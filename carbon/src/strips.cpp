@@ -78,4 +78,22 @@ void stitch_strip(const Tensor& strip_out, const Strip& strip, Tensor& page_out)
   copy_rows(strip_out, strip.keep0, page_out, strip.out0, rows);
 }
 
+Tensor run_in_strips(const Tensor& page, int strips, const std::function<Tensor(const Tensor&)>& run,
+                     const StripRule& rule) {
+  const Shape& s = page.shape();
+  if (s.size() != 4) throw Error("run_in_strips: a page " + shape_string(s) + ", not [N, C, H, W]");
+  if (strips <= 1) return run(page);
+  Tensor out;
+  for (const Strip& st : plan_strips(static_cast<int>(s[2]), strips, rule)) {
+    const Tensor y = run(strip_input(page, st));
+    if (out.shape().empty()) {
+      const Shape& ys = y.shape();
+      if (ys.size() != 4) throw Error("run_in_strips: an output " + shape_string(ys) + ", not [N, C, H, W]");
+      out = Tensor::empty(y.dtype(), {ys[0], ys[1], s[2] / rule.out_stride, ys[3]});
+    }
+    stitch_strip(y, st, out);
+  }
+  return out;
+}
+
 }  // namespace carbon

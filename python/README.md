@@ -22,7 +22,7 @@ logits, = s.run([np.zeros((1, 1, 32, 512), np.float32)])          # [1, 800, 128
 
 | API | what |
 |---|---|
-| `Engine(set, workers=0, pin=True, rec="rec-latin", order_model=None)`, `.ocr(pages)` | the engine on the CPU: grayscale pages (uint8 [h, w]) in, read in parallel. Each page comes back as a dict: its lines (box, text, confidence, det_score, words) in reading order, which method made the order (`model` or `xy-cut`), its pictures, the order model's blocks (label, confidence, lines, table cells), its rotation, its timings and its text |
+| `Engine(set, workers=0, pin=True, rec="rec-latin", order_model=None)`, `.ocr(pages)` | the engine on the CPU: grayscale pages (uint8 [h, w]) in, read in parallel. Each page comes back as a dict: its lines (box, text, confidence, det_score, words) in reading order, which method made the order (`model` or `xy-cut`), its pictures, the order model's blocks (label, confidence, lines, table cells), its rotation, whether it took the second detection pass (`second_pass`), its timings and its text |
 | `Pipeline(set, device=None, page_batch=8, line_batch=256, in_flight=32, threads=0, model_threads=0, rec="rec-latin", order_model=None, engine_cache=None)`, `.ocr(pages)`, `.stats`, `.device` | the batched pipeline: each model runs on batches drawn from all the pages in flight. Each page's dict is the same as `Engine`'s, and on the CPU so are the results. `stats` counts the runs and what they held. `device="cuda"` needs TensorRT, which this module does not include yet (`carbon-ocr ocr --device cuda` has it) |
 | `load_image(path)` | a PNG, JPEG, BMP or PNM page as grayscale uint8 [h, w], as the engine reads it |
 
@@ -49,6 +49,9 @@ logits, = s.run([np.zeros((1, 1, 32, 512), np.float32)])          # [1, 800, 128
 | `ctc_collapse(ids, probs, lengths)` | its second half, for a best class per frame found elsewhere (on a GPU) |
 | `decode_det(maps, scale)` | the line decoder: line and picture boxes from the detector's maps, each `((x0, y0, x1, y1), score, pixels)` |
 | `det_targets(lines, pictures, map_h, map_w)` | the decoder's inverse: the maps that decode to the given boxes, float32 [4, map_h, map_w] (core, top, bottom, picture) |
+| `takes_second_pass(lines, below=9.0)` | whether a page takes the detector's second pass: its lines, as `decode_det` gives them at the detector's scale, their median height under `below` px (0: never) |
+| `merge_passes(first, second, first_scale=1.0, below=9.0, iou=0.5)` | the two passes merged as the engine merges them: `first` and `second` each `(lines, pictures)` as `decode_det` gives them, in the same pixels; returns `(lines, pictures)` in reading order |
+| `DET_SECOND_PASS_BELOW`, `DET_SECOND_PASS_SCALE`, `DET_MERGE_IOU` | the default second pass's constants |
 | `cuda_decode_det(maps_ptr, n, map_h, map_w, stream, ...)` | the detector's maps thresholded on a GPU, with only the masks copied back, then decoded into `decode_det`'s boxes (a module built with CUDA) |
 | `order_features(boxes, texts, width, height)`, `ORDER_FEATURES`, `BLOCK_LABELS` | the order model's input, float32 [n, 16] for a page's lines, and its block labels |
 | `decode_order(successor, same_block, table_row, table_col, table_cell, labels, boxes)` | the order model's outputs decoded into `{order, blocks, sure, fallback}`: each block with its label, confidence, lines and table cells |

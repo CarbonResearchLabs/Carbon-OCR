@@ -9,7 +9,9 @@
 //   upright     CPU threads: the page turned and levelled (deskew), its detector input
 //   detect      up to page_batch pages of one padded size in one run, the maps
 //               thresholded (on the GPU: cuda::threshold_det, only the masks come
-//               back) and decoded into lines on the upright page
+//               back) and decoded into lines on the upright page; a page of tiny
+//               text detected again at a larger scale, in strips, and the passes
+//               merged (on the CPU; on a GPU not yet)
 //   recognize   the lines of every page waiting, from any of them, by width bucket,
 //               up to line_batch a run: cropped (on the GPU: cuda::crop_lines, every
 //               line of every page in one set of launches), read, CTC-decoded (on the
@@ -27,7 +29,9 @@
 // (Device::kCuda: CARBON_WITH_CUDA and TensorRT) they run on TensorRT from the
 // set's FP16 files, detection padded to a few fixed sizes (1024 x 800, 800 x 1024,
 // 1024 x 1024 at a long side of 1024) and batched in powers of two up to
-// page_batch, each an exact profile (a CUDA graph).
+// page_batch, each an exact profile (a CUDA graph).  The second detection pass's
+// larger page fits none of those sizes, so on a GPU a page of tiny text takes no
+// second pass yet (OcrPage::second_pass false).
 #pragma once
 
 #include <cstddef>
@@ -84,6 +88,13 @@ class PipelineModels {
   // The detections of pages at the detector's scale, all of detect_size (ph x pw),
   // at that scale.
   virtual std::vector<Detection> detect(std::span<const GrayView> pages, int ph, int pw, const DetRule& rule) = 0;
+  // Whether the device runs the second detection pass (carbon/detect.h), and its
+  // runs: one page's input, [1, 1, h, w] float32 (an ink map, h and w multiples of
+  // 32, any size), its maps; the detect stage calls it.  The CPU's does; a GPU's,
+  // whose detection runs only at its fixed sizes, not yet, and its pages take no
+  // second pass.
+  virtual bool second_pass() const { return false; }
+  virtual Tensor detect_one(const Tensor& input);
   // The pages the recognize runs that follow crop from (a group of upright pages,
   // alive until the next call): on a GPU, uploaded once for all of them.
   virtual void set_pages(std::span<const GrayView> pages) = 0;

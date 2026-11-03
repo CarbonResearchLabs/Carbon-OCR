@@ -124,6 +124,12 @@ class CpuModels final : public PipelineModels {
     return out;
   }
 
+  bool second_pass() const override { return true; }
+
+  Tensor detect_one(const Tensor& input) override {
+    return std::move(det_->run(std::span<const Tensor>(&input, 1))[0]);
+  }
+
   void set_pages(std::span<const GrayView> pages) override { pages_.assign(pages.begin(), pages.end()); }
 
   void recognize(std::span<const int32_t> page_of, std::span<const LineBox> boxes, int bw, const CropRule& crop,
@@ -159,6 +165,10 @@ class CpuModels final : public PipelineModels {
 };
 
 }  // namespace
+
+Tensor PipelineModels::detect_one(const Tensor&) {
+  throw Error("this device's pipeline does not run the second detection pass");
+}
 
 std::unique_ptr<PipelineModels> cpu_pipeline_models(const std::filesystem::path& set, const EngineOptions& o,
                                                     int threads) {
@@ -331,6 +341,10 @@ struct Pipeline::Impl {
   }
 
   void detect_stage() {
+    // The second detection pass's runs, here, the one thread that runs the detector;
+    // none where the device does not run it.
+    detail::DetectRun second;
+    if (models->second_pass()) second = [this](const Tensor& x) { return models->detect_one(x); };
     std::deque<PagePtr> held;  // pages of another size than the batch's, for the next one
     for (;;) {
       PagePtr first;
@@ -372,10 +386,9 @@ struct Pipeline::Impl {
         PagePtr p = std::move(batch[i]);
         p->out.ms.detect = ms;
         const auto t2 = Clock::now();
-        detail::place_detection(found[i], p->up.view.width, p->up.view.height, smalls[i].width, smalls[i].height,
-                                p->out);
+        detail::place_detection(found[i], p->up.view, smalls[i].width, smalls[i].height, e, second, p->out);
         p->up.small = GrayImage{};
-        p->out.ms.decode = ms_since(t2);
+        p->out.ms.decode = ms_since(t2) - p->out.ms.second_pass;
         p->lines_start = Clock::now();
         if (p->out.lines.empty()) {
           cpu_task([this, p](int k) { finish(*p, k); });

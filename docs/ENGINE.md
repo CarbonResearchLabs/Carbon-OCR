@@ -32,7 +32,7 @@ This document follows a page through the engine, step by step, then covers how t
 | scale | the page resampled once to the detector's scale (long side 1024 px), and a 512 × 512 thumbnail made from that copy | `image.h` |
 | orient | `orient` reads the thumbnail; the page is turned by a quarter turn, and only when the model is sure | `engine.h` |
 | deskew | a projection search levels what is left, up to 5° | `deskew.h` |
-| detect | `det` reads the upright page; the line decoder turns its maps into line and picture boxes | `detect.h` |
+| detect | `det` reads the upright page; the line decoder turns its maps into line and picture boxes; a page of tiny text is detected again at twice the scale | `detect.h` |
 | crop | each line cropped to 32 px high by the crop rule, the lines batched by width | `lines.h` |
 | recognize | the recognizer gives class scores every 4 px; greedy CTC decoding gives the text, each character's position and probability | `lines.h` |
 | split | lines split at wide gaps: column gutters, a table row's cells | `engine.h` |
@@ -55,7 +55,7 @@ page = engine.ocr([carbon_ocr.load_image("page.png")])[0]
 print(page["text"])
 ```
 
-**Not in the engine yet.** These parts of the design are still to come: the script classifier that routes each line to the recognizer of its script group (today a page is read by one recognizer, `EngineOptions::rec`), the second detection pass for tiny text (a page whose median line is under 9 px at the detector's scale), the language models that read unsure lines again, the path for vertical CJK columns, bidirectional reordering for right-to-left text, and TIFF input.
+**Not in the engine yet.** These parts of the design are still to come: the script classifier that routes each line to the recognizer of its script group (today a page is read by one recognizer, `EngineOptions::rec`), the second detection pass on a GPU (section 4), the language models that read unsure lines again, the path for vertical CJK columns, bidirectional reordering for right-to-left text, and TIFF input.
 
 ## <img src="assets/chip-02.svg" height="22" alt=""> Inputs: images, PDFs and text layers
 
@@ -103,6 +103,10 @@ On a GPU the threshold runs on the device (`cuda::threshold_det`) in three launc
 
 **Detection on idle cores.** When fast cores are idle, `carbon::Engine` detects a page on a shared multi-threaded ONNX Runtime session of `det.onnx` (2, 4 or 6 threads, the widest the idle fast cores fit) instead of the worker's own single-threaded one. `carbon/strips.h` offers a second way: the page's rows cut into strips that run side by side and are stitched back together. Each strip runs on its own rows plus 128 rows of the page above and below (the detector sees 127 px around a pixel), and every cut falls on a multiple of 32, so the stitched maps are the whole page's, byte for byte. The halos cost compute (8 strips of a 1024-row page run 2.5 times the rows), so strips pay only when many cores are idle. `carbon-ocr pages --det auto|one|wide|strips` times one against the other.
 
+**Tiny text: a second pass.** At stride 2, a line under 9 px high at the detector's scale has a core band one or two map rows high, so the detector misses some such lines and places the rest coarsely. When the first pass's median line is under 9 px (`DetRule::second_pass_below`), the engine detects the upright page again at twice the scale (`second_pass_scale`), its long side at most 2048 px (`EngineOptions::second_pass_long_side`), where those lines are about 18 px high. A page that large runs in strips of about a first pass's pixels, one after another (`carbon::run_in_strips`), so a worker's detector holds about a first pass's memory while the stitched maps stay the whole page's. On a page of ordinary print the second pass would only find the same lines again, and where the passes disagree it costs precision, so the median gates it.
+
+The passes are merged line by line (`carbon::merge_passes`). A line of each pass whose boxes overlap by more than 0.5 IoU (`merge_iou`) is one line, kept from the pass whose scale suits it: the second's where its height is under 9 px at the first pass's scale, the first's otherwise. A line only one pass found is kept, one pass's miss being the other's find, except a first-pass box over text the second read as tiny lines (two or more of them mostly inside it, or one that fills most of it), whose text would otherwise be read twice. Pictures are merged the same way. `OcrPage::second_pass` records the pass and `ms.second_pass` its time; `carbon-ocr ocr --second-pass off` keeps one pass. The batched pipeline runs it on the CPU; on a GPU the detector runs only at its fixed batch sizes, so a page there takes no second pass yet.
+
 ## <img src="assets/chip-05.svg" height="22" alt=""> Crops, recognition and CTC decoding
 
 **The crop rule** (`carbon::CropRule`, `carbon/lines.h`). A line box of height h becomes a crop 32 px high. The box gets h × 0.2 of padding above and below and h × 0.3 at each end, is scaled to 32 px, then is widened on both sides into the page to a multiple of 8, the recognizer's width step. The resampling is a triangle filter whose support widens with the downscale (an antialiased bilinear), in 22-bit fixed point: a horizontal pass into an 8-bit intermediate, then a vertical pass. Pixels outside the page read as paper. A crop of light text on a dark ground is flipped (255 − v), so a recognizer always reads dark ink on light paper: the test is whether more of its pixels are at least 48 levels lighter than its ground (the median of its border) than as much darker. Then the crop is padded to its batch's width with its own ground. The CUDA kernel (`cuda::crop_lines`, four launches for every line of every page) gives the same bytes as the CPU code, because the coefficients are computed in IEEE double precision without fused multiply-adds. A recognizer whose file carries its own crop rule (`carbon.crop.height`, `carbon.crop.pad_v`, `carbon.crop.pad_h`) sets those three values.
@@ -127,7 +131,7 @@ On a GPU the threshold runs on the device (`cuda::threshold_det`) in three launc
 
 ## <img src="assets/chip-07.svg" height="22" alt=""> Outputs
 
-Each page comes out as a `carbon::OcrPage`: its size, the `rotation` and `skew` undone, its lines in reading order (box, text, confidence, `det_score`, words), its pictures, its blocks and their cells, its `source` and `order`, and its time per stage in ms (`orient`, which includes deskew, `detect`, `decode`, `recognize`, `total`). `carbon/output.h` writes pages in the formats other tools read. Where a page has no blocks, it is written as one block of all its lines.
+Each page comes out as a `carbon::OcrPage`: its size, the `rotation` and `skew` undone, its lines in reading order (box, text, confidence, `det_score`, words), its pictures, its blocks and their cells, its `source` and `order`, whether it took the second detection pass (`second_pass`), and its time per stage in ms (`orient`, which includes deskew, `detect`, `decode`, `second_pass`, `recognize`, `total`). `carbon/output.h` writes pages in the formats other tools read. Where a page has no blocks, it is written as one block of all its lines.
 
 | format | `--format` | what |
 |---|---|---|
@@ -228,6 +232,7 @@ Every model runs through `carbon::Session` (`carbon/session.h`), so a step never
 | `backend` | none: per model, as in section 9 | one backend for every model: `kNative` or `kOnnxRuntime` |
 | `rec` | `"rec-latin"` | the recognizer: `<set>/<rec>.onnx` and `<rec>.vocab.json` |
 | `det_long_side` | 1024 | the page's long side at detection, padded to a multiple of 32 |
+| `second_pass_long_side` | 2048 | the page's long side at most, in the second detection pass |
 | `orient_side` | 512 | the side of the thumbnail orientation reads |
 | `turn_probability` | none: the set's own, else 0.95 | how sure orientation must be to turn a page |
 | `deskew`, `max_skew`, `min_skew`, `min_skew_gain` | true, 5.0°, 0.2°, 1.05 | deskew, and when it levels a page |
@@ -236,7 +241,7 @@ Every model runs through `carbon::Session` (`carbon/session.h`), so a step never
 | `order` | `OrderRule` | `min_sure` 0.5, `sweeps` 4, `join` 0.5 |
 | `split` | `SplitRule` | `min_gap` 0.6, `ratio` 2.5, `space` 0.25, `always` 1.5 (line heights); none: no splitting |
 | `tables` | `TableRule` | `min_rows` 2, `min_cols` 2, `row_overlap` 0.5, `max_row_gap` 2.0, `max_cell_chars` 30; none: no tables from geometry |
-| `det` | `DetRule` | `core_threshold` and `picture_threshold` 0.5, `min_core_pixels` 2, `min_picture_pixels` 16, `edge_quantile` 0.05 |
+| `det` | `DetRule` | `core_threshold` and `picture_threshold` 0.5, `min_core_pixels` 2, `min_picture_pixels` 16, `edge_quantile` 0.05; the second pass: `second_pass_below` 9 px (0: never), `second_pass_scale` 2, `merge_iou` 0.5 |
 | `crop` | `CropRule` | `height` 32, `width_step` 8, `frame_px` 4, `pad_v` 0.2, `pad_h` 0.3, `flip_margin` 48; a recognizer's own `carbon.crop.*` values set `height`, `pad_v` and `pad_h` |
 
 `carbon::PipelineOptions` (`carbon/pipeline.h`) adds:

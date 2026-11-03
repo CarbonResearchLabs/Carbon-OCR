@@ -1,10 +1,13 @@
 // The page's steps the CPU engine (engine.cpp) and the batched pipeline (pipeline.cpp)
 // share, so a page reads the same through either: the detector's scale and the
 // orientation thumbnail, the turn orientation asks for, the page made upright and
-// level, the detection placed on the upright page, a line's text and words from
-// its CTC decoding, and the reading order with blocks and tables.
+// level, the second detection pass and the detection placed on the upright page, a
+// line's text and words from its CTC decoding, and the reading order with blocks and
+// tables.
 #pragma once
 
+#include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -14,6 +17,7 @@
 #include "carbon/image.h"
 #include "carbon/lines.h"
 #include "carbon/session.h"
+#include "carbon/tensor.h"
 
 namespace carbon::detail {
 
@@ -43,9 +47,29 @@ struct Upright {
 };
 void make_upright(const GrayView& page, int rotation, GrayImage small, const EngineOptions& o, Upright& u);
 
-// A detection made at the detector's scale (dw x dh), its lines and pictures in the
-// upright page's pixels (vw x vh), clamped; lines under a pixel left out.
-void place_detection(const Detection& d, int vw, int vh, int dw, int dh, OcrPage& out);
+// A detector run: its input [1, 1, h, w] (an ink map, h and w multiples of 32), its maps.
+using DetectRun = std::function<Tensor(const Tensor&)>;
+
+// A detection made at a scale of dw x dh, its lines and pictures in the upright
+// page's pixels (vw x vh), clamped.
+Detection on_page(const Detection& d, int vw, int vh, int dw, int dh);
+
+// The second detection pass (carbon/detect.h) of the upright page, its first pass
+// made at dw x dh: the page resampled to det.second_pass_scale times that scale
+// (its long side at most o.second_pass_long_side), as an ink map padded to a
+// multiple of 32, run by `run` in strips of about a first pass's pixels (the
+// detector's long side squared) where it has more (run_in_strips: a whole run's
+// maps) and decoded; its boxes in the upright page's pixels.  Nothing where that
+// scale is no larger than dw x dh.
+std::optional<Detection> second_pass(const GrayView& upright, int dw, int dh, const EngineOptions& o,
+                                     const DetectRun& run);
+
+// The page's detection on the upright page: the first pass's, made at the
+// detector's scale (dw x dh), merged with the second pass's (merge_passes) where it
+// takes one and `run` is given (out.second_pass, its time in out.ms.second_pass);
+// its lines (those of a pixel or more) and pictures into out.
+void place_detection(const Detection& first, const GrayView& upright, int dw, int dh, const EngineOptions& o,
+                     const DetectRun& run, OcrPage& out);
 
 // A line's text, words (each from the frame its first character starts on) and
 // confidence from its CTC decoding over `length` frames.

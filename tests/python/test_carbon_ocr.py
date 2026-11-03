@@ -75,6 +75,34 @@ def test_det_targets_and_decode_round_trip():
     assert abs(pics[0][0][0] - 840) <= 2 and abs(pics[0][0][3] - 800) <= 2
 
 
+def test_the_second_pass_is_the_engines():
+    """The detector's second pass as the engine takes it (carbon/detect.h): a page whose median line is under 9 px
+    at the detector's scale, its lines as decode_det gives them; the two passes merged by the engine's own rule."""
+    assert (carbon_ocr.DET_SECOND_PASS_BELOW, carbon_ocr.DET_SECOND_PASS_SCALE, carbon_ocr.DET_MERGE_IOU) == (9, 2, 0.5)
+    lines = np.array([[40.0, 100 + 12 * i, 700, 107 + 12 * i] for i in range(9)] + [[40, 30, 600, 60]])  # 7 px
+    maps = carbon_ocr.det_targets(lines, np.zeros((0, 4)), 512, 400)
+    for k in (0, 3):
+        maps[k] = np.where(maps[k] > 0.5, 8.0, -8.0)
+    first = carbon_ocr.decode_det(maps)
+    assert carbon_ocr.takes_second_pass(first[0])
+    assert not carbon_ocr.takes_second_pass(first[0], below=0)
+    assert not carbon_ocr.takes_second_pass(carbon_ocr.decode_det(maps, scale=2.0)[0])  # 14 px: print
+    assert not carbon_ocr.takes_second_pass([])
+    # page pixels, the first pass at half the page's scale: a line found by both is the second's under 18 px
+    first = ([((100.0, 100, 500, 112), 0.25, 10), ((100.0, 200, 900, 240), 0.25, 10),
+              ((600.0, 100, 900, 112), 0.25, 10)], [((50.0, 600, 950, 900), 0.25, 100)])
+    second = ([((102.0, 99, 498, 111), 0.75, 40), ((104.0, 202, 896, 238), 0.75, 40),
+               ((100.0, 300, 400, 311), 0.75, 40)], [])
+    lines, pictures = carbon_ocr.merge_passes(first, second, first_scale=2.0)
+    assert [(b, s) for b, s, _ in lines] == [((102, 99, 498, 111), 0.75), ((600, 100, 900, 112), 0.25),
+                                             ((100, 200, 900, 240), 0.25), ((100, 300, 400, 311), 0.75)]
+    assert [(b, s) for b, s, _ in pictures] == [((50, 600, 950, 900), 0.25)]
+    assert carbon_ocr.merge_passes(first, second)[0][0][1] == 0.25  # at the page's own scale, 12 px is print
+    # no pair that close: every line kept but the first's tiny one the second read again inside it (read twice)
+    kept = carbon_ocr.merge_passes(first, second, 2.0, iou=0.95)[0]
+    assert len(kept) == 5 and ((100, 100, 500, 112), 0.25) not in [(b, s) for b, s, _ in kept]
+
+
 def test_det_decoded_on_the_gpu_is_the_cpus():
     """cuda_decode_det thresholds a batch of maps where they are, a torch tensor's memory, and
     decodes the masks: the boxes decode_det gives from the whole maps, page by page."""
@@ -192,6 +220,13 @@ def test_engine_reads_a_page():
     assert out[1]["text"] == "aaa\naaaaa\naa\n"
     assert abs(out[0]["lines"][0]["box"][1] - 200) < 2 and out[0]["ms"]["total"] > 0
     assert out[0]["order"] == "xy-cut" and out[0]["blocks"] == []  # the fake set has no order model
+    assert out[0]["second_pass"] is False and out[0]["ms"]["second_pass"] == 0  # its lines are 22 px
+    tiny = np.full((1024, 800), 255, np.uint8)  # tests/cpp/engine_test.cpp's page of tiny text: bars 5 px high
+    for i, dashes in enumerate((3, 4, 2, 3, 4, 2)):
+        for d in range(dashes):
+            tiny[200 + 41 * i:205 + 41 * i, 100 + 32 * d:124 + 32 * d] = 20
+    t = e.ocr([tiny])[0]
+    assert t["second_pass"] is True and len(t["lines"]) == 6 and t["ms"]["second_pass"] > 0
     # tests/data/fake-order.onnx: not sure of its order, so the XY-cut's, but its blocks
     ordered = carbon_ocr.Engine(str(DATA / "fake-set"), workers=1, order_model=str(DATA / "fake-order.onnx"))
     o = ordered.ocr([page])[0]

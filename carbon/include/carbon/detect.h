@@ -16,6 +16,16 @@
 // Map pixel (r, c) covers input rows [2r, 2r + 2) and columns [2c, 2c + 2), and
 // is in a band when its centre (2c + 1, 2r + 1) is.  Boxes are in the
 // detector's input pixels; decode_det scales them to the page's.
+//
+// Tiny text takes a second pass.  At stride 2 a line under 9 px
+// has a band one or two map rows high, so the detector misses some and places
+// the rest coarsely; the page detected again at twice the scale finds them as
+// lines of 18 px.  On a page of print the second pass would find again what the
+// first found, and where the two disagree it costs precision, so it runs only
+// where the first pass's median line is under 9 px (takes_second_pass), and the
+// passes are merged line by line, each line kept from the pass whose scale suits
+// its height, and a first box over text the second read as tiny lines dropped, so
+// nothing is read twice (merge_passes).
 #pragma once
 
 #include <span>
@@ -37,6 +47,13 @@ struct DetRule {
   // the (1 - q) quantile of their bottom edges, so the box of a slightly
   // slanted line holds both its ends.
   double edge_quantile = 0.05;
+  // The second pass: a page whose first pass's median line is under
+  // second_pass_below px at the detector's scale (0: never) is detected again
+  // at second_pass_scale times that scale; two boxes, one of each pass, whose
+  // IoU is over merge_iou are one line.
+  double second_pass_below = 9.0;
+  double second_pass_scale = 2.0;
+  double merge_iou = 0.5;
 };
 
 struct DetBox {
@@ -49,7 +66,7 @@ struct Detection {
   std::vector<DetBox> lines;     // top to bottom, then left to right
   std::vector<DetBox> pictures;  // the same order
   // The median line height, in the boxes' pixels: under 9 px at the detector's
-  // scale, the page takes a second pass at a larger one.  0
+  // scale, the page takes a second pass at a larger one (takes_second_pass).  0
   // without lines.
   double median_line_height() const;
 };
@@ -87,5 +104,23 @@ Detection decode_det(const DetMasks& masks, double scale = 1.0, const DetRule& r
 // decode_det(threshold_det(maps)), for maps[4][map_h][map_w] (core and picture as
 // logits).
 Detection decode_det(const float* maps, int map_h, int map_w, double scale = 1.0, const DetRule& rule = {});
+
+// Whether a page takes the second pass: its first pass's median line, at the
+// detector's scale (decode_det's scale 1), under rule.second_pass_below.  A
+// page without lines takes none.
+bool takes_second_pass(const Detection& first, const DetRule& rule = {});
+
+// The two passes' detections of a page merged, their boxes in the page's pixels,
+// first_scale of them to one input pixel of the first pass.  A line of each pass
+// whose boxes' IoU is over rule.merge_iou are one line (the pairs of largest IoU
+// first, each line in one pair at most), kept from the pass whose scale suits
+// its height: the second's where the pair's mean height is under
+// rule.second_pass_below at the first pass's scale, the first's otherwise.
+// Every other line of either pass is kept, one pass's miss being the other's find,
+// except a first-pass line over text the second read as tiny lines (two or more
+// of them mostly inside it, or one that fills most of it): kept, its text would be
+// read twice.  Pictures likewise.  In reading order, as decode_det gives them.
+Detection merge_passes(const Detection& first, const Detection& second, double first_scale,
+                       const DetRule& rule = {});
 
 }  // namespace carbon

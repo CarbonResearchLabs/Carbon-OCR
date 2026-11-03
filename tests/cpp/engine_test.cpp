@@ -50,6 +50,69 @@ TEST(Engine, ReadsAPageEndToEnd) {
   }
 }
 
+// A page of tiny text for the fake set, at the detector's own scale (800 x 1024):
+// six bars 5 px high of 3, 4, 2, 3, 4 and 2 dashes, 24 px long and 8 apart, the
+// first at an even row, the next at an odd one, and so on.  The fake detector's
+// 5 x 5 window at stride 2 fits in such a bar only where it starts on an even row,
+// so its first pass finds every other bar, 4 px high; at twice the scale its
+// window fits in every bar.
+GrayImage tiny_page() {
+  GrayImage p{800, 1024, std::vector<uint8_t>(800 * 1024, 255)};
+  const int dashes[] = {3, 4, 2, 3, 4, 2};
+  for (int i = 0; i < 6; ++i) {
+    const int y = 200 + 41 * i;
+    for (int d = 0; d < dashes[i]; ++d) {
+      for (int r = y; r < y + 5; ++r) std::fill_n(p.pixels.begin() + r * 800 + 100 + 32 * d, 24, uint8_t{20});
+    }
+  }
+  return p;
+}
+
+// The page of tiny text takes the second pass (its median line 4 px, under 9),
+// whose page at twice the scale (1600 x 2048) runs in 4 strips: every bar is
+// found, once, its box the second pass's.  A page of print takes none.
+TEST(Engine, DetectsAPageOfTinyTextAgainAtTwiceTheScale) {
+  const GrayImage tiny = tiny_page();
+  EngineOptions o;
+  o.pool.workers = 2;
+  o.crop.flip_margin = 0;  // a tiny bar's box is all bar: its crop's ground is its ink, not paper
+  Engine engine(kSet, o);
+  const OcrPage p = engine.ocr(tiny.view());
+  EXPECT_EQ(p.skew, 0.0);
+  EXPECT_TRUE(p.second_pass);
+  EXPECT_GT(p.ms.second_pass, 0.0);
+  EXPECT_GE(p.ms.total, p.ms.detect + p.ms.second_pass);
+  ASSERT_EQ(p.lines.size(), 6u);
+  const char* want[] = {"aaa", "aaaa", "aa", "aaa", "aaaa", "aa"};
+  for (int i = 0; i < 6; ++i) {
+    const OcrLine& l = p.lines[i];
+    EXPECT_EQ(l.text, want[i]) << "line " << i;
+    EXPECT_NEAR(l.box.y0, 200 + 41 * i + 0.5, 0.25) << "line " << i;  // the second pass's, at either row
+    EXPECT_NEAR(l.box.y1, 200 + 41 * i + 4.5, 0.25) << "line " << i;
+    EXPECT_NEAR(l.box.x0, 96, 2.0) << "line " << i;
+  }
+  EXPECT_NE(p.json().find("\"second_pass\": true"), std::string::npos);
+
+  // Without the second pass, or with no larger scale to take it at, the first's
+  // lines alone: the bars that start on even rows.
+  for (int k = 0; k < 2; ++k) {
+    EngineOptions first = o;
+    if (k == 0) first.det.second_pass_below = 0;
+    if (k == 1) first.second_pass_long_side = first.det_long_side;
+    const OcrPage q = Engine(kSet, first).ocr(tiny.view());
+    EXPECT_FALSE(q.second_pass);
+    EXPECT_EQ(q.ms.second_pass, 0.0);
+    ASSERT_EQ(q.lines.size(), 3u);
+    for (int i = 0; i < 3; ++i) EXPECT_NEAR(q.lines[i].box.y0, 200 + 82 * i + 1, 0.25) << "line " << i;
+  }
+
+  const OcrPage print = engine.ocr(load_image(kSet / "page.png").view());
+  EXPECT_FALSE(print.second_pass);
+  EXPECT_EQ(print.ms.second_pass, 0.0);
+  EXPECT_EQ(print.text(), "aaa\naaaaa\naa\n");
+  EXPECT_NE(print.json().find("\"second_pass\": false"), std::string::npos);
+}
+
 // The page turned 2.5 degrees: levelled before detection, read as it was.
 TEST(Engine, LevelsASkewedPage) {
   const GrayImage level = load_image(kSet / "page.png");

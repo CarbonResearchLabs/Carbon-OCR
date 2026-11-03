@@ -116,7 +116,98 @@ std::pair<int, int> centres_in(double lo, double hi, double s) {
   return {i0, i1};
 }
 
+double iou(const LineBox& a, const LineBox& b) {
+  const double w = std::min(a.x1, b.x1) - std::max(a.x0, b.x0), h = std::min(a.y1, b.y1) - std::max(a.y0, b.y0);
+  if (w <= 0 || h <= 0) return 0;
+  const double both = w * h;
+  return both / ((a.x1 - a.x0) * (a.y1 - a.y0) + (b.x1 - b.x0) * (b.y1 - b.y0) - both);
+}
+
+// One kind of box of the two passes merged (merge_passes) into out: a pair is
+// kept from the second pass where its mean height is under `tiny` page pixels.
+void merge_boxes(const std::vector<DetBox>& first, const std::vector<DetBox>& second, double tiny, double min_iou,
+                 std::vector<DetBox>& out) {
+  // The second pass's boxes by their tops: a box topped more than the tallest's
+  // height above another ends above it, so each first box scans only those that
+  // can reach it.
+  std::vector<uint32_t> by_top(second.size());
+  std::iota(by_top.begin(), by_top.end(), 0u);
+  std::sort(by_top.begin(), by_top.end(), [&](uint32_t p, uint32_t q) { return second[p].box.y0 < second[q].box.y0; });
+  double tallest = 0;
+  for (const DetBox& b : second) tallest = std::max(tallest, b.box.y1 - b.box.y0);
+  struct Pair {
+    double iou;
+    uint32_t i, j;
+  };
+  std::vector<Pair> pairs;
+  for (uint32_t i = 0; i < first.size(); ++i) {
+    const LineBox& a = first[i].box;
+    auto it = std::lower_bound(by_top.begin(), by_top.end(), a.y0 - tallest,
+                               [&](uint32_t j, double y) { return second[j].box.y0 < y; });
+    for (; it != by_top.end() && second[*it].box.y0 < a.y1; ++it) {
+      const double v = iou(a, second[*it].box);
+      if (v > min_iou) pairs.push_back({v, i, *it});
+    }
+  }
+  std::sort(pairs.begin(), pairs.end(), [](const Pair& p, const Pair& q) {
+    return p.iou != q.iou ? p.iou > q.iou : p.i != q.i ? p.i < q.i : p.j < q.j;
+  });
+  std::vector<uint8_t> paired_first(first.size(), 0), paired_second(second.size(), 0);
+  for (const Pair& p : pairs) {
+    if (paired_first[p.i] || paired_second[p.j]) continue;
+    paired_first[p.i] = paired_second[p.j] = 1;
+    const LineBox &a = first[p.i].box, &b = second[p.j].box;
+    out.push_back((a.y1 - a.y0 + b.y1 - b.y0) / 2 < tiny ? second[p.j] : first[p.i]);
+  }
+  // A first box no second box pairs with is dropped where the second pass read the
+  // same text as tiny lines: two or more of them lie mostly inside it (the first pass
+  // ran tiny lines together), or one does and fills most of it (the same line, boxed
+  // loosely). Kept, its text would be read twice. A second box that is not tiny (a
+  // heading the larger scale split) never drops a first one.
+  auto inside = [](const LineBox& b, const LineBox& a) {  // the share of b within a
+    const double w = std::min(a.x1, b.x1) - std::max(a.x0, b.x0), h = std::min(a.y1, b.y1) - std::max(a.y0, b.y0);
+    const double area = (b.x1 - b.x0) * (b.y1 - b.y0);
+    return w > 0 && h > 0 && area > 0 ? w * h / area : 0.0;
+  };
+  for (size_t i = 0; i < first.size(); ++i) {
+    if (paired_first[i]) continue;
+    const LineBox& a = first[i].box;
+    const double a_area = (a.x1 - a.x0) * (a.y1 - a.y0);
+    int held = 0;
+    double held_area = 0;
+    auto it = std::lower_bound(by_top.begin(), by_top.end(), a.y0 - tallest,
+                               [&](uint32_t j, double y) { return second[j].box.y0 < y; });
+    for (; it != by_top.end() && second[*it].box.y0 < a.y1; ++it) {
+      const LineBox& b = second[*it].box;
+      if (b.y1 - b.y0 < tiny && inside(b, a) >= 0.7) {
+        ++held;
+        held_area += (b.x1 - b.x0) * (b.y1 - b.y0);
+      }
+    }
+    if (held >= 2 || (held == 1 && a_area > 0 && held_area >= 0.4 * a_area)) continue;
+    out.push_back(first[i]);
+  }
+  for (size_t j = 0; j < second.size(); ++j) {
+    if (!paired_second[j]) out.push_back(second[j]);
+  }
+}
+
 }  // namespace
+
+bool takes_second_pass(const Detection& first, const DetRule& rule) {
+  return rule.second_pass_below > 0 && !first.lines.empty() && first.median_line_height() < rule.second_pass_below;
+}
+
+Detection merge_passes(const Detection& first, const Detection& second, double first_scale, const DetRule& rule) {
+  const double tiny = rule.second_pass_below * first_scale;
+  Detection d;
+  d.lines.reserve(first.lines.size() + second.lines.size());
+  merge_boxes(first.lines, second.lines, tiny, rule.merge_iou, d.lines);
+  merge_boxes(first.pictures, second.pictures, tiny, rule.merge_iou, d.pictures);
+  std::sort(d.lines.begin(), d.lines.end(), reading_order);
+  std::sort(d.pictures.begin(), d.pictures.end(), reading_order);
+  return d;
+}
 
 double Detection::median_line_height() const {
   if (lines.empty()) return 0;

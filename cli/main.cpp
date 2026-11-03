@@ -2,7 +2,7 @@
 // times models and model sets.
 //
 //   carbon-ocr ocr IMAGE|PDF... --set DIR [--rec rec-latin] [--backend ort|native]
-//                           [--dpi 200] [--text-layer auto|off] [--hybrid auto|off]
+//                           [--dpi 200] [--text-layer auto|off] [--hybrid auto|off] [--second-pass auto|off]
 //                           [--format text|json|hocr|alto|page|markdown|pdf] [--out-dir DIR]
 //                           [--output FILE] [--text-out FILE] [--text-only] [--image-dpi 300] [--as-given]
 //                           [--workers N] [--no-pin] [--device cpu|cuda] [--batch 8] [--in-flight N]
@@ -52,7 +52,9 @@
 // --text-layer off; the JSON gives each page's source, and for a PDF page read
 // by OCR why its text layer was not used.  Such a page's pictures (its image
 // objects) are read by OCR, on the page with only its pictures left, and their
-// lines join the layer's (source "hybrid"), unless --hybrid off
+// lines join the layer's (source "hybrid"), unless --hybrid off.  A page whose lines are
+// tiny (the first pass's median under 9 px at the detector's scale) is detected again at
+// twice the scale and the passes merged (carbon/detect.h), unless --second-pass off
 // (carbon::Engine, the pipeline v0 on the CPU; reading order by the set's
 // order.onnx where it has one, every page's, else by the XY-cut): text prints each page's lines,
 // pages apart by a form feed; json one object with every page.  The pages run
@@ -133,6 +135,7 @@ struct Args {
   double dpi = 200;  // ocr: a PDF's pages
   std::string text_layer = "auto";  // ocr: auto, a page's text layer where it passes; off
   std::string hybrid = "auto";      // ocr: auto, the pictures of a page read from its text layer read by OCR; off
+  std::string second_pass = "auto";  // ocr: auto, tiny text detected again at twice the scale; off
   std::string out_dir;               // ocr --format page: a file a page here
   std::string output;                // ocr: the file to write (pdf needs one); empty: standard output
   std::string text_out;              // ocr: also the pages' text, to this file
@@ -151,7 +154,7 @@ struct Args {
                "carbon-ocr: %s\n"
                "usage: carbon-ocr ocr IMAGE|PDF... --set DIR [--rec NAME] [--workers N]\n"
                "                        [--no-pin] [--backend ort|native] [--dpi N] [--text-layer auto|off]\n"
-               "                        [--hybrid auto|off]\n"
+               "                        [--hybrid auto|off] [--second-pass auto|off]\n"
                "                        [--format text|json|hocr|alto|page|markdown|pdf] [--out-dir DIR]\n"
                "                        [--output FILE] [--text-out FILE] [--text-only] [--image-dpi N]\n"
                "                        [--as-given] [--device cpu|cuda] [--batch N] [--in-flight N]\n"
@@ -286,6 +289,9 @@ Args parse(int argc, char** argv) {
     } else if (arg == "--hybrid") {
       a.hybrid = value();
       if (a.hybrid != "auto" && a.hybrid != "off") usage("--hybrid takes auto or off");
+    } else if (arg == "--second-pass") {
+      a.second_pass = value();
+      if (a.second_pass != "auto" && a.second_pass != "off") usage("--second-pass takes auto or off");
     } else if (arg == "--dpi") {
       a.dpi = to_int(arg, value(), 36);
     } else if (arg == "--format") {
@@ -1028,6 +1034,7 @@ int ocr(const Args& a) {
   if (a.backend_given) o.backend = a.backend;
   o.pool.workers = a.workers.empty() ? 0 : a.workers.front();
   o.pool.pin = a.pin;
+  if (a.second_pass == "off") o.det.second_pass_below = 0;  // one detection pass, whatever the lines' size
   if (a.as_given) {  // the page as given (OCRmyPDF turns and deskews pages itself, and grafts the text back)
     o.turn_probability = 2.0f;
     o.deskew = false;

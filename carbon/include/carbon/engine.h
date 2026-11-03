@@ -7,7 +7,8 @@
 // (its long side 512), which is what their trainers must give them too.  The
 // page is turned upright by `orient` (only by quarter turns, and only when it
 // is sure) and levelled by deskew (carbon/deskew.h), its lines found by `det`
-// and the line decoder (carbon/detect.h), cropped by the crop rule
+// and the line decoder (carbon/detect.h), a page of tiny text detected again at
+// twice the scale and the two passes merged, its lines cropped by the crop rule
 // (carbon/lines.h), read by one recognizer and CTC decoding, split at wide gaps,
 // and put in reading order, with blocks and tables, by the set's order
 // model (order.onnx, on ONNX Runtime; carbon/order.h), or by an XY-cut where the
@@ -15,8 +16,7 @@
 // each worker has its own sessions, and each page is planned for the cores
 // free when it gets to them (detection on threads when fast cores are idle,
 // its lines split over them), as `carbon-ocr pages` measures.  Not yet: the
-// script classifier and other recognizers, the second detection pass for tiny
-// text, and the language model.
+// script classifier and other recognizers, and the language model.
 #pragma once
 
 #include <filesystem>
@@ -63,6 +63,10 @@ struct EngineOptions {
   std::optional<Backend> backend; // the models' backend (open_set_model); none: the fastest the set has
   std::string rec = "rec-latin";  // the recognizer: <set>/<rec>.onnx and <rec>.vocab.json
   int det_long_side = 1024;       // the page's long side at detection, padded to a multiple of 32
+  // The second detection pass's page (det.second_pass_below and second_pass_scale, carbon/detect.h): its long
+  // side at most this, run in strips of about a first pass's pixels (det_long_side squared; carbon/strips.h)
+  // where it has more, so a worker's detector never holds much more than a first pass's memory.
+  int second_pass_long_side = 2048;
   int orient_side = 512;          // the thumbnail orientation reads
   // How sure orientation must be to turn a page. None: the set's own, where its orient.onnx
   // carries one (carbon.orient.turn_probability, calibrated on held-out pages when the
@@ -125,17 +129,19 @@ struct OcrPage {
   std::vector<OcrLine> lines; // in reading order
   std::vector<LineBox> pictures;
   std::string order = "xy-cut";  // the reading order's: "model" (the order model's), or the XY-cut's
+  bool second_pass = false;      // detected again at a larger scale, its median line tiny (carbon/detect.h)
   std::vector<OcrBlock> blocks;  // the order model's; none without it
   std::string source = "ocr";  // or "text layer": a born-digital page read from its own text (carbon/textlayer.h);
                                // "hybrid": from its text, and its pictures' text by OCR
   std::string text_layer;      // a PDF page read by OCR: why its text layer was not used
   struct Timings {
-    double orient = 0, detect = 0, decode = 0, recognize = 0, total = 0;  // ms
+    // ms; second_pass the second detection pass's, all of it (its page, detection, decoding and the merge)
+    double orient = 0, detect = 0, decode = 0, second_pass = 0, recognize = 0, total = 0;
   } ms;
 
   std::string text() const;  // the lines, a row each
-  // {"width", "height", "rotation", "skew", "source", "order", "lines": [{box, text, confidence, det_score,
-  // words: [{box, text, confidence}]}], "pictures", "blocks": [{label, confidence, lines, cells: [{row,
+  // {"width", "height", "rotation", "skew", "source", "order", "second_pass", "lines": [{box, text, confidence,
+  // det_score, words: [{box, text, confidence}]}], "pictures", "blocks": [{label, confidence, lines, cells: [{row,
   // col, lines}]}] (with the order model), "ms"}
   std::string json() const;
 };

@@ -19,6 +19,7 @@
 #include "carbon/error.h"
 #include "carbon/image.h"
 #include "carbon/session.h"
+#include "carbon/strips.h"
 #include "engine_steps.h"
 #include "net/onnx.h"
 
@@ -491,12 +492,13 @@ std::string OcrPage::json() const {
   json_escape(s, source);
   s += ", \"order\": ";
   json_escape(s, order);
+  s += second_pass ? ", \"second_pass\": true" : ", \"second_pass\": false";
   if (!text_layer.empty()) {
     s += ", \"text_layer\": ";
     json_escape(s, text_layer);
   }
   s += ", \"lines\": [";
-  char buf[160];
+  char buf[256];
   for (size_t i = 0; i < lines.size(); ++i) {
     const OcrLine& l = lines[i];
     s += i ? ", {\"box\": " : "{\"box\": ";
@@ -545,9 +547,9 @@ std::string OcrPage::json() const {
     s += "]";
   }
   std::snprintf(buf, sizeof buf,
-                ", \"ms\": {\"orient\": %.2f, \"detect\": %.2f, \"decode\": %.2f, \"recognize\": %.2f, "
-                "\"total\": %.2f}}",
-                ms.orient, ms.detect, ms.decode, ms.recognize, ms.total);
+                ", \"ms\": {\"orient\": %.2f, \"detect\": %.2f, \"decode\": %.2f, \"second_pass\": %.2f, "
+                "\"recognize\": %.2f, \"total\": %.2f}}",
+                ms.orient, ms.detect, ms.decode, ms.second_pass, ms.recognize, ms.total);
   s += buf;
   return s;
 }
@@ -673,27 +675,28 @@ void Engine::Impl::page(Job& j, int k) {
   const int pw = round_up(dw, 32), ph = round_up(dh, 32);
   Tensor input = Tensor::empty(DType::kFloat32, {1, 1, ph, pw});
   ink_input(sv, dw, dh, pw, ph, input.data<float>().data());
-  std::vector<Tensor> in = one(std::move(input));
-  Tensor maps;
-  bool done = false;
-  for (auto& wd : wides) {
-    if (wd->threads > free_fast(k)) continue;
-    std::unique_lock lk(wd->m, std::try_to_lock);
-    if (!lk) continue;
-    maps = std::move(wd->session->run(in)[0]);
-    done = true;
-    break;
-  }
-  if (!done) maps = std::move(w[k].det->run(in)[0]);
+  const detail::DetectRun run = [&](const Tensor& x) {
+    const std::span<const Tensor> in(&x, 1);
+    for (auto& wd : wides) {
+      if (wd->threads > free_fast(k)) continue;
+      std::unique_lock lk(wd->m, std::try_to_lock);
+      if (!lk) continue;
+      return std::move(wd->session->run(in)[0]);
+    }
+    return std::move(w[k].det->run(in)[0]);
+  };
+  const Tensor maps = run(input);
   out.ms.detect = ms_since(t);
 
-  // The line decoder, its boxes back in the upright page's pixels.
+  // The line decoder, its boxes back in the upright page's pixels; a page of tiny
+  // text detected again at a larger scale (its strips by the same run) and the
+  // two passes merged.
   t = Clock::now();
   const Shape& shape = maps.shape();
   const Detection d =
       decode_det(maps.data<float>().data(), static_cast<int>(shape[2]), static_cast<int>(shape[3]), 1.0, o.det);
-  detail::place_detection(d, j.up.view.width, j.up.view.height, dw, dh, out);
-  out.ms.decode = ms_since(t);
+  detail::place_detection(d, j.up.view, dw, dh, o, run, out);
+  out.ms.decode = ms_since(t) - out.ms.second_pass;
 
   // Recognition: the lines by their width buckets, in a task for each free fast
   // core, or in tasks of line_batch when every core is busy.
@@ -828,17 +831,60 @@ void make_upright(const GrayView& page, int rotation, GrayImage small, const Eng
   }
 }
 
-void place_detection(const Detection& d, int vw, int vh, int dw, int dh, OcrPage& out) {
+Detection on_page(const Detection& d, int vw, int vh, int dw, int dh) {
   const double sx = 1.0 * vw / dw, sy = 1.0 * vh / dh;
-  auto to_page = [&](const LineBox& b) {
-    return LineBox{std::clamp(b.x0 * sx, 0.0, 1.0 * vw), std::clamp(b.y0 * sy, 0.0, 1.0 * vh),
-                   std::clamp(b.x1 * sx, 0.0, 1.0 * vw), std::clamp(b.y1 * sy, 0.0, 1.0 * vh)};
+  auto to_page = [&](DetBox b) {
+    b.box = {std::clamp(b.box.x0 * sx, 0.0, 1.0 * vw), std::clamp(b.box.y0 * sy, 0.0, 1.0 * vh),
+             std::clamp(b.box.x1 * sx, 0.0, 1.0 * vw), std::clamp(b.box.y1 * sy, 0.0, 1.0 * vh)};
+    return b;
   };
+  Detection p;
+  p.lines.reserve(d.lines.size());
+  for (const DetBox& l : d.lines) p.lines.push_back(to_page(l));
+  for (const DetBox& b : d.pictures) p.pictures.push_back(to_page(b));
+  return p;
+}
+
+std::optional<Detection> second_pass(const GrayView& upright, int dw, int dh, const EngineOptions& o,
+                                     const DetectRun& run) {
+  const double f = std::min(o.det.second_pass_scale, 1.0 * o.second_pass_long_side / std::max(dw, dh));
+  const int w = std::max(1, static_cast<int>(std::lround(dw * f)));
+  const int h = std::max(1, static_cast<int>(std::lround(dh * f)));
+  if (w <= dw && h <= dh) return std::nullopt;
+  const GrayImage page = resize_gray(upright, w, h);
+  const int pw = round_up(w, 32), ph = round_up(h, 32);
+  Tensor x = Tensor::empty(DType::kFloat32, {1, 1, ph, pw});
+  ink_input(page.view(), w, h, pw, ph, x.data<float>().data());
+  // Strips of about a first pass's pixels (the detector's long side squared), so
+  // the detector's memory, which keeps its largest run's, stays about a first
+  // pass's; their cores at least two halos high, so the halos at most double
+  // their rows.
+  const StripRule rule{StripRule{}.halo, StripRule{}.align, o.det.stride};
+  const int64_t side = round_up(o.det_long_side, 32);
+  const int64_t by_pixels = (static_cast<int64_t>(ph) * pw + side * side - 1) / (side * side);
+  const int strips = static_cast<int>(std::clamp<int64_t>(by_pixels, 1, std::max(1, ph / (2 * rule.halo))));
+  const Tensor maps = run_in_strips(x, strips, run, rule);
+  const Shape& s = maps.shape();
+  return on_page(decode_det(maps.data<float>().data(), static_cast<int>(s[2]), static_cast<int>(s[3]), 1.0, o.det),
+                 upright.width, upright.height, w, h);
+}
+
+void place_detection(const Detection& first, const GrayView& upright, int dw, int dh, const EngineOptions& o,
+                     const DetectRun& run, OcrPage& out) {
+  Detection d = on_page(first, upright.width, upright.height, dw, dh);
+  if (run && takes_second_pass(first, o.det)) {
+    const auto t = Clock::now();
+    if (const std::optional<Detection> second = second_pass(upright, dw, dh, o, run)) {
+      d = merge_passes(d, *second, 1.0 * upright.height / dh, o.det);
+      out.second_pass = true;
+      out.ms.second_pass = ms_since(t);
+    }
+  }
   for (const DetBox& l : d.lines) {
-    const LineBox b = to_page(l.box);
+    const LineBox& b = l.box;
     if (b.x1 - b.x0 >= 1 && b.y1 - b.y0 >= 1) out.lines.push_back({b, "", 0.0f, l.score});
   }
-  for (const DetBox& p : d.pictures) out.pictures.push_back(to_page(p.box));
+  for (const DetBox& p : d.pictures) out.pictures.push_back(p.box);
 }
 
 void read_line(OcrLine& line, const CtcLine& d, int32_t length, const CropRule& crop,

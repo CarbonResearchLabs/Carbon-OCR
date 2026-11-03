@@ -111,6 +111,16 @@ DetBoxes det_boxes(const std::vector<carbon::DetBox>& v) {
   return out;
 }
 
+// det_boxes' inverse: decode_det's boxes, as Python holds them, back to the engine's.
+std::vector<carbon::DetBox> from_det_boxes(const DetBoxes& v) {
+  std::vector<carbon::DetBox> out;
+  out.reserve(v.size());
+  for (const auto& [b, score, pixels] : v) {
+    out.push_back({{std::get<0>(b), std::get<1>(b), std::get<2>(b), std::get<3>(b)}, score, pixels});
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------- tensors
 
 using Array = nb::ndarray<nb::numpy, nb::c_contig, nb::device::cpu>;
@@ -220,10 +230,12 @@ nb::dict page_dict(const carbon::OcrPage& p) {
     blocks.append(bd);
   }
   d["blocks"] = blocks;
+  d["second_pass"] = p.second_pass;
   nb::dict ms;
   ms["orient"] = p.ms.orient;
   ms["detect"] = p.ms.detect;
   ms["decode"] = p.ms.decode;
+  ms["second_pass"] = p.ms.second_pass;
   ms["recognize"] = p.ms.recognize;
   ms["total"] = p.ms.total;
   d["ms"] = ms;
@@ -317,7 +329,8 @@ NB_MODULE(carbon_ocr, m) {
           "pages"_a,
           "Reads grayscale pages (uint8 [h, w], paper 255) in parallel; for each a dict: width, height, rotation, "
           "lines (box, text, confidence, det_score) in reading order, pictures, order (\"model\" or \"xy-cut\"), "
-          "blocks (label, confidence, lines, cells), ms (per stage), text.");
+          "blocks (label, confidence, lines, cells), second_pass (detected again at a larger scale: tiny text), "
+          "ms (per stage), text.");
 
   nb::class_<carbon::Pipeline>(m, "Pipeline",
                                "The batched OCR pipeline (carbon::Pipeline, carbon/pipeline.h): every model run on "
@@ -491,6 +504,44 @@ NB_MODULE(carbon_ocr, m) {
   m.attr("DET_STRIDE") = dr.stride;
   m.attr("DET_CORE_FRAC") = dr.core_frac;
   m.attr("DET_CORE_X_SHRINK") = dr.core_x_shrink;
+  m.attr("DET_SECOND_PASS_BELOW") = dr.second_pass_below;
+  m.attr("DET_SECOND_PASS_SCALE") = dr.second_pass_scale;
+  m.attr("DET_MERGE_IOU") = dr.merge_iou;
+
+  m.def(
+      "takes_second_pass",
+      [](const DetBoxes& lines, double below) {
+        carbon::DetRule r;
+        r.second_pass_below = below;
+        carbon::Detection d;
+        d.lines = from_det_boxes(lines);
+        return carbon::takes_second_pass(d, r);
+      },
+      "lines"_a, "below"_a = dr.second_pass_below,
+      "Whether a page takes the detector's second pass (carbon::takes_second_pass): its lines as decode_det gives "
+      "them at the detector's scale, their median height under `below` px (0: never).");
+
+  m.def(
+      "merge_passes",
+      [](const std::tuple<DetBoxes, DetBoxes>& first, const std::tuple<DetBoxes, DetBoxes>& second,
+         double first_scale, double below, double iou) {
+        carbon::DetRule r;
+        r.second_pass_below = below;
+        r.merge_iou = iou;
+        carbon::Detection a, b;
+        a.lines = from_det_boxes(std::get<0>(first));
+        a.pictures = from_det_boxes(std::get<1>(first));
+        b.lines = from_det_boxes(std::get<0>(second));
+        b.pictures = from_det_boxes(std::get<1>(second));
+        const carbon::Detection d = carbon::merge_passes(a, b, first_scale, r);
+        return std::make_tuple(det_boxes(d.lines), det_boxes(d.pictures));
+      },
+      "first"_a, "second"_a, "first_scale"_a = 1.0, "below"_a = dr.second_pass_below, "iou"_a = dr.merge_iou,
+      "The detector's two passes merged as the engine merges them (carbon::merge_passes): first and second each "
+      "(lines, pictures) as decode_det gives them, in the same pixels, first_scale of them to one of the first "
+      "pass's input. Boxes of the two passes over `iou` are one line, kept from the second pass where their mean "
+      "height is under `below` px at the first pass's scale, else from the first; the rest of both kept. "
+      "(lines, pictures), in reading order.");
 
   m.def(
       "det_targets",

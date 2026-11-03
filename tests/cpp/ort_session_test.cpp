@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstring>
 #include <memory>
+#include <span>
 #include <vector>
 
 #include "carbon/parallel.h"
@@ -124,6 +125,11 @@ TEST(OrtSession, StripsGiveTheWholePagesBytes) {
     EXPECT_EQ(std::memcmp(out.raw(), full.raw(), full.bytes()) == 0, c.exact)
         << "halo " << c.halo << ", " << c.strips << " strips";
   }
+  // the same through run_in_strips, as the second detection pass runs its page
+  const Tensor run = run_in_strips(
+      page, 5, [&](const Tensor& x) { return std::move(s->run(std::span<const Tensor>(&x, 1))[0]); }, {32, 8, 2});
+  ASSERT_EQ(run.shape(), full.shape());
+  EXPECT_EQ(std::memcmp(run.raw(), full.raw(), full.bytes()), 0);
 }
 
 TEST(Backends, NamesRoundTrip) {

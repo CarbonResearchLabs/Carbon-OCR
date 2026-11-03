@@ -5,6 +5,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <vector>
@@ -35,6 +37,7 @@ void expect_same(const OcrPage& a, const OcrPage& b, int page) {
   EXPECT_EQ(a.rotation, b.rotation) << "page " << page;
   EXPECT_DOUBLE_EQ(a.skew, b.skew) << "page " << page;
   EXPECT_EQ(a.order, b.order) << "page " << page;
+  EXPECT_EQ(a.second_pass, b.second_pass) << "page " << page;
   ASSERT_EQ(a.lines.size(), b.lines.size()) << "page " << page;
   for (size_t i = 0; i < a.lines.size(); ++i) {
     EXPECT_EQ(a.lines[i].text, b.lines[i].text) << "page " << page << " line " << i;
@@ -48,14 +51,32 @@ void expect_same(const OcrPage& a, const OcrPage& b, int page) {
   EXPECT_EQ(a.pictures.size(), b.pictures.size()) << "page " << page;
 }
 
-// Pages of three sizes (the fake page, a blank one, the page skewed), through the
-// pipeline and through the CPU engine: the same results.
+// A page of tiny text at the detector's scale: bars 5 px high, every other one
+// starting on an odd row, which the fake detector finds only at twice the scale
+// (engine_test.cpp's tiny_page).
+GrayImage tiny_page() {
+  GrayImage p = paper(800, 1024);
+  const int dashes[] = {3, 4, 2, 3, 4, 2};
+  for (int i = 0; i < 6; ++i) {
+    const int y = 200 + 41 * i;
+    for (int d = 0; d < dashes[i]; ++d) {
+      for (int r = y; r < y + 5; ++r) std::fill_n(p.pixels.begin() + r * 800 + 100 + 32 * d, 24, uint8_t{20});
+    }
+  }
+  return p;
+}
+
+// Pages of three sizes (the fake page, a blank one, the page skewed) and a page of
+// tiny text, which takes the second detection pass, through the pipeline and
+// through the CPU engine: the same results.
 TEST(BatchPipeline, ReadsPagesAsTheEngineDoes) {
   const GrayImage page = load_image(kSet / "page.png");
   const GrayImage skewed = rotate_page(page.view(), 2.5);
   const GrayImage blank = paper(400, 300);
+  const GrayImage tiny = tiny_page();
+  const GrayView kinds[] = {page.view(), blank.view(), skewed.view(), tiny.view()};
   std::vector<GrayView> pages;
-  for (int i = 0; i < 10; ++i) pages.push_back(i % 3 == 0 ? page.view() : i % 3 == 1 ? blank.view() : skewed.view());
+  for (int i = 0; i < 10; ++i) pages.push_back(kinds[i % 4]);
   EngineOptions eo;
   eo.pool.workers = 2;
   const std::vector<OcrPage> want = Engine(kSet, eo).ocr(pages);
@@ -67,6 +88,10 @@ TEST(BatchPipeline, ReadsPagesAsTheEngineDoes) {
   EXPECT_EQ(got[0].text(), "aaa\naaaaa\naa\n");
   EXPECT_NEAR(got[2].skew, -2.5, 0.15);
   EXPECT_GT(got[0].ms.total, 0.0);
+  EXPECT_FALSE(got[0].second_pass);
+  EXPECT_TRUE(got[3].second_pass);
+  EXPECT_EQ(got[3].lines.size(), 6u);
+  EXPECT_GT(got[3].ms.second_pass, 0.0);
 }
 
 // Many pages in flight: a detection run holds several pages of a size, a

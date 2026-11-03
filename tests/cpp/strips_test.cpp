@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "carbon/error.h"
@@ -58,6 +60,57 @@ TEST(Strips, InputAndStitchMoveWholeRows) {
   Tensor narrow(DType::kFloat32, {1, 2, 8, 2});
   EXPECT_THROW(stitch_strip(in, s, narrow), Error);
   EXPECT_THROW(strip_input(page, {6, 10, 0, 1, 0}), Error);
+}
+
+// A model in miniature, [N, 1, H, W] to maps [N, 2, H / 2, W]: each map row the
+// sum of the 8 input rows around its own (zero past the input's edges, as a
+// convolution's padding) and its row doubled, so its receptive field reaches 4
+// rows.
+Tensor rows_model(const Tensor& x) {
+  const Shape& s = x.shape();
+  const int64_t n = s[0], h = s[2], w = s[3];
+  Tensor y(DType::kFloat32, {n, 2, h / 2, w});
+  const auto in = x.data<float>();
+  auto out = y.data<float>();
+  for (int64_t b = 0; b < n; ++b) {
+    for (int64_t r = 0; r < h / 2; ++r) {
+      for (int64_t c = 0; c < w; ++c) {
+        float sum = 0;
+        for (int64_t k = 2 * r - 3; k <= 2 * r + 4; ++k) sum += k >= 0 && k < h ? in[(b * h + k) * w + c] : 0.0f;
+        out[((b * 2) * (h / 2) + r) * w + c] = sum;
+        out[((b * 2 + 1) * (h / 2) + r) * w + c] = 2 * in[(b * h + 2 * r) * w + c];
+      }
+    }
+  }
+  return y;
+}
+
+// A model run in strips gives a whole run's bytes where the halo covers its
+// receptive field, one strip being the whole run; with no halo it does not.
+TEST(Strips, RunInStripsGivesAWholeRunsBytes) {
+  std::vector<float> v(2 * 128 * 5);
+  uint32_t r = 7;
+  for (float& x : v) {
+    r = r * 1664525u + 1013904223u;
+    x = static_cast<float>(r >> 8) / 16777216.0f;
+  }
+  const Tensor page = Tensor::from<float>({2, 1, 128, 5}, v);
+  const Tensor whole = rows_model(page);
+  auto same = [&](const Tensor& t) {
+    return t.shape() == whole.shape() && std::memcmp(t.raw(), whole.raw(), whole.bytes()) == 0;
+  };
+  int runs = 0;
+  auto counted = [&](const Tensor& x) {
+    ++runs;
+    return rows_model(x);
+  };
+  for (int n : {1, 3, 4, 16}) {
+    runs = 0;
+    EXPECT_TRUE(same(run_in_strips(page, n, counted, {8, 8, 2}))) << n << " strips";
+    EXPECT_EQ(runs, n);
+  }
+  EXPECT_FALSE(same(run_in_strips(page, 4, rows_model, {0, 8, 2})));
+  EXPECT_THROW(run_in_strips(Tensor(DType::kFloat32, {1, 128, 5}), 2, rows_model), Error);
 }
 
 }  // namespace

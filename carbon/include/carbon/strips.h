@@ -7,9 +7,12 @@
 // multiple of `align`, the detector's largest stride, so a strip's feature maps
 // line up with the page's at every level.  The halos cost compute (8 strips of
 // a 1024-row page run 2.5 times the rows), so strips are for a page that finds
-// many cores idle; with the cores busy a page is detected in one run.
+// many cores idle; with the cores busy a page is detected in one run.  The
+// second detection pass (carbon/detect.h) runs its larger page in strips too,
+// one after another: its maps are a whole run's, its memory a strip's.
 #pragma once
 
+#include <functional>
 #include <vector>
 
 #include "carbon/tensor.h"
@@ -39,5 +42,11 @@ Tensor strip_input(const Tensor& page, const Strip& strip);
 // Copies a strip's kept output rows ([N, C, rows, W'] from the detector) into
 // the page's output [N, C, H / out_stride, W'].
 void stitch_strip(const Tensor& strip_out, const Strip& strip, Tensor& page_out);
+
+// A model run on a page in `strips` strips (plan_strips), one after another:
+// each strip's input given to `run`, its kept rows stitched into the page's
+// output [N, C, H / out_stride, W'].  One strip: run on the page itself.
+Tensor run_in_strips(const Tensor& page, int strips, const std::function<Tensor(const Tensor&)>& run,
+                     const StripRule& rule = {});
 
 }  // namespace carbon

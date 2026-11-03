@@ -39,6 +39,7 @@ By default the pages run in parallel on the CPU, one worker per physical core. `
 | `--dpi N` | 200 | the dpi a PDF's pages are rendered at |
 | `--text-layer auto\|off` | `auto` | read a PDF page from its own text layer where it passes the checks |
 | `--hybrid auto\|off` | `auto` | read the pictures of a page that was read from its text layer by OCR |
+| `--second-pass auto\|off` | `auto` | detect a page of tiny text (its median line under 9 px at the detector's scale) again at twice the scale, and merge the two passes |
 | `--as-given` | off | no quarter turns and no deskew: the page as given |
 | `--backend ort\|native` | per model | run every model on one backend; by default a model runs on the native int8 backend where the set has its `.int8.onnx`, else on ONNX Runtime |
 | `--workers N` | one per physical core | CPU workers |
@@ -110,7 +111,7 @@ session = carbon_ocr.Session("models/fullerene-3M/rec-latin.onnx", backend="ort"
 logits, = session.run([np.zeros((1, 1, 32, 512), np.float32)])     # [1, 800, 128]
 ```
 
-The module also exposes the engine's building blocks: the crop rule (`crop`, `crop_lines`, `crop_region`), the CTC decoders (`ctc_greedy`, `ctc_collapse`), the detector's decoder (`decode_det`), the order model's features and decoder (`order_features`, `decode_order`, `reading_order`), and text scoring (`text_errors`, `char_confusions`). [python/README.md](../python/README.md) lists all of them.
+The module also exposes the engine's building blocks: the crop rule (`crop`, `crop_lines`, `crop_region`), the CTC decoders (`ctc_greedy`, `ctc_collapse`), the detector's decoder and the merge of its two passes (`decode_det`, `takes_second_pass`, `merge_passes`), the order model's features and decoder (`order_features`, `decode_order`, `reading_order`), and text scoring (`text_errors`, `char_confusions`). [python/README.md](../python/README.md) lists all of them.
 
 ## <img src="assets/chip-05.svg" height="22" alt=""> OCRmyPDF
 

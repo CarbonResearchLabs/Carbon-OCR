@@ -107,7 +107,7 @@ scikit-build-core builds the module `carbon_ocr` from this CMake project, with O
 
 ## <img src="assets/chip-06.svg" height="22" alt=""> Tests
 
-`ctest --preset <preset>` runs the C++ tests: the tensors, the crop rule, the CPU kernels against their scalar reference, the native backend against ONNX Runtime, the detector's and order model's decoders, the engine and the batched pipeline on small fake models, PDFs, the output formats and the command line. The tests that need a GPU are built with CUDA or TensorRT and run on a machine with one.
+`ctest --preset <preset>` runs the C++ tests: the tensors, the crop rule, the CPU kernels against their scalar reference, the native backend against ONNX Runtime, the detector's and order model's decoders, the detector's two passes merged, the engine and the batched pipeline on small fake models, PDFs, the output formats and the command line. The tests that need a GPU are built with CUDA or TensorRT and run on a machine with one.
 
 ```shell
 pip install ./python pytest==8.4.2 pillow==13.0.0
