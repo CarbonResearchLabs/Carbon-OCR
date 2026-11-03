@@ -8,6 +8,9 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <latch>
+#include <exception>
 #include <cstdio>
 #include <fstream>
 #include <iterator>
@@ -20,6 +23,7 @@
 #include "carbon/image.h"
 #include "carbon/session.h"
 #include "carbon/strips.h"
+#include "det_head.h"
 #include "engine_steps.h"
 #include "net/onnx.h"
 
@@ -619,12 +623,34 @@ struct Engine::Impl {
     std::unique_ptr<Session> session;
     std::mutex m;
   };
+  // The detector's head, where its file has fullerene's (det_head.h): the workers' detectors and the wide ones
+  // then run their file cut before it, and the engine runs the head (cpu::det_head).
+  std::optional<detail::FusedHead> head, wide_head;
   struct Job {
     GrayView page{};
+    std::shared_ptr<const void> keep;  // what holds the page's pixels, for a page of the stream
+    GrayImage own;                     // or its own pixels
+    std::filesystem::path file;        // or its file, decoded by the worker that takes the page
     detail::Upright up;  // the page turned upright and levelled, and its copy at the detector's scale
     OcrPage out;
     std::atomic<int> left{0};
     Clock::time_point start, lines_start;
+    bool streamed = false;
+    bool complete = false;  // under Stream::m
+    std::mutex error_m;
+    std::exception_ptr error;  // the first a task of the page met
+
+    void fail(std::exception_ptr e) {
+      std::lock_guard lk(error_m);
+      if (!error) error = std::move(e);
+    }
+  };
+  // The stream's pages (Engine::submit, next): given and not yet taken, by number.
+  struct Stream {
+    std::mutex m;
+    std::condition_variable cv;
+    std::map<size_t, std::unique_ptr<Job>> jobs;
+    size_t submitted = 0, completed = 0, taken = 0;
   };
 
   EngineOptions o;
@@ -632,8 +658,18 @@ struct Engine::Impl {
   WorkerPool pool;
   std::vector<Worker> w;
   std::vector<std::unique_ptr<Wide>> wides;
+  Stream stream;
 
-  Impl(const std::filesystem::path& set, EngineOptions options) : o(std::move(options)), pool(o.pool) {
+  // The engine's pool: a page starts on a fast core, and slow cores take the lines of pages already started
+  // (an E-core detects a page 1.5 times slower than a P-core, sharing its cluster's L2: 10 workers read fewer pages
+  // a second than the 6 P-cores alone when E-cores took whole pages).
+  static PoolOptions engine_pool(PoolOptions p) {
+    p.slow_takes_new = false;
+    return p;
+  }
+
+  Impl(const std::filesystem::path& set, EngineOptions options)
+      : o(std::move(options)), pool(engine_pool(o.pool)) {
     vocab = load_vocab(set / (o.rec + ".vocab.json"));
     o.crop = detail::model_crop(set, o.rec, o.crop);
     if (!o.turn_probability) o.turn_probability = detail::model_turn_probability(set);
@@ -641,9 +677,14 @@ struct Engine::Impl {
     SessionOptions single;
     single.threads = 1;
     const detail::OrderModel order_model = detail::choose_order(set, o);
+    choose_set_model(set, "orient", o.backend, o.precision);  // its file first: a missing one is named first, as before
+    const SetModel det = choose_set_model(set, "det", o.backend, o.precision);
+    head = detail::fused_det_head(det.file);
+    SessionOptions det_options = single;
+    if (head) det_options.model_bytes = head->cut;
     pool.on_each_worker([&](int k) {
       w[k].orient = open_set_model(set, "orient", o.backend, single, o.precision);
-      w[k].det = open_set_model(set, "det", o.backend, single, o.precision);
+      w[k].det = open_session(det.backend, det.file, det_options);
       w[k].rec = open_set_model(set, o.rec, o.backend, single, o.precision);
       if (!order_model.file.empty()) w[k].order = open_session(order_model.backend, order_model.file, single);
     });
@@ -661,12 +702,27 @@ struct Engine::Impl {
     const bool ort = std::find(built.begin(), built.end(), Backend::kOnnxRuntime) != built.end();
     // (ONNX Runtime on det.onnx: FP32, so not where another precision is asked for)
     const bool fp32_det = o.precision == Precision::kAuto || o.precision == Precision::kFp32;
+    // A wide detector's threads on the fast cores: on a hybrid CPU the OS may otherwise put them on an E-core,
+    // which the whole run then waits for (processor group 0 alone, where ONNX Runtime's numbers are these).
+    std::vector<int> fast_cpus;
+    const CpuTopology& topo = cpu_topology();
+    if (o.pool.pin && topo.groups == 1 && !topo.cores.empty() &&
+        topo.cores.front().efficiency != topo.cores.back().efficiency) {
+      for (const CpuCore& c : topo.cores) {
+        if (c.efficiency == topo.cores.front().efficiency) fast_cpus.insert(fast_cpus.end(), c.cpus.begin(), c.cpus.end());
+      }
+    }
+    if (ort && o.backend != Backend::kNative && fp32_det && pool.fast() >= 2) {
+      wide_head = det.file == set / "det.onnx" ? head : detail::fused_det_head(set / "det.onnx");
+    }
     for (int t : {6, 4, 2}) {
       if (t > pool.fast() || !ort || o.backend == Backend::kNative || !fp32_det) continue;
       auto wd = std::make_unique<Wide>();
       wd->threads = t;
       SessionOptions so;
       so.threads = t;
+      so.thread_cpus = fast_cpus;
+      if (wide_head) so.model_bytes = wide_head->cut;
       wd->session = open_session(Backend::kOnnxRuntime, set / "det.onnx", so);
       wides.push_back(std::move(wd));
     }
@@ -679,9 +735,109 @@ struct Engine::Impl {
 
   int free_fast(int k) const { return pool.idle() + (pool.is_fast(k) ? 1 : 0); }
 
+  // A page's first task: its plan, and an error it meets kept with the page (a page with lines ends in
+  // the last of its line tasks instead).
+  void start(Job& j, int k) {
+    try {
+      if (!j.file.empty()) {
+        const auto t = Clock::now();
+        j.own = load_image(j.file);
+        j.page = j.own.view();
+        j.out.ms.load = ms_since(t);
+      }
+      page(j, k);
+    } catch (...) {
+      j.fail(std::current_exception());
+      done(j);
+    }
+  }
   void page(Job& j, int k);
   void recognize(Job& j, std::span<const size_t> lines, int k);
+  void read_lines(Job& j, std::span<const size_t> lines, int k);
+  // The page's last task: its lines split and ordered, unless a task failed.
+  void end(Job& j, int k) {
+    if (!j.error) {
+      try {
+        finish(j, k);
+      } catch (...) {
+        j.fail(std::current_exception());
+      }
+    }
+    done(j);
+  }
+  void done(Job& j) {
+    if (!j.streamed) return;
+    {
+      std::lock_guard lk(stream.m);
+      j.complete = true;
+      ++stream.completed;
+    }
+    stream.cv.notify_all();
+  }
+  size_t give(std::unique_ptr<Job> job);
   void finish(Job& j, int k);
+
+  // Runs fs side by side on the idle fast workers, the first here: each one nobody has taken by the time this
+  // worker gets to it runs here too. Returns when every one has run; rethrows the first error.
+  void together(std::vector<std::function<void()>> fs) {
+    if (fs.size() <= 1 || pool.idle() == 0) {
+      for (auto& f : fs) f();
+      return;
+    }
+    struct Shared {
+      explicit Shared(std::vector<std::function<void()>> f) : fs(std::move(f)), state(fs.size()), left(fs.size()) {}
+      std::vector<std::function<void()>> fs;
+      std::vector<std::atomic<int>> state;  // 0 waiting, 1 taken
+      std::latch left;
+      std::mutex m;
+      std::exception_ptr error;
+    };
+    auto sh = std::make_shared<Shared>(std::move(fs));
+    const auto run = [](Shared& s, size_t i) {
+      if (s.state[i].exchange(1) != 0) return;
+      try {
+        s.fs[i]();
+      } catch (...) {
+        std::lock_guard lk(s.m);
+        if (!s.error) s.error = std::current_exception();
+      }
+      s.left.count_down();
+    };
+    for (size_t i = 1; i < sh->fs.size(); ++i) pool.submit([sh, i, run](int) { run(*sh, i); });
+    for (size_t i = 0; i < sh->fs.size(); ++i) run(*sh, i);
+    sh->left.wait();
+    if (sh->error) std::rethrow_exception(sh->error);
+  }
+  // The detector's maps from its head's input: [1, in, h/4, w/4] to [1, out, h/2, w/2], in row bands on the idle
+  // fast workers (each row's maps the same however the rows are cut).
+  Tensor head_maps(const Session::OutputView& y, const detail::FusedHead& h) {
+    const Shape& s = y.shape;
+    if (s.size() != 4 || s[0] != 1 || s[1] != h.in || y.dtype != DType::kFloat32) {
+      throw Error("the detector cut before its head gives " + shape_string(s));
+    }
+    const int h4 = static_cast<int>(s[2]), w4 = static_cast<int>(s[3]);
+    Tensor maps = Tensor::empty(DType::kFloat32, {1, h.out, 2 * h4, 2 * w4});
+    const cpu::DetHeadWeights wt = h.weights();
+    const float* x = y.as<float>();
+    float* out = maps.data<float>().data();
+    split_rows(2 * h4, [&](int r0, int r1) { cpu::det_head(x, h4, w4, wt, out, r0, r1); });
+    return maps;
+  }
+  // A page's rows in a band for this worker and each idle fast one (RowSplit).
+  void split_rows(int rows, const std::function<void(int, int)>& band) {
+    const int parts = std::min(rows, 1 + pool.idle());
+    if (parts <= 1) {
+      band(0, rows);
+      return;
+    }
+    std::vector<std::function<void()>> fs;
+    for (int p = 0; p < parts; ++p) {
+      const int r0 = static_cast<int>(static_cast<int64_t>(rows) * p / parts);
+      const int r1 = static_cast<int>(static_cast<int64_t>(rows) * (p + 1) / parts);
+      fs.push_back([&band, r0, r1] { band(r0, r1); });
+    }
+    together(std::move(fs));
+  }
   void order_page(OcrPage& page, int k) { detail::order_page(page, w[k].order.get(), o); }
 };
 
@@ -695,15 +851,24 @@ void Engine::Impl::page(Job& j, int k) {
   // and turns the page only by a quarter turn, only when sure.
   GrayImage small = detail::det_scale(j.page, o.det_long_side);
   const int side = o.orient_side;
-  {
+  const auto orient = [&] {
     Tensor thumb = Tensor::empty(DType::kFloat32, {1, 1, side, side});
     detail::thumbnail_input(small.view(), j.page.width, j.page.height, side, thumb.data<float>().data());
     const Tensor logits = std::move(w[k].orient->run(one(std::move(thumb)))[0]);
     out.rotation = detail::rotation_of(logits.data<float>(), *o.turn_probability);
+  };
+  // With fast cores idle (a page alone), the skew's search on the page as given runs beside orientation: a page
+  // orientation does not turn keeps it, a turned one searches again (the same bytes either way).
+  std::optional<Skew> skew;
+  if (o.deskew && pool.idle() > 0) {
+    together({orient, [&] { skew = find_skew(small.view(), o.max_skew); }});
+  } else {
+    orient();
   }
   // What is left of a turn, a few degrees: the page and its copy at the
   // detector's scale levelled, when the level angle clearly wins.
-  detail::make_upright(j.page, out.rotation, std::move(small), o, j.up);
+  detail::make_upright(j.page, out.rotation, std::move(small), o, j.up, skew,
+                       [this](int rows, const std::function<void(int, int)>& band) { split_rows(rows, band); });
   out.skew = j.up.skew;
   out.ms.orient = ms_since(j.start);
 
@@ -721,9 +886,15 @@ void Engine::Impl::page(Job& j, int k) {
       if (wd->threads > free_fast(k)) continue;
       std::unique_lock lk(wd->m, std::try_to_lock);
       if (!lk) continue;
-      return std::move(wd->session->run(in)[0]);
+      if (!wide_head) return std::move(wd->session->run(in)[0]);
+      Tensor maps;
+      wd->session->run(in, [&](std::span<const Session::OutputView> y) { maps = head_maps(y[0], *wide_head); });
+      return maps;
     }
-    return std::move(w[k].det->run(in)[0]);
+    if (!head) return std::move(w[k].det->run(in)[0]);
+    Tensor maps;
+    w[k].det->run(in, [&](std::span<const Session::OutputView> y) { maps = head_maps(y[0], *head); });
+    return maps;
   };
   const Tensor maps = run(input);
   out.ms.detect = ms_since(t);
@@ -743,29 +914,31 @@ void Engine::Impl::page(Job& j, int k) {
   j.lines_start = Clock::now();
   const size_t n = out.lines.size();
   if (n == 0) {
-    finish(j, k);
+    end(j, k);
     return;
   }
-  std::vector<int> bucket(n);
-  for (size_t i = 0; i < n; ++i) bucket[i] = width_bucket(crop_region(out.lines[i].box, o.crop).width);
-  auto order = std::make_shared<std::vector<size_t>>(n);
-  std::iota(order->begin(), order->end(), size_t{0});
-  std::stable_sort(order->begin(), order->end(), [&](size_t a, size_t b) { return bucket[a] < bucket[b]; });
-  const int idle = pool.idle();
-  const size_t chunk = idle > 0 ? (n + std::max(1, free_fast(k)) - 1) / std::max(1, free_fast(k))
-                                : static_cast<size_t>(std::max(1, o.line_batch));
-  const int tasks = static_cast<int>((n + chunk - 1) / chunk);
+  const detail::LineTasks plan = detail::line_tasks(out.lines, o.crop, pool.idle() > 0 ? free_fast(k) : 0,
+                                                    o.line_batch);
+  auto lines = std::make_shared<std::vector<size_t>>(std::move(plan.lines));
+  const int tasks = static_cast<int>(plan.starts.size()) - 1;
   j.left.store(tasks);
   for (int t2 = 1; t2 < tasks; ++t2) {
-    pool.submit([this, &j, order, chunk, t2, n](int v) {
-      const size_t a = t2 * chunk, b = std::min(n, a + chunk);
-      recognize(j, std::span<const size_t>(order->data() + a, b - a), v);
-    });
+    const size_t a = plan.starts[t2], b = plan.starts[t2 + 1];
+    pool.submit([this, &j, lines, a, b](int v) { recognize(j, std::span<const size_t>(lines->data() + a, b - a), v); });
   }
-  recognize(j, std::span<const size_t>(order->data(), std::min(n, chunk)), k);
+  recognize(j, std::span<const size_t>(lines->data(), plan.starts[1]), k);
 }
 
 void Engine::Impl::recognize(Job& j, std::span<const size_t> lines, int k) {
+  try {
+    read_lines(j, lines, k);
+  } catch (...) {
+    j.fail(std::current_exception());
+  }
+  if (j.left.fetch_sub(1) == 1) end(j, k);
+}
+
+void Engine::Impl::read_lines(Job& j, std::span<const size_t> lines, int k) {
   const int h = o.crop.height;
   for (size_t a = 0; a < lines.size();) {
     // one batch for each width bucket the task's lines fall in
@@ -783,16 +956,23 @@ void Engine::Impl::recognize(Job& j, std::span<const size_t> lines, int k) {
     Tensor x = Tensor::empty(DType::kFloat32, {m, 1, h, bw});
     float* px = x.data<float>().data();
     for (size_t i = 0; i < crops.size(); ++i) px[i] = 1.0f - crops[i] / 255.0f;
-    const Tensor logits = std::move(w[k].rec->run(one(std::move(x)))[0]);
-    const Shape& s = logits.shape();
+    // The logits decoded where the recognizer wrote them (about 20 MB a page, read once): no copy.
     std::vector<int32_t> lengths(m);
-    for (int i = 0; i < m; ++i) lengths[i] = std::min<int32_t>(static_cast<int32_t>(s[2]), widths[i] / o.crop.frame_px);
-    const auto decoded = ctc_greedy(logits.data<float>().data(), m, static_cast<int>(s[1]), static_cast<int>(s[2]),
-                                    lengths);
+    std::vector<CtcLine> decoded;
+    const std::vector<Tensor> in = one(std::move(x));
+    w[k].rec->run(in, [&](std::span<const Session::OutputView> out) {
+      const Session::OutputView& v = out[0];
+      if (v.dtype != DType::kFloat32 || v.shape.size() != 3 || v.shape[0] != m) {
+        throw Error(o.rec + " gives logits " + shape_string(v.shape) + " for " + std::to_string(m) + " lines");
+      }
+      for (int i = 0; i < m; ++i) {
+        lengths[i] = std::min<int32_t>(static_cast<int32_t>(v.shape[2]), widths[i] / o.crop.frame_px);
+      }
+      decoded = ctc_greedy(v.as<float>(), m, static_cast<int>(v.shape[1]), static_cast<int>(v.shape[2]), lengths);
+    });
     for (int i = 0; i < m; ++i) detail::read_line(j.out.lines[lines[a + i]], decoded[i], lengths[i], o.crop, vocab);
     a = b;
   }
-  if (j.left.fetch_sub(1) == 1) finish(j, k);
 }
 
 void Engine::Impl::finish(Job& j, int k) {
@@ -806,6 +986,41 @@ void Engine::Impl::finish(Job& j, int k) {
 // ---------------------------------------------------------------- the steps the pipeline shares
 
 namespace detail {
+
+LineTasks line_tasks(std::span<const OcrLine> lines, const CropRule& crop, int parts, int line_batch) {
+  const size_t n = lines.size();
+  std::vector<int> bucket(n);
+  for (size_t i = 0; i < n; ++i) bucket[i] = width_bucket(crop_region(lines[i].box, crop).width);
+  std::vector<size_t> order(n);
+  std::iota(order.begin(), order.end(), size_t{0});
+  std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return bucket[a] < bucket[b]; });
+  LineTasks plan;
+  if (parts <= 0) {  // every core busy: tasks of line_batch width-sorted lines, which other pages' workers steal
+    const size_t chunk = static_cast<size_t>(std::max(1, line_batch));
+    plan.lines = std::move(order);
+    for (size_t a = 0; a < n; a += chunk) plan.starts.push_back(a);
+    plan.starts.push_back(n);
+    return plan;
+  }
+  // Idle cores: a task each, split by cost (a line costs its bucket's width): the widest first, each into the least
+  // loaded task (equal counts of width-sorted lines left the widest task 2.3 times the mean on the median page);
+  // inside each task the lines by width again, so a bucket's lines stay one batch.
+  const int p = static_cast<int>(std::min<size_t>(static_cast<size_t>(parts), n));
+  std::vector<std::vector<size_t>> part(p);
+  std::vector<int64_t> load(p, 0);
+  for (auto it = order.rbegin(); it != order.rend(); ++it) {
+    const int t = static_cast<int>(std::min_element(load.begin(), load.end()) - load.begin());
+    load[t] += bucket[*it];
+    part[t].push_back(*it);
+  }
+  for (auto& t : part) {
+    std::stable_sort(t.begin(), t.end(), [&](size_t a, size_t b) { return bucket[a] < bucket[b]; });
+    plan.starts.push_back(plan.lines.size());
+    plan.lines.insert(plan.lines.end(), t.begin(), t.end());
+  }
+  plan.starts.push_back(n);
+  return plan;
+}
 
 OrderModel choose_order(const std::filesystem::path& set, const EngineOptions& o) {
   OrderModel m;
@@ -850,7 +1065,8 @@ int rotation_of(std::span<const float> z, float turn_probability) {
   return p >= turn_probability && (best == 3 || best == 6 || best == 9) ? static_cast<int>(best) * 30 : 0;
 }
 
-void make_upright(const GrayView& page, int rotation, GrayImage small, const EngineOptions& o, Upright& u) {
+void make_upright(const GrayView& page, int rotation, GrayImage small, const EngineOptions& o, Upright& u,
+                  std::optional<Skew> skew, const RowSplit& split) {
   u.view = page;
   u.skew = 0;
   u.small = std::move(small);
@@ -861,10 +1077,10 @@ void make_upright(const GrayView& page, int rotation, GrayImage small, const Eng
     u.small = rotate_quarter(u.small.view(), q);
   }
   if (o.deskew) {
-    const Skew s = find_skew(u.small.view(), o.max_skew);
+    const Skew s = skew && !rotation ? *skew : find_skew(u.small.view(), o.max_skew);
     if (std::abs(s.degrees) >= o.min_skew && s.gain >= o.min_skew_gain) {
       u.skew = s.degrees;
-      u.levelled = rotate_page(u.view, s.degrees);
+      u.levelled = split ? rotate_page(u.view, s.degrees, split) : rotate_page(u.view, s.degrees);
       u.view = u.levelled.view();
       u.small = rotate_page(u.small.view(), s.degrees);
     }
@@ -1031,12 +1247,68 @@ std::vector<OcrPage> Engine::ocr(std::span<const GrayView> pages) {
   }
   for (auto& j : jobs) {
     Impl::Job* job = j.get();
-    impl_->pool.submit([this, job](int k) { impl_->page(*job, k); });
+    impl_->pool.submit([this, job](int k) { impl_->start(*job, k); });
   }
   impl_->pool.wait();
+  for (auto& j : jobs) {
+    if (j->error) std::rethrow_exception(j->error);
+  }
   std::vector<OcrPage> out;
   for (auto& j : jobs) out.push_back(std::move(j->out));
   return out;
+}
+
+size_t Engine::Impl::give(std::unique_ptr<Job> job) {
+  job->streamed = true;
+  const size_t cap = static_cast<size_t>(o.in_flight > 0 ? o.in_flight : 2 * pool.size());
+  Job* j = job.get();
+  {
+    std::unique_lock lk(stream.m);
+    stream.cv.wait(lk, [&] { return stream.submitted - stream.completed < cap; });
+    stream.jobs.emplace(stream.submitted, std::move(job));
+    ++stream.submitted;
+  }
+  pool.submit([this, j](int k) { start(*j, k); });
+  return stream.submitted - 1;
+}
+
+size_t Engine::submit(const GrayView& page, std::shared_ptr<const void> keep) {
+  if (!page.data || page.width <= 0 || page.height <= 0) throw Error("Engine::submit: an empty page");
+  auto job = std::make_unique<Impl::Job>();
+  job->page = page;
+  job->keep = std::move(keep);
+  return impl_->give(std::move(job));
+}
+
+size_t Engine::submit(GrayImage page) {
+  if (page.pixels.empty() || page.width <= 0 || page.height <= 0) throw Error("Engine::submit: an empty page");
+  auto job = std::make_unique<Impl::Job>();
+  job->own = std::move(page);
+  job->page = job->own.view();
+  return impl_->give(std::move(job));
+}
+
+size_t Engine::submit(const std::filesystem::path& file) {
+  if (file.empty()) throw Error("Engine::submit: no file");
+  auto job = std::make_unique<Impl::Job>();
+  job->file = file;
+  return impl_->give(std::move(job));
+}
+
+std::optional<OcrPage> Engine::next() {
+  Impl::Stream& s = impl_->stream;
+  std::unique_ptr<Impl::Job> job;
+  {
+    std::unique_lock lk(s.m);
+    if (s.taken == s.submitted) return std::nullopt;
+    s.cv.wait(lk, [&] { return s.jobs.at(s.taken)->complete; });
+    auto it = s.jobs.find(s.taken);
+    job = std::move(it->second);
+    s.jobs.erase(it);
+    ++s.taken;
+  }
+  if (job->error) std::rethrow_exception(job->error);
+  return std::move(job->out);
 }
 
 OcrPage Engine::ocr(const GrayView& page) { return std::move(ocr(std::span<const GrayView>(&page, 1))[0]); }

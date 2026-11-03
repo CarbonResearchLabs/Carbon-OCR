@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "carbon/deskew.h"
 #include "carbon/detect.h"
 #include "carbon/engine.h"
 #include "carbon/image.h"
@@ -23,6 +24,16 @@ namespace carbon::detail {
 
 // A page's side scaled so its long side is `to` (at least 1 px).
 int fit_side(int side, int longest, int to);
+
+// A page's lines as recognition tasks: `lines` the lines' indices task by task, task t from starts[t] to
+// starts[t + 1], each task's lines by width bucket so a bucket's lines are one batch. With parts > 0 (the free
+// fast cores) that many tasks of about equal cost, a line costing its bucket's width; else tasks of line_batch
+// width-sorted lines. Every line keeps its bucket either way, so the text is the same.
+struct LineTasks {
+  std::vector<size_t> lines;
+  std::vector<size_t> starts;
+};
+LineTasks line_tasks(std::span<const OcrLine> lines, const CropRule& crop, int parts, int line_batch);
 
 // The page at the detector's scale: its long side long_side, the crop rule's
 // antialiased bilinear.
@@ -45,7 +56,10 @@ struct Upright {
   GrayView view{};
   double skew = 0;
 };
-void make_upright(const GrayView& page, int rotation, GrayImage small, const EngineOptions& o, Upright& u);
+// skew: the page's own, where the caller found it already on `small` as given (a page orientation does not
+// turn: the search ran beside orientation); split: the full page's levelling turned in row bands.
+void make_upright(const GrayView& page, int rotation, GrayImage small, const EngineOptions& o, Upright& u,
+                  std::optional<Skew> skew = std::nullopt, const RowSplit& split = {});
 
 // A detector run: its input [1, 1, h, w] (an ink map, h and w multiples of 32), its maps.
 using DetectRun = std::function<Tensor(const Tensor&)>;

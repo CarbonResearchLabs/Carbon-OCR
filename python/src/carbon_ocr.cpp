@@ -240,6 +240,7 @@ nb::dict page_dict(const carbon::OcrPage& p, bool html = false) {
   ms["second_pass"] = p.ms.second_pass;
   ms["recognize"] = p.ms.recognize;
   ms["total"] = p.ms.total;
+  ms["load"] = p.ms.load;
   d["ms"] = ms;
   d["text"] = p.text();
   if (html) d["html"] = carbon::to_html_body(p);
@@ -343,7 +344,48 @@ NB_MODULE(carbon_ocr, m) {
           "skew, lines (box, text, confidence, det_score) in reading order, pictures, order (\"model\" or "
           "\"xy-cut\"), blocks (label, confidence, lines, cells), second_pass (detected again at a larger scale: tiny "
           "text), ms (per stage), text; with html, the page as carbon-ocr's --format html writes it, its blocks as "
-          "headings, paragraphs, lists and tables (carbon/output.h).");
+          "headings, paragraphs, lists and tables (carbon/output.h).")
+      .def(
+          "submit",
+          [](carbon::Engine& e, Gray page) {
+            const carbon::GrayView v = view(page);
+            // the array, held until next() has returned its page: no copy of its pixels
+            auto* held = new Gray(std::move(page));
+            std::shared_ptr<const void> keep(held, [](const void* q) {
+              nb::gil_scoped_acquire locked;
+              delete static_cast<const Gray*>(q);
+            });
+            nb::gil_scoped_release unlocked;
+            return e.submit(v, std::move(keep));
+          },
+          "page"_a,
+          "Gives the engine a page (uint8 [h, w], paper 255) to read as soon as a worker is free, and returns its "
+          "number, from 0 in the order given; waits while the engine is reading its in_flight pages (two a worker). "
+          "The array is held, not copied, until next() has returned its page.")
+      .def(
+          "submit_file",
+          [](carbon::Engine& e, const std::filesystem::path& file) {
+            nb::gil_scoped_release unlocked;
+            return e.submit(file);
+          },
+          "file"_a,
+          "As submit(), with a page's image file, read and decoded by the engine's worker that takes the page (as "
+          "load_image reads it), beside the other pages' work; its ms[\"load\"] the read and decode. A file that "
+          "cannot be read is that page's error, raised by next().")
+      .def(
+          "next",
+          [](carbon::Engine& e, bool html) -> nb::object {
+            std::optional<carbon::OcrPage> p;
+            {
+              nb::gil_scoped_release unlocked;
+              p = e.next();
+            }
+            if (!p) return nb::none();
+            return page_dict(*p, html);
+          },
+          "html"_a = false,
+          "The next page given to submit(), in the order given, as ocr() returns it; waits for it. Raises the error "
+          "that page met (the stream goes on); None once every page given is out.");
 
   nb::class_<carbon::Pipeline>(m, "Pipeline",
                                "The batched OCR pipeline (carbon::Pipeline, carbon/pipeline.h): every model run on "
@@ -410,11 +452,13 @@ NB_MODULE(carbon_ocr, m) {
   m.def(
       "load_image",
       [](const std::filesystem::path& path) {
-        carbon::GrayImage img = carbon::load_image(path);
-        uint8_t* out = nullptr;
-        auto a = new_u8({static_cast<size_t>(img.height), static_cast<size_t>(img.width)}, out);
-        std::memcpy(out, img.pixels.data(), img.pixels.size());
-        return a;
+        carbon::GrayImage img;
+        {
+          nb::gil_scoped_release unlocked;  // other Python threads run while it reads and decodes
+          img = carbon::load_image(path);
+        }
+        const size_t h = static_cast<size_t>(img.height), w = static_cast<size_t>(img.width);
+        return owned(std::move(img.pixels), {h, w});  // the decoder's own buffer, not a copy
       },
       "path"_a, "A PNG, JPEG, BMP or PNM page as grayscale uint8 [h, w], as the engine reads it.");
   m.attr("__version__") = std::string(carbon::kVersion);

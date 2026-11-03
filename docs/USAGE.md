@@ -105,6 +105,11 @@ for page in pages:
     for line in page["lines"]:                                      # in reading order
         print(line["box"], round(line["confidence"], 3), line["text"])
 
+for name in ["a.png", "b.png", "c.png"]:                           # a stream: each page starts
+    engine.submit_file(name)                                        # when a worker is free
+while (page := engine.next()) is not None:                          # in the order given
+    print(page["ms"]["load"], page["text"][:60])
+
 pipeline = carbon_ocr.Pipeline("models/fullerene-3M", page_batch=8)  # batched; same results
 pages = pipeline.ocr([carbon_ocr.load_image("a.png")])
 print(pipeline.stats)

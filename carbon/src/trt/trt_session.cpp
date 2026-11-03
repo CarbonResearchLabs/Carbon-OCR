@@ -319,6 +319,7 @@ class TrtSession final : public Session {
   }
 
   Backend backend() const override { return Backend::kTensorRT; }
+  using Session::run;  // and run() with its outputs in place: the base's, over this one
 
   std::vector<Tensor> run(std::span<const Tensor> inputs) override {
     check_inputs(inputs);

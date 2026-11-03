@@ -6,6 +6,7 @@ add_library(carbon
   src/session.cpp
   src/lines.cpp
   src/detect.cpp
+  src/det_head.cpp
   src/engine.cpp
   src/pipeline.cpp
   src/image.cpp

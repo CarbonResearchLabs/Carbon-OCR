@@ -20,6 +20,10 @@ struct CpuCore {
   std::vector<int> cpus;  // its logical processors (two with SMT), numbered within the group
   int numa_node = 0;
   int efficiency = 0;     // on hybrid CPUs, higher is faster (P-cores above E-cores); else 0
+  // Within its class, how the OS ranks the core (Windows' scheduling class: its favored cores, the highest turbo,
+  // above the rest); 0 where it gives none.  Workers take the higher first.
+  int rank = 0;
+  bool interrupts = false;  // it holds logical processor 0 of group 0, where Windows sends most interrupts: last
 };
 
 struct CpuTopology {
@@ -50,6 +54,10 @@ struct PoolOptions {
   // cores of the fastest class (every worker, unless the CPU is hybrid or the
   // pool unpinned).
   int fast = -1;
+  // Whether a slow worker also starts tasks from outside the pool (new pages), or
+  // only takes the tasks a running task queued (a page's lines): a new task then
+  // always starts on a fast core, where it is quickest (the engine's choice).
+  bool slow_takes_new = true;
 };
 
 // Worker threads that run tasks.  A task gets the index of the worker running
@@ -61,7 +69,8 @@ struct PoolOptions {
 // pages spread over every core and the pages in flight finish first.  On a
 // hybrid CPU a worker on a slower core takes a task only while every fast
 // worker is running one, so a lone page runs on the fast cores and a full load
-// on all of them.  Idle workers sleep; they never spin.
+// on all of them; with slow_takes_new false it takes only a running task's
+// tasks, never a new one.  Idle workers sleep; they never spin.
 class WorkerPool {
  public:
   using Task = std::function<void(int worker)>;
@@ -76,9 +85,9 @@ class WorkerPool {
   int pinned() const;  // the workers pinned to a core
   int fast() const;    // the workers on the fastest cores
   bool is_fast(int worker) const;
-  // The fast workers asleep now: how many more tasks could start at once on the
-  // fastest cores.  A hint (it changes as tasks start and end), for splitting
-  // a page's work to the cores that are free.
+  // The fast workers asleep now, less the tasks already queued for them: how many
+  // more tasks could start at once on the fastest cores.  A hint (it changes as
+  // tasks start and end), for splitting a page's work to the cores that are free.
   int idle() const;
 
   void submit(Task task);

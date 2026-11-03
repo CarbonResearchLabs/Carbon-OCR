@@ -9,6 +9,8 @@
 #include <numeric>
 #include <utility>
 
+#include "carbon/cpu.h"
+
 namespace carbon {
 
 namespace {
@@ -277,20 +279,29 @@ DetMasks threshold_det(const float* maps, int map_h, int map_w, const DetRule& r
   m.height = map_h;
   m.width = map_w;
   m.words = (map_w + 31) / 32;
-  m.core.assign(static_cast<size_t>(map_h) * m.words, 0);
-  m.picture.assign(m.core.size(), 0);
+  m.core.resize(static_cast<size_t>(map_h) * m.words);
+  m.picture.resize(m.core.size());
+  // The masks a row at a time on the CPU's vectors, then each set pixel's values, in the pixels' order, into lists
+  // reserved for them.
+  size_t cores = 0, pictures = 0;
   for (int r = 0; r < map_h; ++r) {
-    for (int c = 0; c < map_w; ++c) {
-      const size_t i = static_cast<size_t>(r) * map_w + c, word = static_cast<size_t>(r) * m.words + c / 32;
-      if (core[i] > tc) {
-        m.core[word] |= 1u << (c % 32);
-        m.core_values.insert(m.core_values.end(), {core[i], top[i], bottom[i]});
-      }
-      if (picture[i] > tp) {
-        m.picture[word] |= 1u << (c % 32);
-        m.picture_values.push_back(picture[i]);
-      }
+    const size_t at = static_cast<size_t>(r) * map_w, word = static_cast<size_t>(r) * m.words;
+    cpu::above_bits(core + at, map_w, tc, &m.core[word]);
+    cpu::above_bits(picture + at, map_w, tp, &m.picture[word]);
+    for (int k = 0; k < m.words; ++k) {
+      cores += static_cast<size_t>(std::popcount(m.core[word + k]));
+      pictures += static_cast<size_t>(std::popcount(m.picture[word + k]));
     }
+  }
+  m.core_values.reserve(3 * cores);
+  m.picture_values.reserve(pictures);
+  for (size_t word = 0; word < m.core.size(); ++word) {
+    const size_t at = word / m.words * map_w + word % m.words * 32;
+    for (uint32_t b = m.core[word]; b; b &= b - 1) {
+      const size_t i = at + static_cast<size_t>(std::countr_zero(b));
+      m.core_values.insert(m.core_values.end(), {core[i], top[i], bottom[i]});
+    }
+    for (uint32_t b = m.picture[word]; b; b &= b - 1) m.picture_values.push_back(picture[at + std::countr_zero(b)]);
   }
   return m;
 }

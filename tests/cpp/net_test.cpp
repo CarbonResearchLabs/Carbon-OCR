@@ -13,7 +13,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "carbon/cpu.h"
@@ -21,6 +23,7 @@
 #include "carbon/error.h"
 #include "carbon/session.h"
 #include "test_model.h"
+#include "../../carbon/src/det_head.h"
 
 namespace carbon {
 namespace {
@@ -382,6 +385,56 @@ TEST(NativeBackend, RefusesWhatItDoesNotRun) {
   SessionOptions o;
   o.isa = "no-such-set";
   EXPECT_THROW(open_session(Backend::kNative, data("native-cls.onnx"), o), Error);
+}
+
+
+// The detector cut before its head (carbon/src/det_head.h), its head then run by the engine (cpu::det_head), gives
+// the whole detector's maps: FP32 on the native backend and on ONNX Runtime and FP16 on the native backend within
+// float rounding; int8 within the quantization the whole file's head adds and the engine's FP32 head does not.
+TEST(Net, TheDetectorCutBeforeItsHeadGivesItsMaps) {
+  std::mt19937 rng(3);
+  std::uniform_real_distribution<float> u(0.0f, 1.0f);
+  Tensor x = Tensor::empty(DType::kFloat32, {1, 1, 64, 48});
+  for (float& v : x.data<float>()) v = u(rng) < 0.3f ? u(rng) : 0.0f;  // ink, sparse
+  struct Case {
+    const char* file;
+    Backend backend;
+    float tolerance;  // of the largest map value
+  };
+  std::vector<Case> cases = {{"native-det.onnx", Backend::kNative, 1e-4f},
+                             {"native-det.fp16.onnx", Backend::kNative, 1e-2f},
+                             {"native-det.int8.onnx", Backend::kNative, 0.05f}};
+  const auto built = compiled_backends();
+  if (std::find(built.begin(), built.end(), Backend::kOnnxRuntime) != built.end()) {
+    cases.push_back({"native-det.onnx", Backend::kOnnxRuntime, 1e-4f});
+  }
+  for (const Case& c : cases) {
+    const auto head = detail::fused_det_head(data(c.file));
+    ASSERT_TRUE(head.has_value()) << c.file;
+    EXPECT_EQ(head->mid, 8);
+    EXPECT_EQ(head->out, 4);
+    const auto whole = open_session(c.backend, data(c.file));
+    SessionOptions cut;
+    cut.model_bytes = head->cut;
+    const auto part = open_session(c.backend, data(c.file), cut);
+    const std::span<const Tensor> in(&x, 1);
+    const Tensor want = std::move(whole->run(in)[0]);
+    const Tensor y = std::move(part->run(in)[0]);
+    ASSERT_EQ(y.shape(), (Shape{1, head->in, 16, 12})) << c.file;
+    ASSERT_EQ(want.shape(), (Shape{1, 4, 32, 24})) << c.file;
+    Tensor got = Tensor::empty(DType::kFloat32, {1, 4, 32, 24});
+    cpu::det_head(y.data<float>().data(), 16, 12, head->weights(), got.data<float>().data(), 0, 32);
+    float most = 0, worst = 0;
+    const std::span<const float> a = want.data<float>();
+    const std::span<const float> b = std::as_const(got).data<float>();
+    for (size_t i = 0; i < a.size(); ++i) {
+      most = std::max(most, std::abs(a[i]));
+      worst = std::max(worst, std::abs(a[i] - b[i]));
+    }
+    EXPECT_GT(most, 0.0f) << c.file;
+    EXPECT_LE(worst, c.tolerance * most) << c.file << " on " << backend_name(c.backend);
+  }
+  EXPECT_FALSE(detail::fused_det_head(data("native-rec.onnx")).has_value());  // no detector head there
 }
 
 }  // namespace

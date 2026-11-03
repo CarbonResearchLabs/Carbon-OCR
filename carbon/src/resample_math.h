@@ -45,14 +45,21 @@ CARBON_HD inline double triangle(double x) {
   return x < 1.0 ? 1.0 - x : 0.0;
 }
 
+// floor(v) as an int, for v in an int's range: the truncation, one less where that is above v. The same value as
+// static_cast<int>(floor(v)), without the library's call.
+CARBON_HD inline int floor_int(double v) {
+  const int i = static_cast<int>(v);
+  return i - (v < i ? 1 : 0);
+}
+
 // Output sample `xx`: its first source index (returned), its tap count, and its
 // coefficients in fixed point (k[0 .. count)).  PIL truncates the window ends
 // toward zero and clamps them to the image; with paper outside the image, floor
 // is the same rounding on a page shifted to positive coordinates.
 CARBON_HD inline int coefficients(const Filter& f, double in0, int xx, int32_t* k, int* count) {
   const double center = in0 + (xx + 0.5) * f.scale;
-  const int xmin = static_cast<int>(floor(center - f.support + 0.5));
-  const int n = static_cast<int>(floor(center + f.support + 0.5)) - xmin;
+  const int xmin = floor_int(center - f.support + 0.5);
+  const int n = floor_int(center + f.support + 0.5) - xmin;
   double ww = 0.0;
   for (int x = 0; x < n; ++x) ww += triangle((x + xmin - center + 0.5) * f.ss);
   for (int x = 0; x < n; ++x) {

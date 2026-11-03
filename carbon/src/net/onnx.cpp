@@ -3,9 +3,11 @@
 
 #include "onnx.h"
 
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <set>
 
 #include "carbon/cpu.h"
 #include "carbon/error.h"
@@ -417,6 +419,128 @@ Model load(const std::filesystem::path& path) {
   } catch (const Error& e) {
     throw Error(path.string() + ": " + e.what());
   }
+}
+
+namespace {
+
+// Protobuf's wire format, written: a key, then a varint or a length and its bytes.
+void put_varint(std::string& out, uint64_t v) {
+  while (v >= 0x80) {
+    out.push_back(static_cast<char>((v & 0x7f) | 0x80));
+    v >>= 7;
+  }
+  out.push_back(static_cast<char>(v));
+}
+void put_bytes(std::string& out, uint32_t field, std::string_view bytes) {
+  put_varint(out, (static_cast<uint64_t>(field) << 3) | 2);
+  put_varint(out, bytes.size());
+  out.append(bytes);
+}
+void put_int(std::string& out, uint32_t field, uint64_t v) {
+  put_varint(out, static_cast<uint64_t>(field) << 3);
+  put_varint(out, v);
+}
+
+// A name in a message: a ValueInfoProto's is field 1, a TensorProto's field 8.
+std::string name_in(std::string_view msg, uint32_t name_field) {
+  Reader r(msg);
+  uint32_t field, wire;
+  while (r.next(field, wire)) {
+    if (field == name_field && wire == 2) return text(r.bytes());
+    r.skip(wire);
+  }
+  return {};
+}
+
+}  // namespace
+
+std::string cut(std::string_view model, const std::string& output, int32_t dtype, const std::vector<int64_t>& dims) {
+  // The nodes `output` depends on, from the graph's end back.
+  const Model m = parse(model);
+  std::set<std::string> needed{output};
+  std::vector<bool> keep(m.graph.nodes.size(), false);
+  bool made = false;
+  for (size_t k = m.graph.nodes.size(); k-- > 0;) {
+    const Node& n = m.graph.nodes[k];
+    bool want = false;
+    for (const std::string& o : n.outputs) want = want || needed.count(o);
+    if (!want) continue;
+    keep[k] = true;
+    for (const std::string& o : n.outputs) made = made || o == output;
+    for (const std::string& i : n.inputs) {
+      if (!i.empty()) needed.insert(i);
+    }
+  }
+  if (!made) throw Error("ONNX: no node makes " + output);
+  // The graph again, field by field: the nodes kept, the initializers they read, the inputs, and the new output.
+  std::string graph;
+  std::string_view graph_bytes;
+  Reader top(model);
+  uint32_t field, wire;
+  while (top.next(field, wire)) {
+    if (field == 7 && wire == 2) graph_bytes = top.bytes();
+    else top.skip(wire);
+  }
+  Reader g(graph_bytes);
+  size_t node = 0;
+  while (g.next(field, wire)) {
+    if (wire != 2) {  // no graph field the cut changes is a varint
+      g.skip(wire);
+      continue;
+    }
+    const std::string_view b = g.bytes();
+    switch (field) {
+      case 1:  // a node
+        if (keep[node++]) put_bytes(graph, 1, b);
+        break;
+      case 5:  // an initializer: kept where a kept node reads it
+        if (needed.count(name_in(b, 8))) put_bytes(graph, 5, b);
+        break;
+      case 11: {  // an input; older exports list the initializers as inputs too, kept as theirs are
+        const std::string name = name_in(b, 1);
+        const bool init = std::any_of(m.graph.initializers.begin(), m.graph.initializers.end(),
+                                      [&](const TensorData& t) { return t.name == name; });
+        if (!init || needed.count(name)) put_bytes(graph, 11, b);
+        break;
+      }
+      case 12:  // the outputs: the cut's alone, below
+      case 13:  // value_info: the shapes of tensors that may be gone
+        break;
+      default: put_bytes(graph, field, b);
+    }
+  }
+  std::string tensor_type, type, value;
+  put_int(tensor_type, 1, static_cast<uint64_t>(dtype));  // TypeProto.Tensor: elem_type
+  if (!dims.empty()) {
+    std::string shape;  // TensorShapeProto: a Dimension each, a value or a name
+    for (size_t d = 0; d < dims.size(); ++d) {
+      std::string dim;
+      if (dims[d] >= 0) put_int(dim, 1, static_cast<uint64_t>(dims[d]));
+      else put_bytes(dim, 2, "d" + std::to_string(d));
+      put_bytes(shape, 1, dim);
+    }
+    put_bytes(tensor_type, 2, shape);
+  }
+  put_bytes(type, 1, tensor_type);  // TypeProto: tensor_type
+  put_bytes(value, 1, output);      // ValueInfoProto: name
+  put_bytes(value, 2, type);        //                 type
+  put_bytes(graph, 12, value);
+  // The model with that graph, every other field as it was.
+  std::string out;
+  Reader r(model);
+  while (r.next(field, wire)) {
+    if (field == 7 && wire == 2) {
+      r.bytes();
+      put_bytes(out, 7, graph);
+      continue;
+    }
+    switch (wire) {
+      case 0: put_int(out, field, r.varint()); break;
+      case 2: put_bytes(out, field, r.bytes()); break;
+      default: throw Error("ONNX: a ModelProto field of wire type " + std::to_string(wire));
+    }
+  }
+  return out;
 }
 
 std::map<std::string, std::string> metadata(const std::filesystem::path& path) {

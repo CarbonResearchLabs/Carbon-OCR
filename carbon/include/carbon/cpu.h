@@ -233,6 +233,23 @@ void gemm_f16(Rows<float> a, const PackedF16& b, int m, const Epilogue& out);
 void dwconv_f16(Rows<uint16_t> a, const uint16_t* w, int c, int m, const Epilogue& out, Isa isa = best_isa());
 void dwconv_f16(Rows<float> a, const uint16_t* w, int c, int m, const Epilogue& out, Isa isa = best_isa());
 
+// ---------------------------------------------------------------- a threshold's bits
+//
+// Bit i % 32 of bits[i / 32] set where v[i] > t (a NaN never), for i in [0, n); the
+// last word's bits past n clear. The detector's masks (carbon/detect.h). Vectors:
+// avx2 for every x86-64 set, neon for Arm; the scalar reference elsewhere.
+void above_bits(const float* v, int n, float t, uint32_t* bits, Isa isa = best_isa());
+
+// ---------------------------------------------------------------- a crop's counts
+//
+// Of a crop's w x h bytes (rows `stride` apart), how many are at most `lo` and how
+// many at least `hi` (light_on_dark's counts; none where lo < 0 or hi > 255).
+// Vectors: avx2 for every x86-64 set, neon for Arm; the scalar reference elsewhere.
+struct ByteCounts {  // an aggregate, so no constructor of its is built for an instruction set (made {0, 0})
+  int64_t below, above;
+};
+ByteCounts count_beyond(const uint8_t* c, int w, int h, int64_t stride, int lo, int hi, Isa isa = best_isa());
+
 // ---------------------------------------------------------------- CTC greedy
 //
 // One line of a recognizer's logits [classes][frames] (class-major, the models'
@@ -244,6 +261,25 @@ void dwconv_f16(Rows<float> a, const uint16_t* w, int c, int m, const Epilogue& 
 // Vectors run along the frames: avx2 for every x86-64 set, neon for Arm.
 void ctc_argmax(const float* logits, int classes, int frames, int t_n, int32_t* ids, float* probs,
                 Isa isa = best_isa());
+
+// det_head: the line detector's head (fullerene det) in one pass.  From x[in][h4][w4] (the FPN's stride-4 features):
+// a 1x1 convolution to `mid` channels and ReLU, a nearest 2x upsample, a depthwise 3x3 (padding 1) and ReLU, and a
+// 1x1 convolution to the `out` maps; rows row0 to row1 - 1 of maps[out][2 h4][2 w4].  The stride-2 tensors between
+// them are never written (two of 12.5 MB for a Letter page): each band keeps three upsampled rows.  Every output an
+// FMA chain, the bias first and then its inputs in order (the 1x1's channels; the 3x3's taps row by row), so every
+// version gives the reference's bits however the rows are cut.  Vectors run along the rows: avx2 for every x86-64
+// set; the reference elsewhere.
+struct DetHeadWeights {
+  int in = 0, mid = 0, out = 0;  // channels: x's, the head's, the maps' (out at most 8)
+  const float* w1 = nullptr;     // [mid][in]
+  const float* b1 = nullptr;     // [mid]
+  const float* w2 = nullptr;     // [mid][3][3]
+  const float* b2 = nullptr;     // [mid]
+  const float* w3 = nullptr;     // [out][mid]
+  const float* b3 = nullptr;     // [out]
+};
+void det_head(const float* x, int h4, int w4, const DetHeadWeights& w, float* maps, int row0, int row1,
+              Isa isa = best_isa());
 
 // ---------------------------------------------------------------- page turns
 //
@@ -261,6 +297,10 @@ void ctc_argmax(const float* logits, int classes, int frames, int t_n, int32_t* 
 // on its own in that order, so every version gives the reference's bytes.
 void rotate_bilinear(const uint8_t* src, int width, int height, int64_t stride, double s, double c, uint8_t* dst,
                      Isa isa = best_isa());
+// The same for dst's rows row0 to row1 - 1 alone (dst the whole page's): each row's bytes are what the whole turn
+// writes there, so the rows can be turned by several threads at once.
+void rotate_bilinear_rows(const uint8_t* src, int width, int height, int64_t stride, double s, double c, uint8_t* dst,
+                          int row0, int row1, Isa isa = best_isa());
 
 // rotate_quarters: the page turned clockwise q times 90 degrees (q 0 to 3), so
 // dst's rows are height bytes long when q is odd.

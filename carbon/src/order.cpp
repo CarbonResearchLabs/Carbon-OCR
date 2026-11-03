@@ -64,7 +64,10 @@ bool sentence_end(const std::u32string& t) {
 float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
 // Groups of `items` joined where the mean pairwise probability between two groups'
-// members reaches `join` (average linkage, merged greedily, best pair first).
+// members reaches `join` (average linkage, merged greedily, best pair first: of equal
+// means the last pair, the groups scanned in order, each with those after it). Each
+// group keeps its best partner after it, so a merge rescans only the groups whose
+// partner it changed: about O(m^2) in all, where scanning every pair a merge was O(m^3).
 std::vector<std::vector<size_t>> cluster(const std::vector<size_t>& items, std::span<const float> logits, size_t n,
                                          float join) {
   const size_t m = items.size();
@@ -72,24 +75,38 @@ std::vector<std::vector<size_t>> cluster(const std::vector<size_t>& items, std::
   for (size_t i : items) g.push_back({i});
   std::vector<double> s(m * m, 0.0);  // the summed probabilities between two groups' members
   for (size_t a = 0; a < m; ++a) {
-    for (size_t b = 0; b < m; ++b) {
-      if (a == b) continue;
+    for (size_t b = a + 1; b < m; ++b) {
       s[a * m + b] = (sigmoid(logits[items[a] * n + items[b]]) + sigmoid(logits[items[b] * n + items[a]])) / 2;
+      s[b * m + a] = s[a * m + b];  // the same sum either way round
     }
   }
   std::vector<bool> alive(m, true);
+  auto mean = [&](size_t a, size_t b) { return s[a * m + b] / static_cast<double>(g[a].size() * g[b].size()); };
+  std::vector<size_t> partner(m, m);  // a's best group after it (the last of equal means), m if none
+  std::vector<double> top(m, -HUGE_VAL);
+  auto rescan = [&](size_t a) {
+    double best = -HUGE_VAL;
+    size_t at = m;
+    for (size_t b = a + 1; b < m; ++b) {
+      if (!alive[b]) continue;
+      const double v = mean(a, b);
+      if (v >= best) {
+        best = v;
+        at = b;
+      }
+    }
+    top[a] = best;
+    partner[a] = at;
+  };
+  for (size_t a = 0; a < m; ++a) rescan(a);
   for (;;) {
     double best = join;
     size_t ba = m, bb = m;
     for (size_t a = 0; a < m; ++a) {
-      for (size_t b = a + 1; alive[a] && b < m; ++b) {
-        if (!alive[b]) continue;
-        const double mean = s[a * m + b] / static_cast<double>(g[a].size() * g[b].size());
-        if (mean >= best) {
-          best = mean;
-          ba = a;
-          bb = b;
-        }
+      if (alive[a] && partner[a] != m && top[a] >= best) {
+        best = top[a];
+        ba = a;
+        bb = partner[a];
       }
     }
     if (ba == m) break;
@@ -100,6 +117,21 @@ std::vector<std::vector<size_t>> cluster(const std::vector<size_t>& items, std::
     }
     g[ba].insert(g[ba].end(), g[bb].begin(), g[bb].end());
     alive[bb] = false;
+    rescan(ba);
+    for (size_t a = 0; a < m; ++a) {
+      if (!alive[a] || a == ba) continue;
+      if (partner[a] == ba || partner[a] == bb) {  // its best changed or is gone
+        rescan(a);
+      } else if (a < ba) {
+        // Its mean with ba changed: merged, it lies between the two it replaces, so only rounding lifts it to a's
+        // best; then the scan's >= in ba's place among a's partners.
+        const double v = mean(a, ba);
+        if (v > top[a] || (v == top[a] && ba > partner[a])) {
+          top[a] = v;
+          partner[a] = ba;
+        }
+      }
+    }
   }
   std::vector<std::vector<size_t>> out;
   for (size_t a = 0; a < m; ++a) {
@@ -190,8 +222,9 @@ PageOrder decode_order(const OrderOutputs& out, std::span<const LineBox> boxes, 
     for (size_t j = 0; j < T; ++j) {
       if (j != i) z += std::exp(out.successor[i * T + j] - m);
     }
+    const double lz = std::log(z);
     for (size_t j = 0; j < T; ++j) {
-      if (j != i) lp[i * T + j] = out.successor[i * T + j] - m - std::log(z);
+      if (j != i) lp[i * T + j] = out.successor[i * T + j] - m - lz;
     }
   }
   // the chain, as tokens: start, then lines (token = line + 1), then the end (0)
@@ -265,10 +298,10 @@ PageOrder decode_order(const OrderOutputs& out, std::span<const LineBox> boxes, 
     if (b.label != block_label("Table")) continue;
     // cells, then rows and columns of cells
     std::vector<std::vector<size_t>> cells = cluster(b.lines, out.table_cell, N, rule.join);
+    std::vector<size_t> place(N);  // a line's place in the block's order
+    for (size_t k = 0; k < b.lines.size(); ++k) place[b.lines[k]] = k;
     for (auto& c : cells) {  // a cell's lines in reading order
-      std::sort(c.begin(), c.end(), [&](size_t x, size_t y) {
-        return std::find(b.lines.begin(), b.lines.end(), x) < std::find(b.lines.begin(), b.lines.end(), y);
-      });
+      std::sort(c.begin(), c.end(), [&](size_t x, size_t y) { return place[x] < place[y]; });
     }
     std::vector<size_t> heads(cells.size());  // a cell stands for its lines by its first
     for (size_t c = 0; c < cells.size(); ++c) heads[c] = cells[c].front();

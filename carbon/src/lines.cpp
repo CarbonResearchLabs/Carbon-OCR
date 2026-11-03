@@ -237,22 +237,36 @@ void resample_gray(const GrayView& im, double x0, double y0, double x1, double y
   }
 }
 
-uint8_t crop_ground(const uint8_t* c, int w, int h, int64_t stride) {
+namespace {
+
+// The bytes crop_ground takes the median of: the top and bottom rows and the right column (the corners twice).
+std::array<int, 256> ground_histogram(const uint8_t* c, int w, int h, int64_t stride) {
   std::array<int, 256> hist{};
   for (int x = 0; x < w; ++x) {
     ++hist[c[x]];
     ++hist[c[(h - 1) * stride + x]];
   }
   for (int y = 0; y < h; ++y) ++hist[c[y * stride + w - 1]];
-  const int m = 2 * w + h;
+  return hist;
+}
+
+// Their median (the mean of the middle two, rounded down, of an even count); of the crop flipped (255 - each byte),
+// read from the same histogram backwards.
+uint8_t ground_of(const std::array<int, 256>& hist, int count, bool flipped) {
   auto nth = [&](int n) {  // the n-th smallest, from 0
     for (int v = 0, seen = 0; v < 256; ++v) {
-      seen += hist[v];
+      seen += hist[flipped ? 255 - v : v];
       if (seen > n) return v;
     }
     return 255;
   };
-  return static_cast<uint8_t>(m % 2 ? nth(m / 2) : (nth(m / 2 - 1) + nth(m / 2)) / 2);
+  return static_cast<uint8_t>(count % 2 ? nth(count / 2) : (nth(count / 2 - 1) + nth(count / 2)) / 2);
+}
+
+}  // namespace
+
+uint8_t crop_ground(const uint8_t* c, int w, int h, int64_t stride) {
+  return ground_of(ground_histogram(c, w, h, stride), 2 * w + h, false);
 }
 
 void crop_lines(const GrayView& page, std::span<const LineBox> boxes, int out_width, uint8_t* out,
@@ -272,28 +286,34 @@ void crop_lines(const GrayView& page, std::span<const LineBox> boxes, int out_wi
   }
 }
 
+namespace {
+
+// light_on_dark's test on the crop's ground g: the CPU's vectors count its bytes (cpu::count_beyond).
+bool lighter_than_darker(const uint8_t* c, int w, int h, int64_t stride, int g, int margin) {
+  const cpu::ByteCounts n = cpu::count_beyond(c, w, h, stride, g - margin, g + margin);
+  return n.above > n.below;
+}
+
+}  // namespace
+
 bool light_on_dark(const uint8_t* c, int w, int h, int64_t stride, int margin) {
   if (margin <= 0 || w <= 0 || h <= 0) return false;
-  const int g = crop_ground(c, w, h, stride);
-  int64_t lighter = 0, darker = 0;
-  for (int y = 0; y < h; ++y) {
-    const uint8_t* row = c + y * stride;
-    for (int x = 0; x < w; ++x) {
-      lighter += row[x] >= g + margin;
-      darker += row[x] <= g - margin;
-    }
-  }
-  return lighter > darker;
+  return lighter_than_darker(c, w, h, stride, crop_ground(c, w, h, stride), margin);
 }
 
 void finish_crop(uint8_t* c, int w, int out_width, const CropRule& rule) {
   const int h = rule.height;
-  if (light_on_dark(c, w, h, out_width, rule.flip_margin)) {
+  if (w <= 0 || h <= 0) return;
+  // The ground's histogram once: the test's ground, and the padding's (the flipped crop's, the histogram backwards).
+  const std::array<int, 256> hist = ground_histogram(c, w, h, out_width);
+  const bool flip = rule.flip_margin > 0 &&
+                    lighter_than_darker(c, w, h, out_width, ground_of(hist, 2 * w + h, false), rule.flip_margin);
+  if (flip) {
     for (int y = 0; y < h; ++y)
       for (int x = 0; x < w; ++x) c[y * out_width + x] = static_cast<uint8_t>(255 - c[y * out_width + x]);
   }
   if (w < out_width) {
-    const uint8_t ground = crop_ground(c, w, h, out_width);
+    const uint8_t ground = ground_of(hist, 2 * w + h, flip);
     for (int y = 0; y < h; ++y) std::fill(c + y * out_width + w, c + (y + 1) * out_width, ground);
   }
 }

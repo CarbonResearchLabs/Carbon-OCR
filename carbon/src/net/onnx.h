@@ -78,4 +78,12 @@ Model parse(std::string_view bytes);
 // skipped: where the export writes a recognizer's crop rule (carbon.crop.*).
 std::map<std::string, std::string> metadata(const std::filesystem::path& path);
 
+// The model (a file's bytes) cut at `output`: the same ModelProto with its graph's one output that tensor
+// (of `dtype`, of shape `dims`), and only the nodes it depends on and the initializers they read; every
+// other field as it was. For a runtime to run part of a model, the rest done by the engine (the detector's head:
+// carbon/src/det_head.cpp). Throws Error where no node makes `output`.
+// dims: its shape where the runtime needs it given (the native backend does), -1 for a free dimension.
+std::string cut(std::string_view model, const std::string& output, int32_t dtype = kFloat,
+                const std::vector<int64_t>& dims = {});
+
 }  // namespace carbon::onnx

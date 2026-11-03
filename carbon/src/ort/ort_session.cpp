@@ -76,6 +76,14 @@ class OrtSession final : public Session {
     so.AddConfigEntry("session.intra_op.allow_spinning", "0");
     so.AddConfigEntry("session.inter_op.allow_spinning", "0");
     so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+    if (options.threads > 1 && !options.thread_cpus.empty()) {
+      // each of its threads (not the caller's) on any of these: ONNX Runtime numbers processors from 1
+      std::string cpus;
+      for (int c : options.thread_cpus) cpus += (cpus.empty() ? "" : ",") + std::to_string(c + 1);
+      std::string all;
+      for (int t = 1; t < options.threads; ++t) all += (all.empty() ? "" : ";") + cpus;
+      so.AddConfigEntry("session.intra_op_thread_affinities", all.c_str());
+    }
     // Denormals flushed to zero: no slow path on tiny activations.
     so.AddConfigEntry("session.set_denormal_as_zero", "1");
     // The arena (SessionOptions::cpu_arena).  Without it every run asks the OS
@@ -83,7 +91,11 @@ class OrtSession final : public Session {
     // pages under a lock the whole process shares, which costs more the more
     // workers run.
     if (!options.cpu_arena) so.DisableCpuMemArena();
-    session_ = Ort::Session(env(), model.c_str(), so);
+    if (options.model_bytes) {
+      session_ = Ort::Session(env(), options.model_bytes->data(), options.model_bytes->size(), so);
+    } else {
+      session_ = Ort::Session(env(), model.c_str(), so);
+    }
 
     Ort::AllocatorWithDefaultOptions alloc;
     for (size_t i = 0; i < session_.GetInputCount(); ++i) {
@@ -100,21 +112,38 @@ class OrtSession final : public Session {
 
   Backend backend() const override { return Backend::kOnnxRuntime; }
 
-  std::vector<Tensor> run(std::span<const Tensor> inputs) override {
+  // The run itself: its outputs ONNX Runtime's own values.
+  std::vector<Ort::Value> run_values(std::span<const Tensor> inputs) {
     check_inputs(inputs);
+    auto mem = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
+    std::vector<Ort::Value> in;
+    in.reserve(inputs.size());
+    for (const Tensor& t : inputs) {
+      // ONNX Runtime reads inputs and never writes them.
+      in.push_back(Ort::Value::CreateTensor(mem, const_cast<void*>(t.raw()), t.bytes(), t.shape().data(),
+                                            t.shape().size(), to_ort(t.dtype())));
+    }
+    return session_.Run(run_options_, in_names_.data(), in.data(), in.size(), out_names_.data(), out_names_.size());
+  }
+
+  void run(std::span<const Tensor> inputs, const std::function<void(std::span<const OutputView>)>& read) override {
+    std::vector<Ort::Value> out;
+    std::vector<OutputView> views;
     try {
-      auto mem = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
-      std::vector<Ort::Value> in;
-      in.reserve(inputs.size());
-      for (const Tensor& t : inputs) {
-        // ONNX Runtime reads inputs and never writes them.
-        in.push_back(Ort::Value::CreateTensor(
-            mem, const_cast<void*>(t.raw()), t.bytes(), t.shape().data(),
-            t.shape().size(), to_ort(t.dtype())));
+      out = run_values(inputs);
+      for (size_t i = 0; i < out.size(); ++i) {
+        auto info = out[i].GetTensorTypeAndShapeInfo();
+        views.push_back({from_ort(info.GetElementType(), outputs_[i].name), info.GetShape(), out[i].GetTensorRawData()});
       }
-      std::vector<Ort::Value> out =
-          session_.Run(run_options_, in_names_.data(), in.data(), in.size(),
-                       out_names_.data(), out_names_.size());
+    } catch (const Ort::Exception& e) {
+      throw Error(std::string("ONNX Runtime: ") + e.what());
+    }
+    read(views);  // the values held until it returns
+  }
+
+  std::vector<Tensor> run(std::span<const Tensor> inputs) override {
+    try {
+      std::vector<Ort::Value> out = run_values(inputs);
 
       std::vector<Tensor> result;
       result.reserve(out.size());

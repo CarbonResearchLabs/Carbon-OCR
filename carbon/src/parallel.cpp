@@ -39,8 +39,16 @@ namespace carbon {
 namespace {
 
 // Workers take cores fastest class first and, within a class, one NUMA node
-// after another, so a pool smaller than the machine spreads its memory traffic.
+// after another, so a pool smaller than the machine spreads its memory traffic;
+// within a class and node, the OS's favored cores first and the interrupts'
+// core last (a lone pinned worker on logical processor 0 of a laptop ran a page
+// 25% slower than unpinned).
 void order_cores(std::vector<CpuCore>& cores) {
+  std::stable_sort(cores.begin(), cores.end(), [](const CpuCore& a, const CpuCore& b) {
+    if (a.efficiency != b.efficiency) return a.efficiency > b.efficiency;
+    if (a.rank != b.rank) return a.rank > b.rank;
+    return !a.interrupts && b.interrupts;
+  });
   std::map<std::pair<int, int>, int> seen;  // (efficiency, node) -> cores so far
   std::vector<std::pair<int, CpuCore>> ranked;
   for (auto& c : cores) {
@@ -115,6 +123,29 @@ CpuTopology read_topology() {
   }
   t.groups = std::max<int>(1, GetActiveProcessorGroupCount());
   t.numa_nodes = static_cast<int>(node_numbers.size());
+  // Each core's rank: the highest scheduling class of its logical processors (GetSystemCpuSetInformation).
+  ULONG need = 0;
+  GetSystemCpuSetInformation(nullptr, 0, &need, GetCurrentProcess(), 0);
+  if (need > 0) {
+    std::vector<char> sets(need);
+    if (GetSystemCpuSetInformation(reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(sets.data()), need, &need,
+                                   GetCurrentProcess(), 0)) {
+      for (ULONG at = 0; at < need;) {
+        const auto* s = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(sets.data() + at);
+        if (s->Type == CpuSetInformation) {
+          for (CpuCore& c : t.cores) {
+            if (c.group != s->CpuSet.Group) continue;
+            for (int cpu : c.cpus) {
+              if (cpu == s->CpuSet.LogicalProcessorIndex) c.rank = std::max(c.rank, int{s->CpuSet.SchedulingClass});
+            }
+          }
+        }
+        if (s->Size == 0) break;
+        at += s->Size;
+      }
+    }
+  }
+  for (CpuCore& c : t.cores) c.interrupts = c.group == 0 && !c.cpus.empty() && c.cpus.front() == 0;
   return t;
 }
 
@@ -248,6 +279,8 @@ struct WorkerPool::Impl {
   std::mutex outside_m;
   std::deque<Task> outside;         // from outside the pool, oldest first
   std::atomic<int64_t> queued{0};   // tasks waiting in any queue (not the mailboxes)
+  std::atomic<int64_t> inside{0};   // of them, those in the workers' own queues (a running task's)
+  bool slow_takes_new = true;
   std::atomic<int64_t> pending{0};  // tasks submitted and not yet finished
   // Sleeping: fast workers wake for any task; a slow worker takes one only while
   // every fast worker is running one (awake is not enough: a burst of tasks
@@ -285,6 +318,7 @@ struct WorkerPool::Impl {
         me.tasks.pop_front();
         me.queued.fetch_sub(1);
         queued.fetch_sub(1);
+        inside.fetch_sub(1);
         return true;
       }
     }
@@ -298,9 +332,11 @@ struct WorkerPool::Impl {
         other.tasks.pop_back();
         other.queued.fetch_sub(1);
         queued.fetch_sub(1);
+        inside.fetch_sub(1);
         return true;
       }
     }
+    if (!me.fast && !slow_takes_new) return false;  // a new task starts on a fast core
     std::lock_guard lk(outside_m);
     if (!outside.empty()) {
       task = std::move(outside.front());
@@ -318,10 +354,12 @@ struct WorkerPool::Impl {
     std::lock_guard lk(sleep_m);
     if (sleeping_fast.load() > 0) {
       wake_fast.notify_one();
-    } else if (fast_all_busy()) {
+    } else if (fast_all_busy() && slow_work()) {
       wake_slow.notify_one();
     }
   }
+  // Whether a queued task is one a slow worker may take.
+  bool slow_work() const { return (slow_takes_new ? queued.load() : inside.load()) > 0; }
 
   void notify_all() {
     std::lock_guard lk(sleep_m);
@@ -339,7 +377,7 @@ struct WorkerPool::Impl {
       wake_fast.wait(lk, [&] { return stop.load() || queued.load() > 0 || me.mail.load() > 0; });
       sleeping_fast.fetch_sub(1);
     } else {
-      auto ready = [&] { return stop.load() || me.mail.load() > 0 || (queued.load() > 0 && fast_all_busy()); };
+      auto ready = [&] { return stop.load() || me.mail.load() > 0 || (slow_work() && fast_all_busy()); };
       // A slow worker's wake depends on two counts; the timeout is a safety net,
       // not a poll (5 wakes a second).
       while (!wake_slow.wait_for(lk, std::chrono::milliseconds(200), ready)) {
@@ -348,7 +386,7 @@ struct WorkerPool::Impl {
     if (queued.load() > 1) {
       if (sleeping_fast.load() > 0) {
         wake_fast.notify_one();
-      } else if (fast_all_busy()) {
+      } else if (fast_all_busy() && slow_work()) {
         wake_slow.notify_one();
       }
     }
@@ -383,7 +421,7 @@ void WorkerPool::Impl::run(int w) {
       continue;
     }
     // The last fast worker to start a task lets the slow ones take what is left.
-    if (me.fast && busy_fast.fetch_add(1) + 1 >= fast && queued.load() > 0) {
+    if (me.fast && busy_fast.fetch_add(1) + 1 >= fast && slow_work()) {
       std::lock_guard lk(sleep_m);
       wake_slow.notify_one();
     }
@@ -416,6 +454,7 @@ WorkerPool::WorkerPool(PoolOptions options) : impl_(std::make_unique<Impl>()) {
     for (int i = 0; i < n; ++i) impl_->workers[i]->fast = topo.cores[i % nc].efficiency == best;
   }
   for (const auto& w : impl_->workers) impl_->fast += w->fast ? 1 : 0;
+  impl_->slow_takes_new = options.slow_takes_new;
   std::latch started(n);  // every worker on its core before the pool is handed out
   for (int i = 0; i < n; ++i) {
     impl_->threads.emplace_back([this, i, pin = options.pin, &topo, &started] {
@@ -450,7 +489,11 @@ bool WorkerPool::is_fast(int worker) const {
   return worker >= 0 && worker < size() && impl_->workers[worker]->fast;
 }
 
-int WorkerPool::idle() const { return impl_->sleeping_fast.load(); }
+// Sleeping fast workers less the tasks already queued for them: at the start of a call of many pages every
+// worker sleeps, but each is about to take a page, and none is free to help another.
+int WorkerPool::idle() const {
+  return static_cast<int>(std::max<int64_t>(0, impl_->sleeping_fast.load() - impl_->queued.load()));
+}
 
 int WorkerPool::current_worker() const { return current.pool == impl_.get() ? current.worker : -1; }
 
@@ -462,6 +505,7 @@ void WorkerPool::submit(Task task) {
     std::lock_guard lk(me.m);
     me.tasks.push_front(std::move(task));
     me.queued.fetch_add(1);
+    p.inside.fetch_add(1);
   } else {
     std::lock_guard lk(p.outside_m);
     p.outside.push_back(std::move(task));

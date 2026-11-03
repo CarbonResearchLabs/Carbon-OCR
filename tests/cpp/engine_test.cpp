@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <numeric>
 #include <string>
 #include <utility>
 #include <vector>
@@ -16,6 +18,7 @@
 #include "carbon/error.h"
 #include "carbon/image.h"
 #include "carbon/textlayer.h"
+#include "../../carbon/src/engine_steps.h"
 
 namespace carbon {
 namespace {
@@ -125,6 +128,18 @@ TEST(Engine, LevelsASkewedPage) {
   ASSERT_EQ(p.lines.size(), 3u);
   const char* want[] = {"aaa", "aaaaa", "aa"};
   for (int i = 0; i < 3; ++i) EXPECT_EQ(p.lines[i].text, want[i]) << "line " << i;
+  // On 4 workers, the page alone: its skew searched beside orientation, its rows levelled in bands; the same page.
+  EngineOptions four = o;
+  four.pool.workers = 4;
+  const OcrPage q = Engine(kSet, four).ocr(page.view());
+  EXPECT_EQ(q.skew, p.skew);
+  ASSERT_EQ(q.lines.size(), p.lines.size());
+  for (size_t i = 0; i < p.lines.size(); ++i) {
+    EXPECT_EQ(q.lines[i].text, p.lines[i].text);
+    EXPECT_EQ(q.lines[i].box.x0, p.lines[i].box.x0);
+    EXPECT_EQ(q.lines[i].box.y0, p.lines[i].box.y0);
+    EXPECT_EQ(q.lines[i].confidence, p.lines[i].confidence);
+  }
   o.deskew = false;  // without it, the lines' boxes hold the slant
   const OcrPage slanted = Engine(kSet, o).ocr(page.view());
   EXPECT_EQ(slanted.skew, 0.0);
@@ -147,6 +162,105 @@ TEST(Engine, ManyPagesComeBackInOrder) {
   const std::string json = out[0].json();
   EXPECT_NE(json.find("\"text\": \"aaaaa\""), std::string::npos);
   EXPECT_NE(json.find("\"width\": 800"), std::string::npos);
+}
+
+// The stream: pages given one at a time, more than in_flight of them, come back in
+// their order with the same lines, boxes and confidences as ocr() gives, whether
+// the engine holds a view of them (and what keeps it) or the pages themselves.
+TEST(Engine, StreamsPagesInOrderAsOcrReadsThem) {
+  const GrayImage page = load_image(kSet / "page.png");
+  GrayImage blank{400, 300, std::vector<uint8_t>(400 * 300, 255)};
+  EngineOptions o;
+  o.pool.workers = 3;
+  o.in_flight = 2;
+  Engine engine(kSet, o);
+  const OcrPage want = engine.ocr(page.view());
+  EXPECT_FALSE(engine.next().has_value());  // nothing given
+  auto held = std::make_shared<GrayImage>(page);
+  std::vector<size_t> numbers;
+  for (int i = 0; i < 9; ++i) {
+    if (i % 3 == 1) numbers.push_back(engine.submit(blank));
+    else if (i % 3 == 0) numbers.push_back(engine.submit(held->view(), held));
+    else numbers.push_back(engine.submit(GrayImage(page)));
+    if (i == 4) {  // taking one while others are still being read
+      const auto first = engine.next();
+      ASSERT_TRUE(first.has_value());
+      EXPECT_EQ(first->lines.size(), 3u);
+    }
+  }
+  for (int i = 0; i < 9; ++i) EXPECT_EQ(numbers[i], static_cast<size_t>(i));
+  held.reset();  // the engine's own reference keeps the view's pixels
+  for (int i = 1; i < 9; ++i) {
+    const auto p = engine.next();
+    ASSERT_TRUE(p.has_value()) << "page " << i;
+    if (i % 3 == 1) {
+      EXPECT_TRUE(p->lines.empty());
+      EXPECT_EQ(p->width, 400);
+      continue;
+    }
+    ASSERT_EQ(p->lines.size(), want.lines.size()) << "page " << i;
+    for (size_t k = 0; k < want.lines.size(); ++k) {
+      EXPECT_EQ(p->lines[k].text, want.lines[k].text);
+      EXPECT_EQ(p->lines[k].box.x0, want.lines[k].box.x0);
+      EXPECT_EQ(p->lines[k].box.y1, want.lines[k].box.y1);
+      EXPECT_EQ(p->lines[k].confidence, want.lines[k].confidence);
+    }
+  }
+  EXPECT_FALSE(engine.next().has_value());  // every page out
+  EXPECT_THROW(engine.submit(GrayImage{}), Error);
+
+  // Files, decoded by the worker that takes them; one that cannot be read fails its own page alone.
+  engine.submit(kSet / "page.png");
+  engine.submit(kSet / "no-such-page.png");
+  engine.submit(kSet / "page.png");
+  const auto a = engine.next();
+  ASSERT_TRUE(a.has_value());
+  EXPECT_EQ(a->lines.size(), 3u);
+  EXPECT_EQ(a->lines[1].text, want.lines[1].text);
+  EXPECT_GT(a->ms.load, 0.0);
+  EXPECT_THROW(engine.next(), Error);
+  const auto c = engine.next();
+  ASSERT_TRUE(c.has_value());
+  EXPECT_EQ(c->lines.size(), 3u);
+  EXPECT_FALSE(engine.next().has_value());
+  EXPECT_EQ(engine.ocr(page.view()).lines.size(), 3u);  // ocr() still reads after a stream
+}
+
+// A page's lines over idle cores: tasks of about equal cost (a line costs its width bucket), every line once, each
+// task's lines by width so a bucket's lines are one batch; with every core busy, tasks of line_batch lines.
+TEST(Engine, SplitsAPagesLinesByTheirCost) {
+  std::vector<OcrLine> lines;
+  for (int i = 0; i < 52; ++i) {  // 12 short lines and 40 long ones, as on a page of body text and headings
+    OcrLine l;
+    const double w = i % 13 == 0 ? 60 + 7 * i : 700 + (i % 5) * 40;
+    l.box = {50.0, 40.0 * i, 50.0 + w, 40.0 * i + 32};
+    lines.push_back(l);
+  }
+  const CropRule crop;
+  for (int parts : {2, 3, 6}) {
+    const detail::LineTasks plan = detail::line_tasks(lines, crop, parts, 8);
+    ASSERT_EQ(plan.starts.size(), static_cast<size_t>(parts + 1));
+    std::vector<int> seen(lines.size(), 0);
+    std::vector<double> cost;
+    for (int t = 0; t < parts; ++t) {
+      double c = 0;
+      int last = 0;
+      for (size_t a = plan.starts[t]; a < plan.starts[t + 1]; ++a) {
+        const int b = width_bucket(crop_region(lines[plan.lines[a]].box, crop).width);
+        EXPECT_GE(b, last) << "task " << t;  // by width inside the task
+        last = b;
+        c += b;
+        ++seen[plan.lines[a]];
+      }
+      cost.push_back(c);
+    }
+    for (int v : seen) EXPECT_EQ(v, 1);
+    const double mean = std::accumulate(cost.begin(), cost.end(), 0.0) / parts;
+    EXPECT_LT(*std::max_element(cost.begin(), cost.end()), 1.1 * mean) << parts << " parts";
+  }
+  const detail::LineTasks busy = detail::line_tasks(lines, crop, 0, 8);
+  EXPECT_EQ(busy.starts.size(), 8u);  // 52 lines in tasks of 8, and the end
+  EXPECT_EQ(busy.starts[1], 8u);
 }
 
 // A hybrid page: the fake page's middle bar inside a picture of a page otherwise

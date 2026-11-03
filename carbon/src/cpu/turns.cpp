@@ -32,9 +32,9 @@ void check(Isa isa, const char* what) {
 // The reference, a pixel at a time: where it was on the page, turned back
 // clockwise, and its four taps there.
 void rotate_bilinear_scalar(const uint8_t* src, int width, int height, int64_t stride, double s, double c,
-                            uint8_t* out) {
+                            uint8_t* out, int row0, int row1) {
   const double cx = (width - 1) / 2.0, cy = (height - 1) / 2.0;
-  for (int y = 0; y < height; ++y) {
+  for (int y = row0; y < row1; ++y) {
     uint8_t* dst = out + static_cast<int64_t>(y) * width;
     const double dy = y - cy;
     for (int x = 0; x < width; ++x) {
@@ -80,11 +80,18 @@ void rotate_quarters_scalar(const uint8_t* src, int w, int h, int64_t stride, in
 
 void rotate_bilinear(const uint8_t* src, int width, int height, int64_t stride, double s, double c, uint8_t* dst,
                      Isa isa) {
-  if (width <= 0 || height <= 0) return;
+  rotate_bilinear_rows(src, width, height, stride, s, c, dst, 0, height, isa);
+}
+
+void rotate_bilinear_rows(const uint8_t* src, int width, int height, int64_t stride, double s, double c, uint8_t* dst,
+                          int row0, int row1, Isa isa) {
+  row0 = std::max(row0, 0);
+  row1 = std::min(row1, height);
+  if (width <= 0 || height <= 0 || row0 >= row1) return;
   check(isa, "rotate_bilinear");
   const Isa kern = turn_kernel(isa);
   if (kern == Isa::kScalar) {
-    rotate_bilinear_scalar(src, width, height, stride, s, c, dst);
+    rotate_bilinear_scalar(src, width, height, stride, s, c, dst, row0, row1);
     return;
   }
   // Each column's dx c and dx s, the products the reference makes for every pixel.
@@ -95,7 +102,7 @@ void rotate_bilinear(const uint8_t* src, int width, int height, int64_t stride, 
     terms[x] = dx * c;
     terms[width + x] = dx * s;
   }
-  const detail::TurnView t{src, width, height, stride, s, c, cx, cy, terms.data(), terms.data() + width};
+  const detail::TurnView t{src, width, height, stride, s, c, cx, cy, terms.data(), terms.data() + width, row0, row1};
   switch (kern) {
 #if defined(CARBON_KERNEL_AVX2)
     case Isa::kAvx2: detail::rotate_bilinear_avx2(t, dst); return;

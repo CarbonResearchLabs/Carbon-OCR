@@ -1,12 +1,64 @@
 #include "carbon/tensor.h"
 
 #include <new>
+#include <vector>
 
 namespace carbon {
 
 namespace {
 
 constexpr std::align_val_t ALIGN{64};
+
+// Each thread's freed large blocks, for its next tensors: a block is taken for a tensor that needs at least half
+// of it, the smallest that fits first; at most kKept bytes kept, the oldest given back past that.
+constexpr size_t kLarge = 256 << 10, kGrain = 64 << 10, kKept = size_t{48} << 20;
+
+struct Blocks {
+  struct Block {
+    std::byte* p;
+    size_t bytes;
+  };
+  std::vector<Block> held;
+  size_t total = 0;
+
+  ~Blocks();
+  std::byte* take(size_t bytes, size_t& capacity) {
+    size_t best = held.size();
+    for (size_t i = 0; i < held.size(); ++i) {
+      if (held[i].bytes >= bytes && held[i].bytes <= 2 * bytes &&
+          (best == held.size() || held[i].bytes < held[best].bytes)) {
+        best = i;
+      }
+    }
+    if (best == held.size()) return nullptr;
+    std::byte* p = held[best].p;
+    capacity = held[best].bytes;
+    total -= capacity;
+    held.erase(held.begin() + static_cast<std::ptrdiff_t>(best));
+    return p;
+  }
+  void keep(std::byte* p, size_t bytes) {
+    held.push_back({p, bytes});
+    total += bytes;
+    while (total > kKept && !held.empty()) {
+      total -= held.front().bytes;
+      ::operator delete[](held.front().p, ALIGN);
+      held.erase(held.begin());
+    }
+  }
+};
+
+thread_local bool gone = false;  // the thread's blocks already freed (it is ending): a tensor freed now goes back
+
+Blocks::~Blocks() {
+  gone = true;
+  for (const Block& b : held) ::operator delete[](b.p, ALIGN);
+}
+
+Blocks& blocks() {
+  thread_local Blocks b;
+  return b;
+}
 
 }  // namespace
 
@@ -63,14 +115,28 @@ std::string shape_string(const Shape& shape) {
 }
 
 void Tensor::Free::operator()(std::byte* p) const noexcept {
+  if (capacity >= kLarge && !gone) {
+    try {
+      blocks().keep(p, capacity);
+      return;
+    } catch (...) {  // no room to note it: given back
+    }
+  }
   ::operator delete[](p, ALIGN);
 }
 
 Tensor::Tensor(DType dtype, Shape shape, Uninitialized)
     : dtype_(dtype), shape_(std::move(shape)), size_(element_count(shape_)) {
-  if (size_ > 0) {
-    data_.reset(static_cast<std::byte*>(::operator new[](bytes(), ALIGN)));
+  if (size_ <= 0) return;
+  const size_t need = bytes();
+  size_t capacity = need;
+  std::byte* p = nullptr;
+  if (need >= kLarge && !gone) {
+    p = blocks().take(need, capacity);
+    if (!p) capacity = (need + kGrain - 1) / kGrain * kGrain;  // a whole grain, so near sizes share blocks
   }
+  if (!p) p = static_cast<std::byte*>(::operator new[](capacity, ALIGN));
+  data_ = std::unique_ptr<std::byte[], Free>(p, Free{capacity});
 }
 
 Tensor::Tensor(DType dtype, Shape shape)

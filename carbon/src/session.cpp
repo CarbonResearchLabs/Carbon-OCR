@@ -84,6 +84,14 @@ void Session::check_inputs(std::span<const DeviceTensor> inputs) const {
   check_all(inputs_, inputs);
 }
 
+void Session::run(std::span<const Tensor> inputs, const std::function<void(std::span<const OutputView>)>& read) {
+  const std::vector<Tensor> out = run(inputs);
+  std::vector<OutputView> views;
+  views.reserve(out.size());
+  for (const Tensor& t : out) views.push_back({t.dtype(), t.shape(), t.raw()});
+  read(views);
+}
+
 std::vector<Shape> Session::output_shapes(std::span<const Shape>) {
   throw Error("backend '" + std::string(backend_name(backend())) +
               "' runs on host memory only: use run()");

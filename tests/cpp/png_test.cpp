@@ -283,6 +283,26 @@ TEST(Png, RunsOfPaethRowsAsStbImage) {
   }
 }
 
+// Blocks of 16 rows that are mostly Paeth with every other filter among them (the wavefront
+// takes such a block whole, each lane by its row's filter), and blocks just under and over
+// its threshold, at every number of bytes a pixel it takes.
+TEST(Png, MixedFiltersInTheWavefrontAsStbImage) {
+  std::mt19937 rng(23);
+  const Kind kinds[] = {{0, 8}, {2, 8}, {6, 8}, {4, 8}};
+  for (const Kind& k : kinds) {
+    for (int w : {32, 33, 100, 517}) {
+      for (int share : {30, 40, 60, 90}) {  // per cent of rows Paeth or Average
+        const Samples im = samples(w, 97, k.depth, k.color, 1u << k.depth, share > 50, rng);
+        Write how;
+        std::vector<int> f(97);
+        for (int& v : f) v = static_cast<int>(rng() % 100) < share ? 3 + static_cast<int>(rng() % 2) : static_cast<int>(rng() % 3);
+        how.filter = [f](int y) { return f[static_cast<size_t>(y)]; };
+        as_stb(png(im, how), name(im, "mixed filters, " + std::to_string(share) + "% serial"));
+      }
+    }
+  }
+}
+
 // tRNS (an alpha the gray drops), short palettes, a palette in an RGB file, IDAT in
 // pieces down to a byte, chunks among them.
 TEST(Png, ChunksAsStbImage) {

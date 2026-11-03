@@ -51,9 +51,14 @@ GrayImage decode_image(std::span<const uint8_t> bytes, cpu::Isa isa) {
 }
 
 GrayImage load_image(const std::filesystem::path& file) {
-  std::ifstream f(file, std::ios::binary);
+  // One read of the whole file (a byte at a time through istreambuf_iterator was 4-7 ms for a page's PNG).
+  std::ifstream f(file, std::ios::binary | std::ios::ate);
   if (!f) throw Error("cannot open " + file.string());
-  const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  const std::streamoff size = f.tellg();
+  if (size < 0) throw Error("cannot read " + file.string());
+  std::vector<uint8_t> bytes(static_cast<size_t>(size));
+  f.seekg(0);
+  if (size > 0 && !f.read(reinterpret_cast<char*>(bytes.data()), size)) throw Error("cannot read " + file.string());
   try {
     return decode_image(bytes);
   } catch (const Error& e) {

@@ -6,7 +6,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -82,6 +85,185 @@ TEST(Order, Features) {
   EXPECT_THROW(order_features(boxes, std::vector<std::string>{"one"}, 10, 10), Error);
   EXPECT_TRUE(order_features({}, {}, 10, 10).empty());
 }
+
+// The decoding as it was before cluster kept each group's best partner (it scanned every pair a merge, O(m^3) a
+// table) and a row's log was taken once, kept as the reference: the same order, blocks, labels and cells.
+namespace before {
+
+float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
+
+std::vector<std::vector<size_t>> cluster(const std::vector<size_t>& items, std::span<const float> logits, size_t n,
+                                         float join) {
+  const size_t m = items.size();
+  std::vector<std::vector<size_t>> g;
+  for (size_t i : items) g.push_back({i});
+  std::vector<double> s(m * m, 0.0);  // the summed probabilities between two groups' members
+  for (size_t a = 0; a < m; ++a) {
+    for (size_t b = 0; b < m; ++b) {
+      if (a == b) continue;
+      s[a * m + b] = (sigmoid(logits[items[a] * n + items[b]]) + sigmoid(logits[items[b] * n + items[a]])) / 2;
+    }
+  }
+  std::vector<bool> alive(m, true);
+  for (;;) {
+    double best = join;
+    size_t ba = m, bb = m;
+    for (size_t a = 0; a < m; ++a) {
+      for (size_t b = a + 1; alive[a] && b < m; ++b) {
+        if (!alive[b]) continue;
+        const double mean = s[a * m + b] / static_cast<double>(g[a].size() * g[b].size());
+        if (mean >= best) {
+          best = mean;
+          ba = a;
+          bb = b;
+        }
+      }
+    }
+    if (ba == m) break;
+    for (size_t c = 0; c < m; ++c) {
+      if (!alive[c] || c == ba || c == bb) continue;
+      s[ba * m + c] += s[bb * m + c];
+      s[c * m + ba] = s[ba * m + c];
+    }
+    g[ba].insert(g[ba].end(), g[bb].begin(), g[bb].end());
+    alive[bb] = false;
+  }
+  std::vector<std::vector<size_t>> out;
+  for (size_t a = 0; a < m; ++a) {
+    if (alive[a]) out.push_back(std::move(g[a]));
+  }
+  return out;
+}
+
+PageOrder decode_order(const OrderOutputs& out, std::span<const LineBox> boxes, const OrderRule& rule) {
+  const int n = out.n;
+  const size_t N = static_cast<size_t>(n), T = N + 1;
+  if (boxes.size() != N || out.successor.size() != T * T || out.same_block.size() != N * N ||
+      out.table_row.size() != N * N || out.table_col.size() != N * N || out.table_cell.size() != N * N ||
+      out.labels.size() != N * kBlockLabels) {
+    throw Error("decode_order: outputs not the size of " + std::to_string(n) + " lines");
+  }
+  PageOrder po;
+  if (n == 0) {
+    po.sure = 1;
+    return po;
+  }
+  // log probabilities of the successor, each row a softmax over the other tokens (column 0 the end)
+  std::vector<double> lp(T * T, -1e30);
+  for (size_t i = 0; i < T; ++i) {
+    double m = -1e30;
+    for (size_t j = 0; j < T; ++j) {
+      if (j != i) m = std::max(m, static_cast<double>(out.successor[i * T + j]));
+    }
+    double z = 0;
+    for (size_t j = 0; j < T; ++j) {
+      if (j != i) z += std::exp(out.successor[i * T + j] - m);
+    }
+    for (size_t j = 0; j < T; ++j) {
+      if (j != i) lp[i * T + j] = out.successor[i * T + j] - m - std::log(z);
+    }
+  }
+  // the chain, as tokens: start, then lines (token = line + 1), then the end (0)
+  std::vector<size_t> chain = {0};
+  std::vector<bool> used(T, false);
+  for (int k = 0; k < n; ++k) {
+    const size_t cur = chain.back();
+    size_t best = 0;
+    double bv = -1e300;
+    for (size_t j = 1; j < T; ++j) {
+      if (!used[j] && lp[cur * T + j] > bv) {
+        bv = lp[cur * T + j];
+        best = j;
+      }
+    }
+    used[best] = true;
+    chain.push_back(best);
+  }
+  chain.push_back(0);
+  // repair: move one line to where the chain's log probability rises most, while it does
+  for (int sweep = 0; sweep < rule.sweeps; ++sweep) {
+    bool moved = false;
+    for (size_t p = 1; p + 1 < chain.size(); ++p) {
+      const size_t x = chain[p], a = chain[p - 1], b = chain[p + 1];
+      const double out_gain = lp[a * T + b] - lp[a * T + x] - lp[x * T + b];
+      double best = 1e-9;
+      size_t to = 0;
+      for (size_t q = 0; q + 1 < chain.size(); ++q) {  // between chain[q] and chain[q + 1], x taken out
+        if (q == p - 1 || q == p) continue;
+        const size_t c = chain[q], d = chain[q + 1];
+        const double gain = out_gain + lp[c * T + x] + lp[x * T + d] - lp[c * T + d];
+        if (gain > best) {
+          best = gain;
+          to = q + 1;
+        }
+      }
+      if (to) {
+        chain.erase(chain.begin() + static_cast<int64_t>(p));
+        chain.insert(chain.begin() + static_cast<int64_t>(to > p ? to - 1 : to), x);
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
+  double sum = 0;
+  for (size_t k = 0; k + 1 < chain.size(); ++k) sum += std::exp(lp[chain[k] * T + chain[k + 1]]);
+  po.sure = static_cast<float>(sum / static_cast<double>(chain.size() - 1));
+  if (po.sure < rule.min_sure) {
+    po.fallback = true;
+    po.order = reading_order(boxes);
+  } else {
+    for (size_t k = 1; k + 1 < chain.size(); ++k) po.order.push_back(chain[k] - 1);
+  }
+  // blocks: runs of the order whose neighbours share a block
+  for (size_t k = 0; k < N; ++k) {
+    const size_t i = po.order[k];
+    if (k == 0 || sigmoid(out.same_block[po.order[k - 1] * N + i]) < rule.join) po.blocks.emplace_back();
+    po.blocks.back().lines.push_back(i);
+  }
+  for (OrderBlock& b : po.blocks) {
+    std::vector<double> mean(kBlockLabels, 0.0);
+    for (size_t i : b.lines) {
+      const float* z = &out.labels[i * kBlockLabels];
+      const float m = *std::max_element(z, z + kBlockLabels);
+      double s = 0;
+      for (int c = 0; c < kBlockLabels; ++c) s += std::exp(z[c] - m);
+      for (int c = 0; c < kBlockLabels; ++c) mean[c] += std::exp(z[c] - m) / s / static_cast<double>(b.lines.size());
+    }
+    b.label = static_cast<int>(std::max_element(mean.begin(), mean.end()) - mean.begin());
+    b.confidence = static_cast<float>(mean[b.label]);
+    if (b.label != block_label("Table")) continue;
+    // cells, then rows and columns of cells
+    std::vector<std::vector<size_t>> cells = cluster(b.lines, out.table_cell, N, rule.join);
+    for (auto& c : cells) {  // a cell's lines in reading order
+      std::sort(c.begin(), c.end(), [&](size_t x, size_t y) {
+        return std::find(b.lines.begin(), b.lines.end(), x) < std::find(b.lines.begin(), b.lines.end(), y);
+      });
+    }
+    std::vector<size_t> heads(cells.size());  // a cell stands for its lines by its first
+    for (size_t c = 0; c < cells.size(); ++c) heads[c] = cells[c].front();
+    auto groups = [&](std::span<const float> logits, bool rows) {
+      std::vector<std::vector<size_t>> g = cluster(heads, logits, N, rule.join);
+      auto at = [&](const std::vector<size_t>& v) {  // the group's mean centre across it
+        double s = 0;
+        for (size_t i : v) s += rows ? boxes[i].y0 + boxes[i].y1 : boxes[i].x0 + boxes[i].x1;
+        return s / static_cast<double>(v.size());
+      };
+      std::sort(g.begin(), g.end(), [&](const auto& x, const auto& y) { return at(x) < at(y); });
+      std::vector<int> of(N, 0);
+      for (size_t k = 0; k < g.size(); ++k) {
+        for (size_t i : g[k]) of[i] = static_cast<int>(k);
+      }
+      return of;
+    };
+    const std::vector<int> row = groups(out.table_row, true), col = groups(out.table_col, false);
+    for (auto& c : cells) b.cells.push_back({row[c.front()], col[c.front()], std::move(c)});
+    std::sort(b.cells.begin(), b.cells.end(),
+              [](const TableCell& x, const TableCell& y) { return x.row != y.row ? x.row < y.row : x.col < y.col; });
+  }
+  return po;
+}
+
+}  // namespace before
 
 // Two columns of two lines; the model reads them across, which the XY-cut would not.
 TEST(Order, DecodesTheChainItIsSureOf) {
@@ -179,6 +361,67 @@ TEST(Order, ATablesCells) {
   }
   EXPECT_EQ(cells[3].lines, (std::vector<size_t>{3, 4}));
   EXPECT_EQ(cells[5].lines, (std::vector<size_t>{6}));
+}
+
+// Dense pages and tables, their logits on a coarse grid or a pair's alike, so means tie often: the decoding gives what it gave before,
+// to the bit (the chain's sureness, the labels' confidences) and the cells' rows and columns.
+TEST(Order, DensePagesAndTablesAsBefore) {
+  std::mt19937 rng(13);
+  std::uniform_int_distribution<int> grid(-4, 4), pick(0, 99);
+  for (const int n : {1, 2, 3, 7, 40, 160}) {
+    for (int trial = 0; trial < 4; ++trial) {
+      std::vector<LineBox> boxes;
+      for (int i = 0; i < n; ++i) {
+        const double x = 100.0 * (i % 4), y = 12.0 * (i / 4);
+        boxes.push_back({x, y, x + 80, y + 10});
+      }
+      Outputs o(n);
+      std::vector<int> order(n);
+      for (int i = 0; i < n; ++i) order[i] = i;
+      std::shuffle(order.begin(), order.end(), rng);
+      for (auto& v : o.successor) v = 1.5f * static_cast<float>(grid(rng));
+      if (trial % 2 == 0) o.chain(order, 9.0f);  // sure, and the repair has a chain to mend
+      for (int a = 0; a < n; ++a) {
+        o.label(a, trial == 3 && a % 5 == 0 ? "Text" : "Table");
+        for (int b = 0; b < n; ++b) {
+          if (a == b) continue;
+          const size_t k = static_cast<size_t>(a) * n + b;
+          o.same_block[k] = pick(rng) < 90 ? 6.0f : -6.0f;
+          o.cell[k] = 2.0f * static_cast<float>(grid(rng));
+          o.row[k] = 2.0f * static_cast<float>(grid(rng));
+          o.col[k] = static_cast<float>(grid(rng) / 2);
+        }
+        for (int b = a + 1; trial == 1 && b < n; ++b) {  // a pair's two logits alike and +-6: means tie exactly
+          o.pair(o.cell, a, b, pick(rng) < 30 ? 6.0f : -6.0f);
+          o.pair(o.row, a, b, pick(rng) < 50 ? 6.0f : -6.0f);
+          o.pair(o.col, a, b, pick(rng) < 50 ? 6.0f : -6.0f);
+        }
+      }
+      for (const float join : {0.5f, 0.3f}) {
+        OrderRule rule;
+        rule.join = join;
+        const PageOrder want = before::decode_order(o.view(), boxes, rule);
+        const PageOrder got = decode_order(o.view(), boxes, rule);
+        SCOPED_TRACE("n " + std::to_string(n) + " trial " + std::to_string(trial));
+        ASSERT_EQ(got.order, want.order);
+        EXPECT_EQ(got.fallback, want.fallback);
+        EXPECT_EQ(std::memcmp(&got.sure, &want.sure, sizeof(float)), 0);
+        ASSERT_EQ(got.blocks.size(), want.blocks.size());
+        for (size_t k = 0; k < got.blocks.size(); ++k) {
+          const OrderBlock &g = got.blocks[k], &w = want.blocks[k];
+          EXPECT_EQ(g.label, w.label);
+          EXPECT_EQ(std::memcmp(&g.confidence, &w.confidence, sizeof(float)), 0);
+          EXPECT_EQ(g.lines, w.lines);
+          ASSERT_EQ(g.cells.size(), w.cells.size());
+          for (size_t c = 0; c < g.cells.size(); ++c) {
+            EXPECT_EQ(g.cells[c].row, w.cells[c].row);
+            EXPECT_EQ(g.cells[c].col, w.cells[c].col);
+            EXPECT_EQ(g.cells[c].lines, w.cells[c].lines);
+          }
+        }
+      }
+    }
+  }
 }
 
 // A line of words at x0..x1 (h 20 px), each word's confidence its index's tenth.

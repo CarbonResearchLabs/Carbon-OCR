@@ -365,6 +365,47 @@ void dwconv_f32(Rows<float> a, const float* w, int c, int m, const Epilogue& out
   }
 }
 
+void above_bits(const float* v, int n, float t, uint32_t* bits, Isa isa) {
+  if (n <= 0) return;
+  check(isa, "above_bits");
+  switch (dw_kernel(isa)) {
+#if defined(CARBON_KERNEL_AVX2)
+    case Isa::kAvx2: detail::above_bits_avx2(v, n, t, bits); return;
+#endif
+#if defined(CARBON_KERNEL_NEON)
+    case Isa::kNeon: detail::above_bits_neon(v, n, t, bits); return;
+#endif
+    default: break;
+  }
+  for (int w = 0; w < (n + 31) / 32; ++w) bits[w] = 0;  // the reference, a value at a time
+  for (int i = 0; i < n; ++i) {
+    if (v[i] > t) bits[i / 32] |= 1u << (i % 32);
+  }
+}
+
+ByteCounts count_beyond(const uint8_t* c, int w, int h, int64_t stride, int lo, int hi, Isa isa) {
+  ByteCounts n{0, 0};
+  if (w <= 0 || h <= 0 || (lo < 0 && hi > 255)) return n;
+  check(isa, "count_beyond");
+  switch (dw_kernel(isa)) {
+#if defined(CARBON_KERNEL_AVX2)
+    case Isa::kAvx2: return detail::count_beyond_avx2(c, w, h, stride, lo, hi);
+#endif
+#if defined(CARBON_KERNEL_NEON)
+    case Isa::kNeon: return detail::count_beyond_neon(c, w, h, stride, lo, hi);
+#endif
+    default: break;
+  }
+  for (int y = 0; y < h; ++y) {  // the reference, a byte at a time
+    const uint8_t* row = c + y * stride;
+    for (int x = 0; x < w; ++x) {
+      n.below += row[x] <= lo;
+      n.above += row[x] >= hi;
+    }
+  }
+  return n;
+}
+
 void ctc_argmax(const float* logits, int classes, int frames, int t_n, int32_t* ids, float* probs, Isa isa) {
   if (t_n <= 0 || classes <= 0) return;
   check(isa, "ctc_argmax");
@@ -393,6 +434,76 @@ void ctc_argmax(const float* logits, int classes, int frames, int t_n, int32_t* 
     float sum = 0.0f;
     for (int c = 0; c < classes; ++c) sum = sum + detail::exp_neg(logits[static_cast<size_t>(c) * frames + t] - best);
     probs[t] = 1.0f / sum;
+  }
+}
+
+namespace {
+
+// The reference, as the kernels run it: the head at stride 4 a row at a time, upsampled into a padded row (a
+// zero either side), three of them kept (slot p % 3 for the head's row p), and a row of zeros above and below.
+void det_head_scalar(const float* x, int h4, int w4, const DetHeadWeights& w, float* maps, int row0, int row1) {
+  const int H = 2 * h4, W = 2 * w4, P = W + 2, mid = w.mid;
+  float* head = detail::scratch_of<float>(detail::Scratch::kA, static_cast<size_t>(mid) * (w4 + 4 * P));
+  float* up = head + static_cast<size_t>(mid) * w4;
+  float* zero = up + static_cast<size_t>(3) * mid * P;
+  std::fill(zero, zero + static_cast<size_t>(mid) * P, 0.0f);
+  int held[3] = {-1, -1, -1};
+  const auto row_of = [&](int p) -> const float* {  // the head's row p, upsampled
+    float* u = up + static_cast<size_t>(p % 3) * mid * P;
+    if (held[p % 3] == p) return u;
+    for (int c = 0; c < mid; ++c) {
+      for (int px = 0; px < w4; ++px) {
+        float acc = w.b1[c];
+        for (int i = 0; i < w.in; ++i) {
+          acc = std::fma(w.w1[static_cast<size_t>(c) * w.in + i], x[(static_cast<int64_t>(i) * h4 + p) * w4 + px], acc);
+        }
+        head[static_cast<size_t>(c) * w4 + px] = acc > 0.0f ? acc : 0.0f;
+      }
+      float* uc = u + static_cast<size_t>(c) * P;
+      uc[0] = 0.0f;
+      uc[P - 1] = 0.0f;
+      for (int zx = 0; zx < W; ++zx) uc[1 + zx] = head[static_cast<size_t>(c) * w4 + (zx >> 1)];
+    }
+    held[p % 3] = p;
+    return u;
+  };
+  for (int oy = row0; oy < row1; ++oy) {
+    const float* z[3];
+    for (int ky = 0; ky < 3; ++ky) {
+      const int zy = oy + ky - 1;
+      z[ky] = zy < 0 || zy >= H ? zero : row_of(zy >> 1);
+    }
+    for (int ox = 0; ox < W; ++ox) {
+      float m[8];
+      for (int o = 0; o < w.out; ++o) m[o] = w.b3[o];
+      for (int c = 0; c < mid; ++c) {
+        float acc = w.b2[c];
+        for (int ky = 0; ky < 3; ++ky) {
+          for (int kx = 0; kx < 3; ++kx) {
+            acc = std::fma(w.w2[static_cast<size_t>(c) * 9 + ky * 3 + kx], z[ky][static_cast<size_t>(c) * P + ox + kx], acc);
+          }
+        }
+        const float d = acc > 0.0f ? acc : 0.0f;
+        for (int o = 0; o < w.out; ++o) m[o] = std::fma(w.w3[static_cast<size_t>(o) * mid + c], d, m[o]);
+      }
+      for (int o = 0; o < w.out; ++o) maps[(static_cast<int64_t>(o) * H + oy) * W + ox] = m[o];
+    }
+  }
+}
+
+}  // namespace
+
+void det_head(const float* x, int h4, int w4, const DetHeadWeights& w, float* maps, int row0, int row1, Isa isa) {
+  if (w.out < 1 || w.out > 8 || w.mid < 1 || w.in < 1) throw Error("det_head: 1 to 8 maps, and channels");
+  row0 = std::max(row0, 0);
+  row1 = std::min(row1, 2 * h4);
+  if (h4 <= 0 || w4 <= 0 || row0 >= row1) return;
+  check(isa, "det_head");
+  switch (dw_kernel(isa)) {
+#if defined(CARBON_KERNEL_AVX2)
+    case Isa::kAvx2: detail::det_head_avx2(x, h4, w4, w, maps, row0, row1); return;
+#endif
+    default: det_head_scalar(x, h4, w4, w, maps, row0, row1); return;
   }
 }
 

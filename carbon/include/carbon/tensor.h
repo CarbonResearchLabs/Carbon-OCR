@@ -51,7 +51,10 @@ struct dtype_of<uint8_t> {
 
 // A row-major tensor in host memory, 64-byte aligned (a cache line, and the
 // widest SIMD load).  Movable, not copyable: page and line batches are large,
-// so copies are explicit (clone()).
+// so copies are explicit (clone()).  A large tensor's memory (256 KB and up) goes
+// back to its thread's cache when the tensor goes, for the next tensor that thread
+// makes: on Windows a fresh block of that size is the system's, first touched at
+// about half a millisecond a megabyte, and a page made 46-55 MB of them.
 class Tensor {
  public:
   Tensor() = default;
@@ -97,6 +100,11 @@ class Tensor {
 
  private:
   struct Free {
+    // Constructors of its own: inside Tensor a member's initializer (or a default argument) cannot yet make it
+    // default-constructible, which gcc and clang need for data_'s default.
+    Free() noexcept : capacity(0) {}
+    explicit Free(size_t bytes) noexcept : capacity(bytes) {}
+    size_t capacity;  // the block's bytes, for its thread's cache
     void operator()(std::byte* p) const noexcept;
   };
   struct Uninitialized {};

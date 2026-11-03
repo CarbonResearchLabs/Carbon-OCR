@@ -238,6 +238,34 @@ def test_engine_reads_a_page():
     assert e.ocr([page], html=True)[0]["html"] == "<p>aaa</p>\n<p>aaaaa</p>\n<p>aa</p>\n"  # no blocks: by their gaps
 
 
+def test_engine_streams_pages_as_ocr_reads_them():
+    page = carbon_ocr.load_image(str(DATA / "fake-set" / "page.png"))
+    blank = np.full((300, 400), 255, np.uint8)
+    e = carbon_ocr.Engine(str(DATA / "fake-set"), workers=2)
+    want = e.ocr([page], html=True)[0]
+    assert e.next() is None  # nothing given
+    given = [e.submit(page if i % 2 == 0 else blank) for i in range(5)]
+    assert given == [0, 1, 2, 3, 4]
+    del page  # the engine holds the array until next() returns its page
+    got = [e.next(html=True) for _ in range(5)]
+    assert e.next() is None
+    for i, p in enumerate(got):
+        if i % 2:
+            assert p["lines"] == [] and p["width"] == 400
+        else:
+            assert [(l["text"], l["box"], l["confidence"]) for l in p["lines"]] ==                 [(l["text"], l["box"], l["confidence"]) for l in want["lines"]]
+            assert p["html"] == want["html"]
+    with pytest.raises(Exception):
+        e.submit(np.zeros((0, 0), np.uint8))
+    e.submit_file(str(DATA / "fake-set" / "page.png"))  # decoded by the engine's worker
+    e.submit_file(str(DATA / "fake-set" / "no-such-page.png"))
+    p = e.next(html=True)
+    assert p["html"] == want["html"] and p["ms"]["load"] > 0 and want["ms"]["load"] == 0
+    with pytest.raises(Exception):
+        e.next()
+    assert e.next() is None
+
+
 def test_engine_precision_picks_the_files():
     # carbon::choose_set_model by precision; the fake set has its models in FP32 alone (its orient.fp16.onnx and
     # det.fp16.onnx are the GPU's, with Casts the native backend does not run)

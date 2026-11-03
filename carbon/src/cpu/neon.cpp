@@ -336,46 +336,126 @@ inline float32x4_t exp_neg4(float32x4_t x) {
 
 }  // namespace
 
-void ctc_argmax_neon(const float* logits, int classes, int frames, int t_n, int32_t* ids, float* probs) {
-  int t0 = 0;
-  for (; t0 + 4 <= t_n; t0 += 4) {  // 4 frames at a time: each class's 4 logits are contiguous
-    float32x4_t best = vdupq_n_f32(-std::numeric_limits<float>::infinity());
-    int32x4_t arg = vdupq_n_s32(0);
-    for (int c = 0; c < classes; ++c) {
-      const float32x4_t v = vld1q_f32(logits + static_cast<size_t>(c) * frames + t0);
-      const uint32x4_t more = vcgtq_f32(v, best);  // strictly: ties keep the lower id
-      best = vbslq_f32(more, v, best);
-      arg = vbslq_s32(more, vdupq_n_s32(c), arg);
+// 32 values a word, 4 a compare: each lane's mask and its bit (1, 2, 4, 8) summed across the vector; the last
+// word's values one at a time.
+void above_bits_neon(const float* v, int n, float t, uint32_t* bits) {
+  const float32x4_t tv = vdupq_n_f32(t);
+  const uint32_t lane_bits[4] = {1, 2, 4, 8};
+  const uint32x4_t weight = vld1q_u32(lane_bits);
+  int i = 0;
+  for (; i + 32 <= n; i += 32) {
+    uint32_t word = 0;
+    for (int k = 0; k < 8; ++k) {
+      const uint32x4_t more = vcgtq_f32(vld1q_f32(v + i + 4 * k), tv);  // a NaN is never above
+      word |= vaddvq_u32(vandq_u32(more, weight)) << (4 * k);
     }
-    vst1q_s32(ids + t0, arg);
-    if (vmaxvq_u32(vreinterpretq_u32_s32(arg)) == 0) continue;  // four blank frames
-    float32x4_t sum = vdupq_n_f32(0.0f);
-    for (int c = 0; c < classes; ++c) {
-      sum = vaddq_f32(sum, exp_neg4(vsubq_f32(vld1q_f32(logits + static_cast<size_t>(c) * frames + t0), best)));
+    bits[i / 32] = word;
+  }
+  if (i < n) {
+    uint32_t word = 0;
+    for (int k = 0; i + k < n; ++k) word |= (v[i + k] > t ? 1u : 0u) << k;
+    bits[i / 32] = word;
+  }
+}
+
+// 16 bytes a step: the compares' ones summed in 8-bit lanes, widened into 64 bits every 255 steps (and at a row's
+// end). The row's last bytes one at a time.
+ByteCounts count_beyond_neon(const uint8_t* c, int w, int h, int64_t stride, int lo, int hi) {
+  const bool any_below = lo >= 0, any_above = hi <= 255;
+  const uint8x16_t lo8 = vdupq_n_u8(static_cast<uint8_t>(any_below ? lo : 0));
+  const uint8x16_t hi8 = vdupq_n_u8(static_cast<uint8_t>(any_above ? hi : 255));
+  const uint8x16_t one = vdupq_n_u8(1);
+  ByteCounts n{0, 0};
+  int64_t below = 0, above = 0;
+  for (int y = 0; y < h; ++y) {
+    const uint8_t* row = c + y * stride;
+    int x = 0;
+    while (x + 16 <= w) {
+      uint8x16_t b = vdupq_n_u8(0), a = vdupq_n_u8(0);
+      for (int k = 0; k < 255 && x + 16 <= w; ++k, x += 16) {
+        const uint8x16_t v = vld1q_u8(row + x);
+        b = vaddq_u8(b, vandq_u8(vcleq_u8(v, lo8), one));
+        a = vaddq_u8(a, vandq_u8(vcgeq_u8(v, hi8), one));
+      }
+      below += vaddlvq_u8(b);
+      above += vaddlvq_u8(a);
     }
-    float prob[4];
-    vst1q_f32(prob, vdivq_f32(vdupq_n_f32(1.0f), sum));
-    int32_t a[4];
-    vst1q_s32(a, arg);
-    for (int k = 0; k < 4; ++k) {
-      if (a[k] != 0) probs[t0 + k] = prob[k];
+    for (; x < w; ++x) {
+      n.below += row[x] <= lo;
+      n.above += row[x] >= hi;
     }
   }
-  for (int t = t0; t < t_n; ++t) {  // the last frames as the reference does them
-    float best = -std::numeric_limits<float>::infinity();
-    int32_t a = 0;
+  if (any_below) n.below += below;
+  if (any_above) n.above += above;
+  return n;
+}
+
+void ctc_argmax_neon(const float* logits, int classes, int frames, int t_n, int32_t* ids, float* probs) {
+  // As ctc_argmax_avx2: in chunks of up to 256 frames, the logits read in their order; each frame's best class 4 frames
+  // a vector (the last frames one at a time), the chunk's running bests in L1; then the softmax sums of only the frames
+  // where a character won, 4 to a vector, each lane loaded from its own frame; past the group's highest best class, a
+  // class whose 4 terms are all of logits more than 17 below their bests passed over (it cannot change a sum of 1 or more).
+  constexpr int kChunk = 256;
+  alignas(16) float top[kChunk + 4];
+  alignas(16) int32_t arg[kChunk + 4];
+  alignas(16) int32_t hit[kChunk + 4];
+  const float inf = std::numeric_limits<float>::infinity();
+  const float32x4_t far = vdupq_n_f32(-17.0f);
+  for (int c0 = 0; c0 < t_n; c0 += kChunk) {
+    const int len = t_n - c0 < kChunk ? t_n - c0 : kChunk;
+    const int nv = len / 4;
+    for (int t = 0; t < len; ++t) {
+      top[t] = -inf;
+      arg[t] = 0;
+    }
     for (int c = 0; c < classes; ++c) {
-      const float v = logits[static_cast<size_t>(c) * frames + t];
-      if (v > best) {
-        best = v;
-        a = c;
+      const float* row = logits + static_cast<size_t>(c) * frames + c0;
+      const int32x4_t cv = vdupq_n_s32(c);
+      for (int v = 0; v < nv; ++v) {
+        const float32x4_t x = vld1q_f32(row + 4 * v), b = vld1q_f32(top + 4 * v);
+        const uint32x4_t more = vcgtq_f32(x, b);  // strictly: ties keep the lower id
+        vst1q_f32(top + 4 * v, vbslq_f32(more, x, b));
+        vst1q_s32(arg + 4 * v, vbslq_s32(more, cv, vld1q_s32(arg + 4 * v)));
+      }
+      for (int t = 4 * nv; t < len; ++t) {
+        if (row[t] > top[t]) {
+          top[t] = row[t];
+          arg[t] = c;
+        }
       }
     }
-    ids[t] = a;
-    if (a == 0) continue;
-    float sum = 0.0f;
-    for (int c = 0; c < classes; ++c) sum = sum + exp_neg(logits[static_cast<size_t>(c) * frames + t] - best);
-    probs[t] = 1.0f / sum;
+    std::memcpy(ids + c0, arg, static_cast<size_t>(len) * sizeof(int32_t));
+    int n = 0;
+    for (int t = 0; t < len; ++t) {
+      hit[n] = t;
+      n += arg[t] != 0;
+    }
+    if (n == 0) continue;  // a blank chunk: no probability is read
+    for (int k = n; k < n + 4; ++k) hit[k] = hit[n - 1];  // a short last group repeats its last frame
+    const float* chunk = logits + c0;
+    for (int k = 0; k < n; k += 4) {
+      const int h0 = hit[k], h1 = hit[k + 1], h2 = hit[k + 2], h3 = hit[k + 3];
+      float32x4_t best = vld1q_dup_f32(top + h0);
+      best = vld1q_lane_f32(top + h1, best, 1);
+      best = vld1q_lane_f32(top + h2, best, 2);
+      best = vld1q_lane_f32(top + h3, best, 3);
+      const int last = std::max(std::max(arg[h0], arg[h1]), std::max(arg[h2], arg[h3]));
+      float32x4_t sum = vdupq_n_f32(0.0f);
+      for (int c = 0; c < classes; ++c) {
+        const float* row = chunk + static_cast<size_t>(c) * frames;
+        float32x4_t v = vld1q_dup_f32(row + h0);
+        v = vld1q_lane_f32(row + h1, v, 1);
+        v = vld1q_lane_f32(row + h2, v, 2);
+        v = vld1q_lane_f32(row + h3, v, 3);
+        const float32x4_t d = vsubq_f32(v, best);
+        if (c > last && vminvq_u32(vcltq_f32(d, far)) != 0) continue;  // NaN is added, as the reference
+        sum = vaddq_f32(sum, exp_neg4(d));
+      }
+      float prob[4];
+      vst1q_f32(prob, vdivq_f32(vdupq_n_f32(1.0f), sum));
+      const int m = n - k < 4 ? n - k : 4;
+      for (int q = 0; q < m; ++q) probs[c0 + hit[k + q]] = prob[q];
+    }
   }
 }
 
@@ -477,7 +557,7 @@ void rotate_bilinear_neon(const TurnView& t, uint8_t* dst) {
   const uint64x2_t x_last = vdupq_n_u64(static_cast<uint64_t>(w - 2));
   const uint64x2_t y_last = vdupq_n_u64(static_cast<uint64_t>(h - 2));
   const int64_t stride = t.stride;
-  for (int y = 0; y < h; ++y) {
+  for (int y = t.row0; y < t.row1; ++y) {
     const double dy = y - t.cy, ds = dy * t.s, dc = dy * t.c;
     const float64x2_t vds = vdupq_n_f64(ds), vdc = vdupq_n_f64(dc);
     uint8_t* d = dst + static_cast<int64_t>(y) * w;

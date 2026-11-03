@@ -337,10 +337,24 @@ class Net {
         const auto& [x, q] = pending[n.inputs[0]];
         rename[n.outputs[0]] = x;
         // A graph output's last Q/DQ is not kept: the output is float anyway,
-        // and the layer's float sums are finer than 256 levels.
+        // and the layer's float sums are finer than 256 levels.  But a zero point
+        // of 0 is also a ReLU the quantizer folded into it (uint8 holds nothing
+        // below 0), so that one stays, as a ReLU of its own: the output of a model
+        // cut inside (the detector before its head, carbon/src/det_head.h) is a
+        // ReLU's.
         const auto is_output = [&](const onnx::ValueInfo& o) { return o.name == n.outputs[0]; };
         if (std::any_of(g.outputs.begin(), g.outputs.end(), is_output)) {
-          output_names_[n.outputs[0]] = x;
+          if (q.zero == 0) {
+            onnx::Node relu;
+            relu.op = "Relu";
+            relu.name = n.outputs[0] + "/relu";
+            relu.inputs = {x};
+            relu.outputs = {x + "/relu"};
+            out.push_back(std::move(relu));
+            output_names_[n.outputs[0]] = x + "/relu";
+          } else {
+            output_names_[n.outputs[0]] = x;
+          }
           continue;
         }
         auto it = quant_.find(x);
@@ -1075,9 +1089,15 @@ bool fp16_activations(cpu::Isa isa) {
   return cpu::f16_arithmetic(isa);
 }
 
-// The file compiled for isa; what it refuses names the file.
-Net open_net(const std::filesystem::path& path, cpu::Isa isa) {
-  const onnx::Model model = onnx::load(path);
+// The file compiled for isa (or `bytes`, read in its place); what it refuses names the file.
+Net open_net(const std::filesystem::path& path, cpu::Isa isa, const std::string* bytes = nullptr) {
+  onnx::Model model;
+  try {
+    model = bytes ? onnx::parse(*bytes) : onnx::load(path);
+  } catch (const Error& e) {
+    if (!bytes) throw;
+    throw Error(path.string() + ": " + e.what());
+  }
   try {
     return Net(model, isa, fp16_activations(isa));
   } catch (const Error& e) {
@@ -1088,13 +1108,14 @@ Net open_net(const std::filesystem::path& path, cpu::Isa isa) {
 class NativeSession final : public Session {
  public:
   NativeSession(const std::filesystem::path& path, const SessionOptions& options)
-      : net_(open_net(path, isa(options.isa))) {
+      : net_(open_net(path, isa(options.isa), options.model_bytes.get())) {
     inputs_ = net_.inputs;
     outputs_ = net_.outputs;
     net_.profile();
   }
 
   Backend backend() const override { return Backend::kNative; }
+  using Session::run;  // and run() with its outputs in place: the base's, over this one
 
   std::vector<Tensor> run(std::span<const Tensor> inputs) override {
     check_inputs(inputs);

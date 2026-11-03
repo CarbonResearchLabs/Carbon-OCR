@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "carbon/detect.h"
+#include "carbon/image.h"
 #include "carbon/lines.h"
 #include "carbon/order.h"
 #include "carbon/parallel.h"
@@ -87,6 +88,9 @@ struct EngineOptions {
   bool deskew = true;
   double max_skew = 5.0, min_skew = 0.2, min_skew_gain = 1.05;
   int line_batch = 8;             // lines a recognition task holds when every core is busy
+  // The stream (Engine::submit): pages being read at once, past which submit waits. 0: two a worker, so a
+  // worker that finishes a page always finds the next one queued.
+  int in_flight = 0;
   // Reading order: <set>/order.onnx where the set has one and ONNX Runtime is built in,
   // or order_model; with none (or use_order false) the XY-cut.
   bool use_order = true;
@@ -144,8 +148,9 @@ struct OcrPage {
                                // "hybrid": from its text, and its pictures' text by OCR
   std::string text_layer;      // a PDF page read by OCR: why its text layer was not used
   struct Timings {
-    // ms; second_pass the second detection pass's, all of it (its page, detection, decoding and the merge)
-    double orient = 0, detect = 0, decode = 0, second_pass = 0, recognize = 0, total = 0;
+    // ms; second_pass the second detection pass's, all of it (its page, detection, decoding and the merge);
+    // load the page's file read and decoded, where the engine was given a file (Engine::submit), outside total
+    double orient = 0, detect = 0, decode = 0, second_pass = 0, recognize = 0, total = 0, load = 0;
   } ms;
 
   std::string text() const;  // the lines, a row each
@@ -200,6 +205,20 @@ class Engine {
   // Reads every page, in parallel; the results in the pages' order.
   std::vector<OcrPage> ocr(std::span<const GrayView> pages);
   OcrPage ocr(const GrayView& page);
+
+  // A stream of pages, for a caller that keeps every core busy across calls (a server, the benchmark's
+  // workers): each page starts as soon as a worker is free, with no wait for a whole batch to end. submit
+  // gives a page and returns its number, from 0 in the order given; it waits while in_flight pages are being
+  // read. next returns the next page's result in that order, waiting for it, and rethrows the error that page
+  // met (the stream goes on); nullopt once every page given is out. The view's pixels must stay valid until
+  // next has returned that page: `keep` holds them (released when it has), a GrayImage is the engine's. The
+  // same bytes as ocr(). One thread may submit while another takes; not from inside the engine's workers.
+  size_t submit(const GrayView& page, std::shared_ptr<const void> keep = {});
+  size_t submit(GrayImage page);
+  // A page's image file (as load_image reads it), read and decoded by the worker that takes the page, so the
+  // decode runs beside the other pages' work; a file that cannot be read is that page's error, from next.
+  size_t submit(const std::filesystem::path& file);
+  std::optional<OcrPage> next();
 
   // Puts pages read otherwise (from a text layer) in reading order as ocr does: the
   // order model's, with blocks, or the XY-cut's.

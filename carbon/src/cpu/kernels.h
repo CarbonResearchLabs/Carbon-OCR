@@ -81,7 +81,13 @@ void dwconv_u8s8_avx2(Rows<uint8_t>, int32_t, const int8_t*, int, int, const Epi
 void dwconv_f32_neon(Rows<float>, const float*, int, int, const Epilogue&);
 void dwconv_u8s8_neon(Rows<uint8_t>, int32_t, const int8_t*, int, int, const Epilogue&);
 void ctc_argmax_avx2(const float*, int, int, int, int32_t*, float*);
+ByteCounts count_beyond_avx2(const uint8_t*, int, int, int64_t, int, int);
+void above_bits_avx2(const float*, int, float, uint32_t*);
+// det_head's band: its working memory (scratch kA) the head's row, three upsampled rows and a row of zeros.
+void det_head_avx2(const float* x, int h4, int w4, const DetHeadWeights& w, float* maps, int row0, int row1);
 void ctc_argmax_neon(const float*, int, int, int, int32_t*, float*);
+ByteCounts count_beyond_neon(const uint8_t*, int, int, int64_t, int, int);
+void above_bits_neon(const float*, int, float, uint32_t*);
 // FP16 (cpu.h): A in FP16 (uint16_t) or FP32, B and the depthwise weights in FP16.
 void gemm_f16_avx2(Rows<uint16_t>, const F16View&, int, const Epilogue&);
 void gemm_f16_avx2(Rows<float>, const F16View&, int, const Epilogue&);
@@ -140,6 +146,7 @@ struct TurnView {
   double s, c, cx, cy;
   const double* xc;
   const double* xs;
+  int row0, row1;  // the rows of dst written, row0 to row1 - 1 (each row's bytes do not depend on the others)
 };
 
 void rotate_bilinear_avx2(const TurnView&, uint8_t*);

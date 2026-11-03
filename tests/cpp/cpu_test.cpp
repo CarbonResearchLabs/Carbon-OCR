@@ -2,13 +2,17 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <set>
 #include <string>
 #include <vector>
+
+#include "../../carbon/src/cpu/kernels.h"
 
 namespace carbon::cpu {
 namespace {
@@ -800,44 +804,190 @@ TEST(CpuGemm, PackingNeedsTheInstructionSet) {
   EXPECT_FALSE(f16_arithmetic(Isa::kAvx2) || f16_arithmetic(Isa::kAvx512) || f16_arithmetic(Isa::kNeon));
 }
 
+// The detector's threshold bits on every instruction set, as the reference sets them: values at the threshold (not
+// above), NaNs (never above), infinities, lengths that leave a word part full; the last word's high bits clear.
+TEST(CpuThreshold, AboveBitsAsTheReference) {
+  std::mt19937 rng(29);
+  std::uniform_int_distribution<int> pick(0, 9);
+  for (const int n : {1, 7, 8, 31, 32, 33, 64, 100, 362}) {
+    std::vector<float> v(n);
+    for (auto& x : v) {
+      const int k = pick(rng);
+      x = k == 0 ? std::numeric_limits<float>::quiet_NaN() : k == 1 ? 0.25f : k == 2 ? INFINITY
+          : k == 3 ? -INFINITY : 0.1f * static_cast<float>(pick(rng)) - 0.2f;
+    }
+    const int words = (n + 31) / 32;
+    std::vector<uint32_t> want(words, 0xdeadbeef);
+    above_bits(v.data(), n, 0.25f, want.data(), Isa::kScalar);
+    for (int i = 0; i < n; ++i) ASSERT_EQ((want[i / 32] >> (i % 32)) & 1u, v[i] > 0.25f ? 1u : 0u) << i;
+    if (n % 32) ASSERT_EQ(want.back() >> (n % 32), 0u);
+    for (Isa isa : isas_available()) {
+      std::vector<uint32_t> got(words, 0xdeadbeef);
+      above_bits(v.data(), n, 0.25f, got.data(), isa);
+      EXPECT_EQ(got, want) << isa_name(isa) << " n " << n;
+    }
+  }
+}
+
+// A crop's bytes at most lo and at least hi on every instruction set, as the reference counts them: widths that leave
+// each vector a tail, rows a stride apart, thresholds at and past the bytes' ends.
+TEST(CpuCrops, CountBeyondAsTheReference) {
+  std::mt19937 rng(23);
+  std::uniform_int_distribution<int> byte(0, 255);
+  for (const int w : {1, 15, 16, 31, 32, 33, 100, 517}) {
+    const int h = 32;
+    const int64_t stride = w + 7;
+    std::vector<uint8_t> c(static_cast<size_t>(stride) * h);
+    for (auto& v : c) v = static_cast<uint8_t>(byte(rng) % 3 == 0 ? 255 : byte(rng));
+    for (const auto [lo, hi] : std::vector<std::pair<int, int>>{{100, 160}, {-1, 256}, {0, 255}, {-5, 200}, {40, 300},
+                                                                {255, 0}, {128, 128}}) {
+      const cpu::ByteCounts want = count_beyond(c.data(), w, h, stride, lo, hi, Isa::kScalar);
+      int64_t below = 0, above = 0;
+      for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+          below += c[static_cast<size_t>(y) * stride + x] <= lo;
+          above += c[static_cast<size_t>(y) * stride + x] >= hi;
+        }
+      ASSERT_EQ(want.below, below);
+      ASSERT_EQ(want.above, above);
+      for (Isa isa : isas_available()) {
+        const cpu::ByteCounts got = count_beyond(c.data(), w, h, stride, lo, hi, isa);
+        EXPECT_EQ(got.below, below) << isa_name(isa) << " w " << w << " lo " << lo;
+        EXPECT_EQ(got.above, above) << isa_name(isa) << " w " << w << " hi " << hi;
+      }
+    }
+  }
+}
+
+TEST(CpuCtc, ATermOfALogitMoreThan17BelowItsBestCannotMoveASumOfOne) {
+  // Past a group's highest best class, every frame's sum is at least 1 (its best's term, exp_neg(0), is exactly 1), and
+  // the kernels pass over a class whose terms are all of logits more than 17 below their bests: such a term must be
+  // under half an ulp of 1, 2^-24. Every float from -17 to -87, where exp_neg clamps, and the clamp's own value.
+  EXPECT_EQ(carbon::cpu::detail::exp_neg(0.0f), 1.0f);
+  float worst = 0.0f;
+  uint32_t lo, hi;
+  const float from = -17.0f, to = -87.0f;
+  std::memcpy(&lo, &from, 4);
+  std::memcpy(&hi, &to, 4);
+  for (uint32_t b = lo + 1; b <= hi + 1; ++b) {  // negative floats grow in magnitude with their bits
+    float x;
+    std::memcpy(&x, &b, 4);
+    const float e = carbon::cpu::detail::exp_neg(x);
+    worst = e > worst ? e : worst;
+  }
+  for (const float x : {-1e30f, -std::numeric_limits<float>::infinity()}) {
+    const float e = carbon::cpu::detail::exp_neg(x);
+    worst = e > worst ? e : worst;
+  }
+  EXPECT_LT(worst, std::ldexp(1.0f, -24));
+  volatile float one = 1.0f;
+  EXPECT_EQ(one + worst, 1.0f);
+}
+
 TEST(CpuCtc, EveryKernelGivesTheReferenceBits) {
-  // Logits on a coarse grid (ties between classes), blank-heavy frames, and frame counts
-  // that leave every vector width a tail.
+  // Logits on a coarse grid (ties between classes), narrow and wide (most terms then too small to change a sum, which
+  // the kernels pass over), blank-heavy frames, frame counts that leave every vector width a tail, and lines longer
+  // than the kernels' chunks of 256 frames, one chunk of them all blank.
   std::mt19937 rng(17);
   std::uniform_int_distribution<int> grid(-24, 24);
-  for (const int classes : {1, 7, 800}) {
-    for (const int frames : {1, 13, 131}) {
-      std::vector<float> logits(static_cast<size_t>(classes) * frames);
-      for (auto& v : logits) v = 0.5f * static_cast<float>(grid(rng));
-      for (int t = 0; t < frames; t += 3) logits[t] += 30.0f;  // class 0, the blank, wins a third of them
-      const int t_n = frames - frames / 5;
-      std::vector<int32_t> ref_ids(frames, -1);
-      std::vector<float> ref_probs(frames, -1.0f);
-      ctc_argmax(logits.data(), classes, frames, t_n, ref_ids.data(), ref_probs.data(), Isa::kScalar);
-      for (int t = 0; t < t_n; ++t) {  // the reference against the definition
-        int best = 0;
-        for (int c = 1; c < classes; ++c)
-          if (logits[static_cast<size_t>(c) * frames + t] > logits[static_cast<size_t>(best) * frames + t]) best = c;
-        ASSERT_EQ(ref_ids[t], best);
-        if (best == 0) continue;
-        double sum = 0;
-        for (int c = 0; c < classes; ++c)
-          sum += std::exp(double(logits[static_cast<size_t>(c) * frames + t]) - logits[static_cast<size_t>(best) * frames + t]);
-        EXPECT_NEAR(ref_probs[t], 1.0 / sum, 2e-5 / sum);  // a float sum of up to 800 terms
-      }
-      for (Isa isa : isas_available()) {
-        std::vector<int32_t> ids(frames, -1);
-        std::vector<float> probs(frames, -1.0f);
-        ctc_argmax(logits.data(), classes, frames, t_n, ids.data(), probs.data(), isa);
-        EXPECT_EQ(ids, ref_ids) << isa_name(isa) << " " << classes << " x " << frames;
-        for (int t = 0; t < t_n; ++t) {
-          if (ref_ids[t] == 0) continue;  // a blank frame's probability is not written
-          uint32_t a, b;
-          std::memcpy(&a, &probs[t], 4);
-          std::memcpy(&b, &ref_probs[t], 4);
-          EXPECT_EQ(a, b) << isa_name(isa) << " frame " << t;
+  for (const float spread : {0.5f, 3.0f}) {
+    for (const int classes : {1, 7, 800}) {
+      for (const int frames : {1, 13, 131, 263, 700}) {
+        std::vector<float> logits(static_cast<size_t>(classes) * frames);
+        for (auto& v : logits) v = spread * static_cast<float>(grid(rng));
+        for (int t = 0; t < frames; t += 3) logits[t] += 30.0f;  // class 0, the blank, raised in a third of them
+        for (int t = 256; t < 512 && t < frames; ++t) logits[t] = 100.0f;  // every frame of the second chunk
+        const int t_n = frames - frames / 5;
+        std::vector<int32_t> ref_ids(frames, -1);
+        std::vector<float> ref_probs(frames, -1.0f);
+        ctc_argmax(logits.data(), classes, frames, t_n, ref_ids.data(), ref_probs.data(), Isa::kScalar);
+        for (int t = 0; t < t_n; ++t) {  // the reference against the definition
+          int best = 0;
+          for (int c = 1; c < classes; ++c)
+            if (logits[static_cast<size_t>(c) * frames + t] > logits[static_cast<size_t>(best) * frames + t]) best = c;
+          ASSERT_EQ(ref_ids[t], best);
+          if (best == 0) continue;
+          double sum = 0;
+          for (int c = 0; c < classes; ++c)
+            sum += std::exp(double(logits[static_cast<size_t>(c) * frames + t]) - logits[static_cast<size_t>(best) * frames + t]);
+          EXPECT_NEAR(ref_probs[t], 1.0 / sum, 2e-5 / sum);  // a float sum of up to 800 terms
+        }
+        for (Isa isa : isas_available()) {
+          std::vector<int32_t> ids(frames, -1);
+          std::vector<float> probs(frames, -1.0f);
+          ctc_argmax(logits.data(), classes, frames, t_n, ids.data(), probs.data(), isa);
+          EXPECT_EQ(ids, ref_ids) << isa_name(isa) << " " << classes << " x " << frames;
+          for (int t = 0; t < t_n; ++t) {
+            if (ref_ids[t] == 0) continue;  // a blank frame's probability is not written
+            uint32_t a, b;
+            std::memcpy(&a, &probs[t], 4);
+            std::memcpy(&b, &ref_probs[t], 4);
+            EXPECT_EQ(a, b) << isa_name(isa) << " frame " << t;
+          }
         }
       }
+    }
+  }
+}
+
+
+// The detector's head in one pass (det_head) gives, bit for bit, what its four steps give one after another over
+// whole tensors (a 1x1 and ReLU, a nearest 2x upsample, a depthwise 3x3 with a zero border and ReLU, a 1x1), each an
+// FMA chain from its bias in the same order; on every instruction set, and in row bands cut anywhere.
+TEST(Cpu, DetectorHeadInOnePassAsItsStepsGiveIt) {
+  std::mt19937 rng(5);
+  std::normal_distribution<float> n(0.0f, 0.5f);
+  for (const auto& [in, mid, out, h4, w4] : std::vector<std::array<int, 5>>{{5, 3, 4, 7, 13}, {8, 8, 4, 4, 6},
+                                                                             {32, 16, 4, 3, 11}, {2, 2, 1, 1, 1}}) {
+    std::vector<float> x(static_cast<size_t>(in) * h4 * w4), w1(mid * in), b1(mid), w2(mid * 9), b2(mid), w3(out * mid),
+        b3(out);
+    for (auto* v : {&x, &w1, &b1, &w2, &b2, &w3, &b3}) {
+      for (float& e : *v) e = n(rng);
+    }
+    const DetHeadWeights w{in, mid, out, w1.data(), b1.data(), w2.data(), b2.data(), w3.data(), b3.data()};
+    const int H = 2 * h4, W = 2 * w4;
+    std::vector<float> head(static_cast<size_t>(mid) * h4 * w4), up(static_cast<size_t>(mid) * H * W),
+        dw(static_cast<size_t>(mid) * H * W), want(static_cast<size_t>(out) * H * W);
+    for (int c = 0; c < mid; ++c) {
+      for (int p = 0; p < h4 * w4; ++p) {
+        float acc = b1[c];
+        for (int i = 0; i < in; ++i) acc = std::fma(w1[c * in + i], x[static_cast<size_t>(i) * h4 * w4 + p], acc);
+        head[static_cast<size_t>(c) * h4 * w4 + p] = acc > 0.0f ? acc : 0.0f;
+      }
+      for (int y = 0; y < H; ++y) {
+        for (int xx = 0; xx < W; ++xx) {
+          up[(static_cast<size_t>(c) * H + y) * W + xx] = head[(static_cast<size_t>(c) * h4 + y / 2) * w4 + xx / 2];
+        }
+      }
+      for (int y = 0; y < H; ++y) {
+        for (int xx = 0; xx < W; ++xx) {
+          float acc = b2[c];
+          for (int ky = 0; ky < 3; ++ky) {
+            for (int kx = 0; kx < 3; ++kx) {
+              const int yy = y + ky - 1, xk = xx + kx - 1;
+              const float v = yy < 0 || yy >= H || xk < 0 || xk >= W ? 0.0f : up[(static_cast<size_t>(c) * H + yy) * W + xk];
+              acc = std::fma(w2[c * 9 + ky * 3 + kx], v, acc);
+            }
+          }
+          dw[(static_cast<size_t>(c) * H + y) * W + xx] = acc > 0.0f ? acc : 0.0f;
+        }
+      }
+    }
+    for (int o = 0; o < out; ++o) {
+      for (int p = 0; p < H * W; ++p) {
+        float acc = b3[o];
+        for (int c = 0; c < mid; ++c) acc = std::fma(w3[o * mid + c], dw[static_cast<size_t>(c) * H * W + p], acc);
+        want[static_cast<size_t>(o) * H * W + p] = acc;
+      }
+    }
+    for (Isa isa : isas_available()) {
+      std::vector<float> got(want.size(), -1.0f);
+      det_head(x.data(), h4, w4, w, got.data(), 0, H, isa);
+      EXPECT_EQ(std::memcmp(got.data(), want.data(), want.size() * sizeof(float)), 0) << isa_name(isa) << " " << in << "x" << h4 << "x" << w4;
+      std::vector<float> bands(want.size(), -1.0f);
+      const int cuts[] = {0, 1, H / 2, H / 2, H};
+      for (int b = 0; b + 1 < 5; ++b) det_head(x.data(), h4, w4, w, bands.data(), cuts[b], cuts[b + 1], isa);
+      EXPECT_EQ(std::memcmp(bands.data(), want.data(), want.size() * sizeof(float)), 0) << isa_name(isa) << " in bands";
     }
   }
 }

@@ -146,6 +146,35 @@ TEST(WorkerPool, FastWorkersFirst) {
   EXPECT_EQ(workers.size(), 3u);
 }
 
+// slow_takes_new false: a burst of tasks from outside runs on the fast worker alone,
+// and the tasks those queue (a page's lines) reach the slow workers too.
+TEST(WorkerPool, SlowWorkersTakeOnlyARunningTasksTasks) {
+  PoolOptions o{3, false, 1};
+  o.slow_takes_new = false;
+  WorkerPool pool(o);
+  std::mutex m;
+  std::set<int> outside, inside;
+  for (int i = 0; i < 12; ++i) {
+    pool.submit([&](int w) {
+      {
+        std::lock_guard lk(m);
+        outside.insert(w);
+      }
+      for (int k = 0; k < 6; ++k) {
+        pool.submit([&](int v) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(3));
+          std::lock_guard lk(m);
+          inside.insert(v);
+        });
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    });
+  }
+  pool.wait();
+  EXPECT_EQ(outside, (std::set<int>{0}));
+  EXPECT_EQ(inside.size(), 3u);
+}
+
 TEST(WorkerPool, IdleCountsTheSleepingFastWorkers) {
   WorkerPool pool({4, false});
   EXPECT_EQ(pool.fast(), 4);

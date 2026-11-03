@@ -4,9 +4,11 @@
 // log steps (each byte plus the one a pixel before it, then two and four pixels before),
 // then the last pixel of the bytes before added to all of them.
 //
-// Paeth, 16 rows at once: a run of 16 Paeth rows of 1, 3 or 4 bytes a pixel goes as a
-// wavefront, row k a pixel behind row k - 1, the rows in the 16 byte lanes of a vector
-// (a vector a channel).  Each step makes a pixel of every row: its left (a) is the
+// Paeth, 16 rows at once: 16 rows of 1, 3 or 4 bytes a pixel of which at least 6 are Paeth
+// or Average (the serial filters a row's scalar code makes slowly) go as a wavefront, row k
+// a pixel behind row k - 1, the rows in the 16 byte lanes of a vector (a vector a channel);
+// each lane applies its own row's filter (None 0, Sub a, Up b, Average (a + b) / 2, Paeth),
+// chosen by masks made once for the 16 rows.  Each step makes a pixel of every row: its left (a) is the
 // lane's last result, its above (b) the last result moved up a lane (lane 0 from the
 // row above the run), its above left (c) the b of the step before.  The raw bytes come
 // into lanes by 16-byte loads from each row, each a pixel further left than the row
@@ -97,20 +99,48 @@ inline void transpose(__m128i v[16]) {
   }
 }
 
-// 16 Paeth rows of B bytes a pixel (above), at least 32 pixels a row.
+// A row of B bytes a pixel from byte i0 (a whole pixel, at least one in) to n, by its filter.
+template <int B>
+void row_from(int filter, const uint8_t* raw, const uint8_t* prior, uint8_t* cur, size_t i0, size_t n) {
+  switch (filter) {
+    case 0:
+      for (size_t i = i0; i < n; ++i) cur[i] = raw[i];
+      return;
+    case 1: png_sub_from<B>(raw, cur, i0, n); return;
+    case 2:
+      for (size_t i = i0; i < n; ++i) cur[i] = static_cast<uint8_t>(raw[i] + prior[i]);
+      return;
+    case 3: png_average_from<B>(raw, prior, cur, i0, n); return;
+    default: png_paeth_from<B>(raw, prior, cur, i0, n); return;
+  }
+}
+
+// 16 rows of B bytes a pixel (above), at least 32 pixels a row, each by its own filter.
 template <int B>
 void paeth_wave(const PngRows& r) {
   const size_t n = r.n, w = n / B;
   const uint8_t* raw[16];
   uint8_t* cur[16];
   const uint8_t* up[16];
+  alignas(16) uint8_t m_sub[16], m_up[16], m_avg[16], m_paeth[16];
+  int filter[16];
   for (int k = 0; k < 16; ++k) {
     raw[k] = r.raw + k * r.raw_stride;
     cur[k] = r.cur + k * r.cur_stride;
     up[k] = k ? cur[k - 1] : r.prior;
+    filter[k] = raw[k][-1];
+    m_sub[k] = filter[k] == 1 ? 0xff : 0;
+    m_up[k] = filter[k] == 2 ? 0xff : 0;
+    m_avg[k] = filter[k] == 3 ? 0xff : 0;
+    m_paeth[k] = filter[k] == 4 ? 0xff : 0;
   }
-  // The triangle the wavefront starts from: row k's first 15 - k pixels.
-  for (int k = 0; k < 15; ++k) png_paeth_row<B>(raw[k], up[k], cur[k], static_cast<size_t>(B) * (15 - k));
+  const __m128i is_sub = _mm_load_si128(reinterpret_cast<const __m128i*>(m_sub));
+  const __m128i is_up = _mm_load_si128(reinterpret_cast<const __m128i*>(m_up));
+  const __m128i is_avg = _mm_load_si128(reinterpret_cast<const __m128i*>(m_avg));
+  const __m128i is_paeth = _mm_load_si128(reinterpret_cast<const __m128i*>(m_paeth));
+  const __m128i one = _mm_set1_epi8(1);
+  // The triangle the wavefront starts from: row k's first 15 - k pixels, each by its filter.
+  for (int k = 0; k < 15; ++k) png_unfilter_row(filter[k], raw[k], up[k], cur[k], static_cast<size_t>(B) * (15 - k), B);
   // Lane k at step 15 makes row k's pixel 15 - k: its left is pixel 14 - k (zero for
   // row 15's first), the b of step 14 row k - 1's pixel 14 - k.
   __m128i a[B], bp[B];
@@ -137,7 +167,12 @@ void paeth_wave(const PngRows& r) {
       for (int ch = 0; ch < B; ++ch) {
         const int q = B * i + ch;
         const __m128i b = _mm_alignr_epi8(a[ch], _mm_loadu_si128(reinterpret_cast<const __m128i*>(above + ch)), 15);
-        const __m128i x = _mm_add_epi8(v[q / 16][q % 16], paeth16(a[ch], b, bp[ch]));
+        // Average's (a + b) >> 1: the rounding up avg less the odd bit of a + b
+        const __m128i avg = _mm_sub_epi8(_mm_avg_epu8(a[ch], b), _mm_and_si128(_mm_xor_si128(a[ch], b), one));
+        const __m128i pred = _mm_or_si128(
+            _mm_or_si128(_mm_and_si128(is_sub, a[ch]), _mm_and_si128(is_up, b)),
+            _mm_or_si128(_mm_and_si128(is_avg, avg), _mm_and_si128(is_paeth, paeth16(a[ch], b, bp[ch]))));
+        const __m128i x = _mm_add_epi8(v[q / 16][q % 16], pred);
         v[q / 16][q % 16] = x;  // in the raw bytes' place
         bp[ch] = b;
         a[ch] = x;
@@ -151,14 +186,25 @@ void paeth_wave(const PngRows& r) {
     }
   }
   // The rest of each row, from the first pixel the groups left.
-  for (int k = 0; k < 16; ++k) png_paeth_from<B>(raw[k], up[k], cur[k], B * (s0 - k), n);
+  for (int k = 0; k < 16; ++k) row_from<B>(filter[k], raw[k], up[k], cur[k], B * (s0 - k), n);
+}
+
+// Of the 16 rows from the first, how many are Paeth or Average; 0 where there are fewer than 16.
+size_t serial_rows(const PngRows& r) {
+  if (r.rows < 16) return 0;
+  size_t k = 0;
+  for (size_t i = 0; i < 16; ++i) {
+    const int f = (r.raw + i * r.raw_stride)[-1];
+    k += f == 3 || f == 4;
+  }
+  return k;
 }
 
 }  // namespace
 
 size_t png_unfilter_avx2(const PngRows& r) {
   const int filter = r.raw[-1], bpp = r.bpp;
-  if (filter == 4 && (bpp == 1 || bpp == 3 || bpp == 4) && r.n / bpp >= 32 && png_paeth_run(r, 16) == 16) {
+  if ((filter == 3 || filter == 4) && (bpp == 1 || bpp == 3 || bpp == 4) && r.n / bpp >= 32 && serial_rows(r) >= 6) {
     if (bpp == 1) {
       paeth_wave<1>(r);
     } else if (bpp == 3) {

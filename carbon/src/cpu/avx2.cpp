@@ -453,43 +453,239 @@ inline __m256 exp_neg8(__m256 x) {
 
 }  // namespace
 
-void ctc_argmax_avx2(const float* logits, int classes, int frames, int t_n, int32_t* ids, float* probs) {
-  int t0 = 0;
-  for (; t0 + 8 <= t_n; t0 += 8) {  // 8 frames at a time: each class's 8 logits are contiguous
-    __m256 best = _mm256_set1_ps(-INFINITY);
-    __m256i arg = _mm256_setzero_si256();
-    for (int c = 0; c < classes; ++c) {
-      const __m256 v = _mm256_loadu_ps(logits + static_cast<size_t>(c) * frames + t0);
-      const __m256 more = _mm256_cmp_ps(v, best, _CMP_GT_OQ);  // strictly: ties keep the lower id
-      best = _mm256_blendv_ps(best, v, more);
-      arg = _mm256_blendv_epi8(arg, _mm256_set1_epi32(c), _mm256_castps_si256(more));
+namespace {
+
+// det_head's row of the head at stride 4: channel c's row in head[c][w4], an FMA chain a pixel, bias first.
+void det_head_row(const float* x, int h4, int w4, const DetHeadWeights& w, int p, float* head) {
+  const __m256 zero = _mm256_setzero_ps();
+  for (int c = 0; c < w.mid; ++c) {
+    const float* wc = w.w1 + static_cast<size_t>(c) * w.in;
+    float* hc = head + static_cast<size_t>(c) * w4;
+    int px = 0;
+    for (; px + 8 <= w4; px += 8) {
+      __m256 acc = _mm256_set1_ps(w.b1[c]);
+      for (int i = 0; i < w.in; ++i) {
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(wc[i]), _mm256_loadu_ps(x + (static_cast<int64_t>(i) * h4 + p) * w4 + px),
+                              acc);
+      }
+      _mm256_storeu_ps(hc + px, _mm256_max_ps(acc, zero));
     }
-    _mm256_storeu_si256(reinterpret_cast<__m256i*>(ids + t0), arg);
-    if (_mm256_testz_si256(arg, arg)) continue;  // eight blank frames: no probability is read
-    __m256 sum = _mm256_setzero_ps();
-    for (int c = 0; c < classes; ++c) {
-      const __m256 v = _mm256_loadu_ps(logits + static_cast<size_t>(c) * frames + t0);
-      sum = _mm256_add_ps(sum, exp_neg8(_mm256_sub_ps(v, best)));
+    for (; px < w4; ++px) {
+      float acc = w.b1[c];
+      for (int i = 0; i < w.in; ++i) acc = fmaf(wc[i], x[(static_cast<int64_t>(i) * h4 + p) * w4 + px], acc);
+      hc[px] = acc > 0.0f ? acc : 0.0f;
     }
-    const __m256 prob = _mm256_div_ps(_mm256_set1_ps(1.0f), sum);
-    const __m256i blank = _mm256_cmpeq_epi32(arg, _mm256_setzero_si256());
-    _mm256_maskstore_ps(probs + t0, _mm256_xor_si256(blank, _mm256_set1_epi32(-1)), prob);
   }
-  for (int t = t0; t < t_n; ++t) {  // the last frames as the reference does them
-    float best = -INFINITY;
-    int32_t a = 0;
+}
+
+// The head's row upsampled 2x (nearest) into u[c][P], a zero either side.
+void det_head_up(const float* head, int mid, int w4, int P, float* u) {
+  for (int c = 0; c < mid; ++c) {
+    const float* hc = head + static_cast<size_t>(c) * w4;
+    float* uc = u + static_cast<size_t>(c) * P;
+    uc[0] = 0.0f;
+    uc[P - 1] = 0.0f;
+    int px = 0;
+    for (; px + 8 <= w4; px += 8) {
+      const __m256 v = _mm256_loadu_ps(hc + px);  // a b c d | e f g h
+      const __m256 lo = _mm256_unpacklo_ps(v, v);  // a a b b | e e f f
+      const __m256 hi = _mm256_unpackhi_ps(v, v);  // c c d d | g g h h
+      _mm256_storeu_ps(uc + 1 + 2 * px, _mm256_permute2f128_ps(lo, hi, 0x20));
+      _mm256_storeu_ps(uc + 1 + 2 * px + 8, _mm256_permute2f128_ps(lo, hi, 0x31));
+    }
+    for (; px < w4; ++px) {
+      uc[1 + 2 * px] = hc[px];
+      uc[2 + 2 * px] = hc[px];
+    }
+  }
+}
+
+}  // namespace
+
+void det_head_avx2(const float* x, int h4, int w4, const DetHeadWeights& w, float* maps, int row0, int row1) {
+  const int H = 2 * h4, W = 2 * w4, P = W + 2, mid = w.mid, out = w.out;
+  float* head = scratch_of<float>(Scratch::kA, static_cast<size_t>(mid) * (w4 + 4 * P));
+  float* up = head + static_cast<size_t>(mid) * w4;
+  float* zero_row = up + static_cast<size_t>(3) * mid * P;
+  memset(zero_row, 0, sizeof(float) * static_cast<size_t>(mid) * P);
+  int held[3] = {-1, -1, -1};
+  const __m256 zero = _mm256_setzero_ps();
+  for (int oy = row0; oy < row1; ++oy) {
+    const float* z[3];
+    for (int ky = 0; ky < 3; ++ky) {
+      const int zy = oy + ky - 1;
+      if (zy < 0 || zy >= H) {
+        z[ky] = zero_row;
+        continue;
+      }
+      const int p = zy >> 1;
+      float* u = up + static_cast<size_t>(p % 3) * mid * P;
+      if (held[p % 3] != p) {
+        det_head_row(x, h4, w4, w, p, head);
+        det_head_up(head, mid, w4, P, u);
+        held[p % 3] = p;
+      }
+      z[ky] = u;
+    }
+    int ox = 0;
+    for (; ox + 8 <= W; ox += 8) {
+      __m256 m[8];
+      for (int o = 0; o < out; ++o) m[o] = _mm256_set1_ps(w.b3[o]);
+      for (int c = 0; c < mid; ++c) {
+        const float* wc = w.w2 + static_cast<size_t>(c) * 9;
+        __m256 acc = _mm256_set1_ps(w.b2[c]);
+        for (int ky = 0; ky < 3; ++ky) {
+          const float* zr = z[ky] + static_cast<size_t>(c) * P + ox;
+          acc = _mm256_fmadd_ps(_mm256_set1_ps(wc[ky * 3]), _mm256_loadu_ps(zr), acc);
+          acc = _mm256_fmadd_ps(_mm256_set1_ps(wc[ky * 3 + 1]), _mm256_loadu_ps(zr + 1), acc);
+          acc = _mm256_fmadd_ps(_mm256_set1_ps(wc[ky * 3 + 2]), _mm256_loadu_ps(zr + 2), acc);
+        }
+        const __m256 d = _mm256_max_ps(acc, zero);
+        for (int o = 0; o < out; ++o) m[o] = _mm256_fmadd_ps(_mm256_set1_ps(w.w3[static_cast<size_t>(o) * mid + c]), d, m[o]);
+      }
+      for (int o = 0; o < out; ++o) _mm256_storeu_ps(maps + (static_cast<int64_t>(o) * H + oy) * W + ox, m[o]);
+    }
+    for (; ox < W; ++ox) {  // the row's tail, as the reference
+      float m[8];
+      for (int o = 0; o < out; ++o) m[o] = w.b3[o];
+      for (int c = 0; c < mid; ++c) {
+        float acc = w.b2[c];
+        for (int ky = 0; ky < 3; ++ky) {
+          for (int kx = 0; kx < 3; ++kx) {
+            acc = fmaf(w.w2[static_cast<size_t>(c) * 9 + ky * 3 + kx], z[ky][static_cast<size_t>(c) * P + ox + kx], acc);
+          }
+        }
+        const float d = acc > 0.0f ? acc : 0.0f;
+        for (int o = 0; o < out; ++o) m[o] = fmaf(w.w3[static_cast<size_t>(o) * mid + c], d, m[o]);
+      }
+      for (int o = 0; o < out; ++o) maps[(static_cast<int64_t>(o) * H + oy) * W + ox] = m[o];
+    }
+  }
+}
+
+// 32 values a word, 8 a compare: vcmpps (ordered, so a NaN is never above) and vmovmskps; the last word's values one
+// at a time.
+void above_bits_avx2(const float* v, int n, float t, uint32_t* bits) {
+  const __m256 tv = _mm256_set1_ps(t);
+  int i = 0;
+  for (; i + 32 <= n; i += 32) {
+    uint32_t word = 0;
+    for (int k = 0; k < 4; ++k) {
+      const __m256 more = _mm256_cmp_ps(_mm256_loadu_ps(v + i + 8 * k), tv, _CMP_GT_OQ);
+      word |= static_cast<uint32_t>(_mm256_movemask_ps(more)) << (8 * k);
+    }
+    bits[i / 32] = word;
+  }
+  if (i < n) {
+    uint32_t word = 0;
+    for (int k = 0; i + k < n; ++k) word |= (v[i + k] > t ? 1u : 0u) << k;
+    bits[i / 32] = word;
+  }
+}
+
+// 32 bytes a step: a byte at most lo where min(v, lo) is v, at least hi where max(v, hi) is v; the masks' ones
+// summed by vpsadbw into four 64-bit lanes. The row's last bytes one at a time.
+ByteCounts count_beyond_avx2(const uint8_t* c, int w, int h, int64_t stride, int lo, int hi) {
+  const bool any_below = lo >= 0, any_above = hi <= 255;
+  const __m256i lo8 = _mm256_set1_epi8(static_cast<char>(any_below ? lo : 0));
+  const __m256i hi8 = _mm256_set1_epi8(static_cast<char>(any_above ? hi : 255));
+  const __m256i one = _mm256_set1_epi8(1), zero = _mm256_setzero_si256();
+  __m256i below = zero, above = zero;
+  ByteCounts n{0, 0};
+  for (int y = 0; y < h; ++y) {
+    const uint8_t* row = c + y * stride;
+    int x = 0;
+    for (; x + 32 <= w; x += 32) {
+      const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row + x));
+      const __m256i le = _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_min_epu8(v, lo8), v), one);
+      const __m256i ge = _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_max_epu8(v, hi8), v), one);
+      below = _mm256_add_epi64(below, _mm256_sad_epu8(le, zero));
+      above = _mm256_add_epi64(above, _mm256_sad_epu8(ge, zero));
+    }
+    for (; x < w; ++x) {
+      n.below += row[x] <= lo;
+      n.above += row[x] >= hi;
+    }
+  }
+  alignas(32) int64_t lanes[4];
+  _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), below);
+  if (any_below) n.below += lanes[0] + lanes[1] + lanes[2] + lanes[3];
+  _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), above);
+  if (any_above) n.above += lanes[0] + lanes[1] + lanes[2] + lanes[3];
+  return n;
+}
+
+void ctc_argmax_avx2(const float* logits, int classes, int frames, int t_n, int32_t* ids, float* probs) {
+  // In chunks of up to 256 frames, the logits read in their order, a class's frames after another's:
+  //  - each frame's best class, 8 frames a vector, the chunk's running bests and their classes kept in L1 (each
+  //    frame's comparisons the reference's, in class order; the last frames' vector a masked load);
+  //  - the softmax sums of only the frames where a character won (most frames are blank), gathered 8 to a vector, each
+  //    lane its own frame's operations in the reference's order, so the same bits whichever lane a frame takes;
+  //  - past the group's highest best class every lane's sum is at least 1 (its best's term, exp(0), is exactly 1), so a
+  //    term below 2^-24 cannot change it: a class whose 8 terms are all of logits more than 17 below their bests
+  //    (exp_neg(-17) is 4.1e-8; tests/cpp/cpu_test.cpp checks every float below) adds nothing and is passed over.
+  constexpr int kChunk = 256;
+  alignas(32) float top[kChunk + 8];
+  alignas(32) int32_t arg[kChunk + 8];
+  alignas(32) int32_t hit[kChunk + 8];
+  const __m256i lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+  const __m256 far = _mm256_set1_ps(-17.0f);
+  for (int c0 = 0; c0 < t_n; c0 += kChunk) {
+    const int len = t_n - c0 < kChunk ? t_n - c0 : kChunk;
+    const int nv = len / 8, rem = len % 8;
+    const __m256i tail = _mm256_cmpgt_epi32(_mm256_set1_epi32(rem), lane);
+    for (int v = 0; v <= nv; ++v) {
+      _mm256_store_ps(top + 8 * v, _mm256_set1_ps(-INFINITY));
+      _mm256_store_si256(reinterpret_cast<__m256i*>(arg + 8 * v), _mm256_setzero_si256());
+    }
     for (int c = 0; c < classes; ++c) {
-      const float v = logits[static_cast<size_t>(c) * frames + t];
-      if (v > best) {
-        best = v;
-        a = c;
+      const float* row = logits + static_cast<size_t>(c) * frames + c0;
+      const __m256i cv = _mm256_set1_epi32(c);
+      for (int v = 0; v < nv; ++v) {
+        const __m256 x = _mm256_loadu_ps(row + 8 * v), b = _mm256_load_ps(top + 8 * v);
+        const __m256 more = _mm256_cmp_ps(x, b, _CMP_GT_OQ);  // strictly: ties keep the lower id
+        _mm256_store_ps(top + 8 * v, _mm256_blendv_ps(b, x, more));
+        __m256i* a = reinterpret_cast<__m256i*>(arg + 8 * v);
+        _mm256_store_si256(a, _mm256_blendv_epi8(_mm256_load_si256(a), cv, _mm256_castps_si256(more)));
+      }
+      if (rem != 0) {  // the lanes past the chunk read as 0 and are never used
+        const __m256 x = _mm256_maskload_ps(row + 8 * nv, tail), b = _mm256_load_ps(top + 8 * nv);
+        const __m256 more = _mm256_cmp_ps(x, b, _CMP_GT_OQ);
+        _mm256_store_ps(top + 8 * nv, _mm256_blendv_ps(b, x, more));
+        __m256i* a = reinterpret_cast<__m256i*>(arg + 8 * nv);
+        _mm256_store_si256(a, _mm256_blendv_epi8(_mm256_load_si256(a), cv, _mm256_castps_si256(more)));
       }
     }
-    ids[t] = a;
-    if (a == 0) continue;
-    float sum = 0.0f;
-    for (int c = 0; c < classes; ++c) sum = sum + exp_neg(logits[static_cast<size_t>(c) * frames + t] - best);
-    probs[t] = 1.0f / sum;
+    std::memcpy(ids + c0, arg, static_cast<size_t>(len) * sizeof(int32_t));
+    int n = 0;
+    for (int t = 0; t < len; ++t) {
+      hit[n] = t;
+      n += arg[t] != 0;
+    }
+    if (n == 0) continue;  // a blank chunk: no probability is read
+    for (int k = n; k < n + 8; ++k) hit[k] = hit[n - 1];  // a short last group repeats its last frame
+    const float* chunk = logits + c0;
+    for (int k = 0; k < n; k += 8) {
+      const __m256i at = _mm256_load_si256(reinterpret_cast<const __m256i*>(hit + k));
+      const __m256 best = _mm256_i32gather_ps(top, at, 4);
+      int last = 0;
+      for (int q = 0; q < 8; ++q) last = arg[hit[k + q]] > last ? arg[hit[k + q]] : last;
+      __m256 sum = _mm256_setzero_ps();
+      int c = 0;
+      for (; c <= last; ++c) {
+        const __m256 v = _mm256_i32gather_ps(chunk + static_cast<size_t>(c) * frames, at, 4);
+        sum = _mm256_add_ps(sum, exp_neg8(_mm256_sub_ps(v, best)));
+      }
+      for (; c < classes; ++c) {
+        const __m256 d = _mm256_sub_ps(_mm256_i32gather_ps(chunk + static_cast<size_t>(c) * frames, at, 4), best);
+        if (_mm256_movemask_ps(_mm256_cmp_ps(d, far, _CMP_NLT_UQ)) == 0) continue;  // NaN is added, as the reference
+        sum = _mm256_add_ps(sum, exp_neg8(d));
+      }
+      alignas(32) float prob[8];
+      _mm256_store_ps(prob, _mm256_div_ps(_mm256_set1_ps(1.0f), sum));
+      const int m = n - k < 8 ? n - k : 8;
+      for (int q = 0; q < m; ++q) probs[c0 + hit[k + q]] = prob[q];
+    }
   }
 }
 
@@ -641,7 +837,7 @@ void rotate_bilinear_avx2(const TurnView& t, uint8_t* dst) {
   const __m256i byte = _mm256_set1_epi32(0xff);
   const int* top_row = reinterpret_cast<const int*>(t.src);
   const int* next_row = reinterpret_cast<const int*>(t.src + (wide ? t.stride : 0));
-  for (int y = 0; y < h; ++y) {
+  for (int y = t.row0; y < t.row1; ++y) {
     const double dy = y - t.cy, ds = dy * t.s, dc = dy * t.c;
     const __m256d vds = _mm256_set1_pd(ds), vdc = _mm256_set1_pd(dc);
     uint8_t* d = dst + static_cast<int64_t>(y) * w;

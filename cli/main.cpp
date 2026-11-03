@@ -1062,6 +1062,7 @@ int ocr(const Args& a) {
   std::vector<carbon::GrayImage> images;
   std::vector<std::pair<std::string, int>> sources;  // a page's file, and its page in a PDF (from 1; 0: an image)
   std::vector<size_t> pdf_pages;                     // the pages of `images` still to render
+  std::vector<size_t> image_files;                   // the pages of `images` still to decode
   std::unique_ptr<carbon::PdfPool> pdf_pool;
   // Each page's slot, made before the renderers start, so each writes its own pages'
   // alone: those read from their text layers, and for PDF pages read by OCR why not.
@@ -1072,7 +1073,8 @@ int ocr(const Args& a) {
     std::string ext = std::filesystem::path(f).extension().string();
     for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (ext != ".pdf") {
-      images.push_back(carbon::load_image(f));
+      image_files.push_back(images.size());
+      images.emplace_back();
       sources.emplace_back(f, 0);
       continue;
     }
@@ -1091,6 +1093,30 @@ int ocr(const Args& a) {
   text_pages.resize(images.size());
   picture_pages.resize(images.size());
   notes.resize(images.size());
+  // The image files decoded side by side, a thread a worker (one after another, 17 ms each for a 7 MP PNG, was the
+  // serial start of every run); the first file that cannot be read stops the run, as before.
+  if (!image_files.empty()) {
+    std::atomic<size_t> next{0};
+    std::exception_ptr failed;
+    std::mutex failed_m;
+    std::vector<std::thread> decoders;
+    const int threads = std::max(1, std::min(engine.workers(), static_cast<int>(image_files.size())));
+    for (int t = 0; t < threads; ++t) {
+      decoders.emplace_back([&] {
+        for (size_t k; (k = next++) < image_files.size();) {
+          const size_t i = image_files[k];
+          try {
+            images[i] = carbon::load_image(sources[i].first);
+          } catch (...) {
+            std::lock_guard<std::mutex> g(failed_m);
+            if (!failed) failed = std::current_exception();
+          }
+        }
+      });
+    }
+    for (auto& d : decoders) d.join();
+    if (failed) std::rethrow_exception(failed);
+  }
 #if defined(CARBON_WITH_PDFIUM)
   if (!pdf_pages.empty()) {
     const double scale = a.dpi / 72.0;

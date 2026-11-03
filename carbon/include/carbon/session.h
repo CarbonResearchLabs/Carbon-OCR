@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -67,6 +68,13 @@ struct SessionOptions {
   // has run (with shapes that keep changing it grows further: +1.4 GB over 10
   // runs was seen in another engine), which the width buckets bound.
   bool cpu_arena = true;
+  // ONNX Runtime with threads > 1: the logical processors (numbered from 0, in processor group 0) its own threads
+  // may run on, each of them; empty, wherever the OS puts them. The engine keeps a page's multi-threaded
+  // detection on the fast cores of a hybrid CPU with it.
+  std::vector<int> thread_cpus;
+  // The model's bytes, run instead of the file's (the path still names it in errors): a model the engine has
+  // changed, as the detector cut before its head (carbon/src/det_head.h). ONNX Runtime and the native backend.
+  std::shared_ptr<const std::string> model_bytes;
 
   // The native backend: the instruction set its kernels use, by its name in
   // carbon/cpu.h ("avx2", "avx512", "neon-dot", ...).  Empty: the best the CPU
@@ -116,6 +124,21 @@ class Session {
   // Host tensors in, host tensors out, through the session's own device
   // buffers.  For tests, tools and CPU-fed stages.
   virtual std::vector<Tensor> run(std::span<const Tensor> inputs) = 0;
+
+  // An output where the backend holds it: valid while the function given to run() runs.
+  struct OutputView {
+    DType dtype;
+    Shape shape;
+    const void* data;
+    template <class T>
+    const T* as() const {
+      return static_cast<const T*>(data);
+    }
+  };
+  // The same run, its outputs read where the backend wrote them, not copied out: ONNX Runtime's own buffers
+  // (its arena's, reused run to run), for an output read once (the recognizer's logits, about 20 MB a page, and
+  // the detector's maps). Other backends pass run()'s tensors.
+  virtual void run(std::span<const Tensor> inputs, const std::function<void(std::span<const OutputView>)>& read);
 
   // GPU sessions (TensorRT).  The output shapes for inputs of these shapes;
   // throws Error when no profile holds them.
