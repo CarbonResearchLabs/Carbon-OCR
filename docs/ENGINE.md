@@ -272,6 +272,7 @@ On a laptop with an Intel Core i7-13620H (6 P-cores, 4 E-cores) and an RTX 4060 
 
 | what | measured |
 |---|---|
+| the trained `fullerene-3M`, end to end | OmniParseBench, all 2,937 pages: a headline of 43.5 against Tesseract 5.5's 5.9; 3.79 pages a second on one core against 0.76, 12.3 in six processes against 3.0 (3 November; FP32 on ONNX Runtime, the engine's HTML and layout blocks graded) |
 | `rec-latin` on one CPU core | 8 lines of 512 px in 11.4 ms in int8 on the engine's own kernels; 16 lines in 65 ms on ONNX Runtime 1.31 in FP32 (AVX2), 62 GMAC/s, about 80% of the core's peak |
 | `fullerene-3M` on one CPU core | a Latin page in 98 ms, every model included, the set's int8 files on the engine's own kernels: 10.2 pages a second per core |
 | `fullerene-10M` on one CPU core | a CJK page in 271 ms |

@@ -21,7 +21,7 @@ The goal is to be far more accurate than Tesseract and faster than every open en
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/glance-dark.svg">
-  <img src="docs/assets/glance-light.svg" alt="Designed: 2.83 M parameters in fullerene-3M; 10.8 GMAC per Latin page; 10.3 M parameters in fullerene-10M. Measured: rec-latin at 62 GMAC/s on one CPU core and 12.8 TMAC/s in FP16 on a laptop RTX 4060; 176 tests, 162 of them in CI" width="100%">
+  <img src="docs/assets/glance-light.svg" alt="Designed: 2.83 M parameters in fullerene-3M; 10.8 GMAC per Latin page; OmniParseBench headline 43.5 against Tesseract's 5.9. Measured: rec-latin at 62 GMAC/s on one CPU core and 12.8 TMAC/s in FP16 on a laptop RTX 4060; 176 tests, 162 of them in CI" width="100%">
 </picture>
 
 The top row is the design budget, counted from the models' layer shapes. The bottom row is measured on random weights, since speed does not depend on the weights (see Measured so far, below).
@@ -41,6 +41,8 @@ The top row is the design budget, counted from the models' layer shapes. The bot
 On the CPU, a pinned worker per physical core reads pages in parallel. Work is cut smaller than a page, so a single page also uses every core. The int8 kernels are picked at run time for the CPU: AVX2, AVX-VNNI, AVX-512, NEON or the Arm dot product. On the GPU, `carbon::Pipeline` batches each model across all the pages in flight. [docs/ENGINE.md](docs/ENGINE.md) covers the engine in full.
 
 ## <img src="docs/assets/chip-03.svg" height="22" alt=""> The models
+
+The trained Latin set, `fullerene-3M`, is on Hugging Face: [huggingface.co/CarbonResearchLabs/fullerene-3M](https://huggingface.co/CarbonResearchLabs/fullerene-3M).
 
 Fullerene is eight small networks, shipped in two sets named by their parameter count:
 - **`fullerene-3M`**, the Latin set, 2.83 M parameters: `orient`, `det`, `script`, `rec-latin` and `order`.
@@ -68,7 +70,19 @@ A Latin page is 10.8 GMAC, and 77% of that is recognition. That is why the recog
 
 ## <img src="docs/assets/chip-04.svg" height="22" alt=""> Measured so far
 
-These were measured on a laptop (i7-13620H, RTX 4060 Laptop GPU) between 27 and 30 October 2026, using random weights, since speed does not depend on them.
+The trained `fullerene-3M` ([on Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M)), read by the engine on all 2,937 pages of OmniParseBench and graded by the benchmark's own grader, against Tesseract 5.5 with its defaults, on the same laptop (3 November 2026): a headline of **43.5** against 5.9 (text 26.2 against 17.8; tables 23.6 and layout 80.6, which Tesseract, writing text alone, scores 0), and **3.79 pages a second on one core** against 0.76 (a median page of 223 ms against 947), 12.3 against 3.0 in six processes. Its FP16 files on the CPU score the same.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/fig-bench-dark.svg">
+  <img src="docs/assets/fig-bench-light.svg" alt="OmniParseBench, all 2,937 pages: fullerene-3M scores a headline of 43.5 against Tesseract 5.5's 5.9; text 26.2 against 17.8, tables 23.6 and layout 80.6 against 0." width="100%">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/fig-bench-speed-dark.svg">
+  <img src="docs/assets/fig-bench-speed-light.svg" alt="Pages a second: 3.79 against Tesseract's 0.76 on one core, 12.26 against 2.97 in six processes." width="100%">
+</picture>
+
+The rows below were measured on the same laptop (and its RTX 4060 Laptop GPU) between 27 and 30 October 2026, using random weights, since speed does not depend on them.
 
 | what | measured |
 |---|---|
