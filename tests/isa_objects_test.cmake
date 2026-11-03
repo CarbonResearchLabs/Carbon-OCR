@@ -1,15 +1,16 @@
-# The files built for an instruction set (carbon/src/cpu/avx2.cpp, avxvnni.cpp,
-# avx512.cpp, neondot.cpp) define no code another file could share (kernels.h): an
-# inline function or a template's instance they emit is one copy the linker keeps
-# for the whole program, and that copy could run AVX-512 code on a CPU without it.
-# Code only: data shared that way is the same bytes in every file.  In an optimized
-# build, where the standard library's one-line accessors are inlined.
+# The files built for an instruction set (carbon/src/cpu/avx2.cpp, png_avx2.cpp,
+# avxvnni.cpp, avx512.cpp, avx512fp16.cpp, neondot.cpp, neonfp16.cpp) define no code
+# another file could share (kernels.h): an inline function or a template's instance
+# they emit is one copy the linker keeps for the whole program, and that copy could
+# run AVX-512 code on a CPU without it.  Code only: data shared that way is the same
+# bytes in every file.  In an optimized build, where the standard library's one-line
+# accessors are inlined.
 #
 #   cmake -DOBJECTS=<object>|<object>... (-DNM=<nm> | -DDUMP=<link.exe>) -P isa_objects_test.cmake
 
 cmake_minimum_required(VERSION 3.24)
 string(REPLACE "|" ";" objects "${OBJECTS}")
-list(FILTER objects INCLUDE REGEX "[/\\\\](avx2|avxvnni|avx512|neondot)(\\.cpp)?\\.(o|obj)$")
+list(FILTER objects INCLUDE REGEX "[/\\\\](png_)?(avx2|avxvnni|avx512|avx512fp16|neondot|neonfp16)(\\.cpp)?\\.(o|obj)$")
 if(NOT objects)
   message(STATUS "no file built for an instruction set: nothing to check")
   return()

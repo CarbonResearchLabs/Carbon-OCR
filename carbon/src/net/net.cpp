@@ -19,6 +19,22 @@
 // writes its output as uint8 or float, as its tensor is kept.  A residual Add
 // joins its convolution in float (the sum is quantized once, not twice).
 //
+// FP16: a file whose input is float16 (the export's <model>.fp16.onnx: the
+// same graph, float16 weights and input and output) runs its convolutions on the
+// FP16 kernels (carbon/cpu.h), the weights packed in FP16.  Its tensors between
+// the layers are kept in FP16 where the instruction set has FP16 arithmetic
+// (avx512-fp16, neon-fp16: the kernels read and write FP16, twice the lanes of
+// FP32), else in FP32.  Without FP16 arithmetic (F16C, plain NEON) every value
+// is widened to FP32 before it is summed, so FP16 tensors only add conversions:
+// measured on an i7-13620H (AVX2, F16C), one thread on a P-core, the median of
+// three rounds of 30 to 100 runs, det at 1024 x 800 took 59.7 ms with FP32
+// tensors and 64.9 ms with FP16 ones, orient at 512 x 512 6.3 and 7.8 ms,
+// rec-latin on 8 lines of 512 px 34.6 and 35.0 ms (the FP32 file: 59.7, 6.5 and
+// 34.4 ms), and FP32 tensors keep a rounding fewer.  The graph's outputs are
+// FP32, as the layer's float sums give them (finer than FP16).
+// CARBON_FP16_ACTIVATIONS=1 or 0 in the environment chooses (tests, timing).  At
+// the session the input and outputs are float32, as every other file's.
+//
 // Running: every tensor is NHWC, channels innermost, with a border of zeros (the
 // zero point, for uint8) as wide as its consumers' padding, so each tap of a
 // convolution reads inside the buffer and an output row of a convolution is one
@@ -68,16 +84,18 @@ inline uint8_t quantize(float v, const Quant& q) {
 }
 
 // A tensor: NHWC with a border ph rows and pw columns wide that holds zeros
-// (uint8: the zero point), kept as float or as uint8 (real = (v - zero) * scale).
+// (uint8: the zero point), kept as float, as uint8 (real = (v - zero) * scale) or
+// as FP16 (an FP16 file's, where the instruction set sums in FP16).
 struct Value {
   std::string name, last;  // last: the name of the op it ends as (fused ops give it theirs)
   int c = 0;
   int ph = 0, pw = 0;
-  bool u8 = false;
+  bool u8 = false, f16 = false;
   Quant q;
   int n = 0, h = 0, w = 0;  // this run's
   std::vector<float> f;
   std::vector<uint8_t> b;
+  std::vector<uint16_t> hv;  // FP16
 
   int64_t hp() const { return h + 2 * ph; }
   int64_t wp() const { return w + 2 * pw; }
@@ -86,16 +104,28 @@ struct Value {
   const float* fat(int i, int y, int x) const { return f.data() + pixel(i, y, x); }
   uint8_t* bat(int i, int y, int x) { return b.data() + pixel(i, y, x); }
   const uint8_t* bat(int i, int y, int x) const { return b.data() + pixel(i, y, x); }
+  uint16_t* hat(int i, int y, int x) { return hv.data() + pixel(i, y, x); }
+  const uint16_t* hat(int i, int y, int x) const { return hv.data() + pixel(i, y, x); }
   float real(int i, int y, int x, int ch) const {
+    if (f16) return cpu::f16_to_f32(hat(i, y, x)[ch]);
     return u8 ? static_cast<float>(static_cast<int32_t>(bat(i, y, x)[ch]) - q.zero) * q.scale : fat(i, y, x)[ch];
   }
   void set(int i, int y, int x, int ch, float v) {
     if (u8) {
       bat(i, y, x)[ch] = quantize(v, q);
+    } else if (f16) {
+      hat(i, y, x)[ch] = cpu::f32_to_f16(v);
     } else {
       fat(i, y, x)[ch] = v;
     }
   }
+  // Bytes a value: what a copy of a pixel's channels moves.
+  size_t element() const { return u8 ? 1 : f16 ? 2 : 4; }
+  const void* raw(int i, int y, int x) const {
+    return u8 ? static_cast<const void*>(bat(i, y, x)) : f16 ? static_cast<const void*>(hat(i, y, x)) : fat(i, y, x);
+  }
+  void* raw(int i, int y, int x) { return const_cast<void*>(static_cast<const Value*>(this)->raw(i, y, x)); }
+  bool same_storage(const Value& o) const { return u8 == o.u8 && f16 == o.f16 && (!u8 || q == o.q); }
 
   // Sized for n x h x w with the border filled (the inside is written by the
   // layer that makes it).  The slack past the end is for the kernels' wide reads.
@@ -106,6 +136,8 @@ struct Value {
     const size_t size = static_cast<size_t>(n) * hp() * wp() * c + 64;
     if (u8) {
       fill(b, size, static_cast<uint8_t>(q.zero));
+    } else if (f16) {
+      fill(hv, size, uint16_t{0});
     } else {
       fill(f, size, 0.0f);
     }
@@ -131,6 +163,12 @@ struct Value {
   }
 };
 
+// A stored value as the pools sum it: uint8 as its integer (dequantized after the
+// sum), FP16 widened.
+inline double stored(uint8_t v) { return v; }
+inline double stored(uint16_t v) { return cpu::f16_to_f32(v); }
+inline double stored(float v) { return v; }
+
 // A weight read from a DequantizeLinear: its int8 values and its scales (one, or
 // one per output channel).
 struct QWeight {
@@ -151,12 +189,14 @@ struct Layer {
   // the weights as read, [cout][cin / groups][kh][kw], until they are packed
   std::vector<float> wf;
   std::optional<QWeight> w8;
-  // packed: FP32, or int8 with the sums' scales (the input's times the weights')
-  bool int8 = false, im2col = false;
+  // packed: FP32, int8 with the sums' scales (the input's times the weights'), or FP16
+  bool int8 = false, im2col = false, half = false;
   cpu::PackedF32 weights;
   cpu::PackedB weights8;
-  std::vector<float> dw;   // depthwise FP32: [taps][c]
-  std::vector<int8_t> dw8;  // depthwise int8: [taps][c]
+  cpu::PackedF16 weights16;
+  std::vector<float> dw;      // depthwise FP32: [taps][c]
+  std::vector<int8_t> dw8;    // depthwise int8: [taps][c]
+  std::vector<uint16_t> dw16;  // depthwise FP16: [taps][c]
   std::vector<float> scale;
   int fh = 1, fw = 1;  // Resize's scales
 };
@@ -166,9 +206,24 @@ struct Output {
   int rank = 4;
 };
 
+// An environment variable's value, or empty.
+std::string env(const char* name) {
+  std::string v;
+#if defined(_MSC_VER)
+  char* e = nullptr;
+  size_t len = 0;
+  if (_dupenv_s(&e, &len, name) == 0 && e) v = e;
+  std::free(e);
+#else
+  if (const char* e = std::getenv(name)) v = e;
+#endif
+  return v;
+}
+
 class Net {
  public:
-  Net(const onnx::Model& model, cpu::Isa isa) : isa_(isa) { compile(model.graph); }
+  // act16: an FP16 file's tensors between layers in FP16 (else FP32).
+  Net(const onnx::Model& model, cpu::Isa isa, bool act16) : isa_(isa), act16_(act16) { compile(model.graph); }
 
   std::vector<TensorInfo> inputs, outputs;
 
@@ -177,13 +232,15 @@ class Net {
     Value& in = values_[0];
     in.shape(static_cast<int>(s[0]), static_cast<int>(s[2]), static_cast<int>(s[3]));
     const float* src = x.data<float>().data();
-    for (int i = 0; i < in.n; ++i) {  // NCHW to NHWC, quantized if the network takes uint8
+    for (int i = 0; i < in.n; ++i) {  // NCHW to NHWC, quantized or rounded to FP16 if the network takes it so
       for (int y = 0; y < in.h; ++y) {
         if (in.c == 1) {  // the same order: a row at a time
           const float* from = src + (static_cast<int64_t>(i) * in.h + y) * in.w;
           if (in.u8) {
             uint8_t* to = in.bat(i, y, 0);
             for (int x0 = 0; x0 < in.w; ++x0) to[x0] = quantize(from[x0], in.q);
+          } else if (in.f16) {
+            cpu::to_f16(from, in.hat(i, y, 0), static_cast<size_t>(in.w), isa_);
           } else {
             std::memcpy(in.fat(i, y, 0), from, sizeof(float) * in.w);
           }
@@ -218,15 +275,7 @@ class Net {
   // CARBON_NATIVE_PROFILE=1: each layer's time, summed over the runs, printed
   // to stderr when the net goes.
   void profile() {
-    std::string v;
-#if defined(_MSC_VER)
-    char* e = nullptr;
-    size_t len = 0;
-    if (_dupenv_s(&e, &len, "CARBON_NATIVE_PROFILE") == 0 && e) v = e;
-    std::free(e);
-#else
-    if (const char* e = std::getenv("CARBON_NATIVE_PROFILE")) v = e;
-#endif
+    const std::string v = env("CARBON_NATIVE_PROFILE");
     if (!v.empty() && v != "0") profile_.assign(layers_.size() + 1, 0.0);
   }
 
@@ -241,10 +290,11 @@ class Net {
         const Layer& l = layers_[i];
         const char* kinds[] = {"conv", "dwconv", "resize", "avgpool", "mean", "add"};
         const Value& y = values_[l.out];
-        what = std::string(kinds[static_cast<int>(l.kind)]) + (l.int8 ? " int8 " : " ") + std::to_string(l.kh) +
-               "x" + std::to_string(l.kw) + "/" + std::to_string(l.sh) + "," + std::to_string(l.sw) + " " +
-               std::to_string(l.cin) + "->" + std::to_string(l.cout) + " out " + std::to_string(y.h) + "x" +
-               std::to_string(y.w) + (y.u8 ? " u8" : "") + (l.relu ? " relu" : "") + (l.residual >= 0 ? " +res" : "");
+        what = std::string(kinds[static_cast<int>(l.kind)]) + (l.int8 ? " int8 " : l.half ? " fp16 " : " ") +
+               std::to_string(l.kh) + "x" + std::to_string(l.kw) + "/" + std::to_string(l.sh) + "," +
+               std::to_string(l.sw) + " " + std::to_string(l.cin) + "->" + std::to_string(l.cout) + " out " +
+               std::to_string(y.h) + "x" + std::to_string(y.w) + (y.u8 ? " u8" : y.f16 ? " f16" : "") +
+               (l.relu ? " relu" : "") + (l.residual >= 0 ? " +res" : "");
       }
       std::fprintf(stderr, "  %8.3f ms %5.1f%%  %s\n", profile_[i] / runs_, 100 * profile_[i] / total, what.c_str());
     }
@@ -277,6 +327,8 @@ class Net {
         if (!a || !a->t) refuse("Constant '" + n.name + "' without a tensor value");
         owned_.push_back(*a->t);
         constants_[n.outputs[0]] = &owned_.back();
+      } else if (fp16_ && (n.op == "QuantizeLinear" || n.op == "DequantizeLinear")) {
+        refuse(n.op + " '" + n.name + "' in a float16 network");
       } else if (n.op == "QuantizeLinear") {
         const onnx::TensorData* z = n.inputs.size() > 2 && !n.inputs[2].empty() ? &constant(n.inputs[2]) : nullptr;
         if (z && z->dtype != onnx::kUint8) refuse("QuantizeLinear '" + n.name + "': uint8 activations only");
@@ -380,9 +432,11 @@ class Net {
   void compile(const onnx::Graph& g) {
     if (g.inputs.size() != 1) refuse("networks with one input only");
     const onnx::ValueInfo& x = g.inputs[0];
-    if (x.dtype != onnx::kFloat || x.dims.size() != 4 || x.dims[1] <= 0) {
-      refuse("the input must be float [N, C, H, W] with C fixed");
+    if ((x.dtype != onnx::kFloat && x.dtype != onnx::kFloat16) || x.dims.size() != 4 || x.dims[1] <= 0) {
+      refuse("the input must be float or float16 [N, C, H, W] with C fixed");
     }
+    fp16_ = x.dtype == onnx::kFloat16;
+    // float32 at the session whatever the file's: an FP16 file's are converted here
     inputs.push_back({x.name, DType::kFloat32, Shape(x.dims.begin(), x.dims.end())});
     add_value(x.name, static_cast<int>(x.dims[1]));
     for (const onnx::TensorData& t : g.initializers) constants_[t.name] = &t;
@@ -395,12 +449,15 @@ class Net {
     for (const onnx::ValueInfo& o : g.outputs) ++uses_[o.name];
     for (const onnx::Node& n : nodes) compile(n);
     for (const onnx::ValueInfo& o : g.outputs) {
-      if (o.dtype != onnx::kFloat) refuse("output '" + o.name + "' is not float");
+      if (o.dtype != (fp16_ ? onnx::kFloat16 : onnx::kFloat)) {
+        refuse("output '" + o.name + "' is not " + (fp16_ ? "float16, as the input is" : "float"));
+      }
       auto it = output_names_.find(o.name);
       outputs_.push_back({value(it == output_names_.end() ? o.name : it->second), static_cast<int>(o.dims.size())});
       outputs.push_back({o.name, DType::kFloat32, Shape(o.dims.begin(), o.dims.end())});
     }
-    // Each tensor kept as its last name's quantization says; each border as wide
+    // Each tensor kept as its last name's quantization says, or in FP16 (an FP16
+    // file's, where its tensors are: the outputs stay FP32); each border as wide
     // as the widest padding of the convolutions that read it.
     for (Value& v : values_) {
       auto it = quant_.find(v.last);
@@ -408,7 +465,9 @@ class Net {
         v.u8 = true;
         v.q = it->second;
       }
+      v.f16 = fp16_ && act16_;
     }
+    for (const Output& o : outputs_) values_[o.value].f16 = false;
     for (const Layer& l : layers_) {
       if (l.kind != Kind::kConv && l.kind != Kind::kDwConv) continue;
       Value& v = values_[l.in];
@@ -564,13 +623,21 @@ class Net {
   }
 
   // A convolution's weights packed for its kernel, once every tensor's storage
-  // is known: int8 where its input is uint8 and its weights came as int8.
+  // is known: int8 where its input is uint8 and its weights came as int8; FP16 in
+  // an FP16 network (its weights FP16 values, widened exactly when read, so
+  // rounding them back is exact too).
   void pack(Layer& l) {
     if (l.kind != Kind::kConv && l.kind != Kind::kDwConv) return;
     const Value& x = values_[l.in];
     const int taps = l.kh * l.kw;
     if (x.u8 && !l.w8) refuse("'" + l.node + "': a uint8 input needs int8 weights");
     l.int8 = x.u8;
+    l.half = fp16_;
+    auto halves = [](const std::vector<float>& v) {
+      std::vector<uint16_t> h(v.size());
+      for (size_t i = 0; i < v.size(); ++i) h[i] = cpu::f32_to_f16(v[i]);
+      return h;
+    };
     if (l.int8) {
       l.scale.resize(l.cout);
       for (int co = 0; co < l.cout; ++co) {
@@ -601,7 +668,11 @@ class Net {
       } else {
         std::vector<float> b;
         to_b(l.wf, b);
-        l.weights = cpu::pack_f32(b.data(), taps * l.cin, l.cout, isa_);
+        if (l.half) {
+          l.weights16 = cpu::pack_f16(halves(b).data(), taps * l.cin, l.cout, isa_);
+        } else {
+          l.weights = cpu::pack_f32(b.data(), taps * l.cin, l.cout, isa_);
+        }
       }
     } else {
       auto to_dw = [&](const auto& w, auto& d) {
@@ -614,6 +685,10 @@ class Net {
         to_dw(l.w8->values, l.dw8);
       } else {
         to_dw(l.wf, l.dw);
+        if (l.half) {
+          l.dw16 = halves(l.dw);
+          l.dw.clear();
+        }
       }
     }
     l.wf.clear();
@@ -684,7 +759,7 @@ class Net {
       case Kind::kDwConv: conv_step(l, x, y); return;
       case Kind::kResize: {
         y.shape(x.n, x.h * l.fh, x.w * l.fw);
-        const bool bytes = x.u8 && y.u8 && x.q == y.q, floats = !x.u8 && !y.u8;
+        const bool same = x.same_storage(y);
         const int c = x.c;
         // Each input row widened once into its first output row; the rows it
         // repeats are copies of that one.
@@ -697,17 +772,15 @@ class Net {
         };
         for (int i = 0; i < y.n; ++i) {
           for (int oy = 0; oy < y.h; ++oy) {
-            if (oy % l.fh && (bytes || floats)) {
-              const size_t row = static_cast<size_t>(y.w) * c * (bytes ? 1 : sizeof(float));
-              if (bytes) {
-                std::memcpy(y.bat(i, oy, 0), y.bat(i, oy - 1, 0), row);
-              } else {
-                std::memcpy(y.fat(i, oy, 0), y.fat(i, oy - 1, 0), row);
-              }
-            } else if (bytes) {
-              widen(x.bat(i, oy / l.fh, 0), y.bat(i, oy, 0));
-            } else if (floats) {
-              widen(x.fat(i, oy / l.fh, 0), y.fat(i, oy, 0));
+            const int iy = oy / l.fh;
+            if (oy % l.fh && same) {
+              std::memcpy(y.raw(i, oy, 0), y.raw(i, oy - 1, 0), static_cast<size_t>(y.w) * c * y.element());
+            } else if (same && x.u8) {
+              widen(x.bat(i, iy, 0), y.bat(i, oy, 0));
+            } else if (same && x.f16) {
+              widen(x.hat(i, iy, 0), y.hat(i, oy, 0));
+            } else if (same) {
+              widen(x.fat(i, iy, 0), y.fat(i, oy, 0));
             } else {
               for (int ox = 0; ox < y.w; ++ox) {
                 for (int ch = 0; ch < c; ++ch) y.set(i, oy, ox, ch, x.real(i, oy / l.fh, ox / l.fw, ch));
@@ -728,19 +801,24 @@ class Net {
             // A row of windows at a time: the window's rows summed into one row
             // of sums (uint8 as integers, exactly), then each sum to its mean.
             std::fill(sums_.begin(), sums_.end(), 0.0);
+            // one channel: the row's values in order
+            auto add_row = [&](const auto* v) {
+              for (int ox = 0; ox < ow; ++ox) {
+                for (int kx = 0; kx < l.kw; ++kx) sums_[ox] += stored(v[ox * l.sw + kx]);
+              }
+            };
+            auto add_pixel = [&](const auto* v, double* sum) {
+              for (int ch = 0; ch < c; ++ch) sum[ch] += stored(v[ch]);
+            };
             for (int ky = 0; ky < l.kh; ++ky) {
               const int iy = oy * l.sh + ky;
-              if (c == 1) {  // one channel: the row's values in order
+              if (c == 1) {
                 if (x.u8) {
-                  const uint8_t* v = x.bat(i, iy, 0);
-                  for (int ox = 0; ox < ow; ++ox) {
-                    for (int kx = 0; kx < l.kw; ++kx) sums_[ox] += v[ox * l.sw + kx];
-                  }
+                  add_row(x.bat(i, iy, 0));
+                } else if (x.f16) {
+                  add_row(x.hat(i, iy, 0));
                 } else {
-                  const float* v = x.fat(i, iy, 0);
-                  for (int ox = 0; ox < ow; ++ox) {
-                    for (int kx = 0; kx < l.kw; ++kx) sums_[ox] += v[ox * l.sw + kx];
-                  }
+                  add_row(x.fat(i, iy, 0));
                 }
                 continue;
               }
@@ -749,11 +827,11 @@ class Net {
                 for (int kx = 0; kx < l.kw; ++kx) {
                   const int ix = ox * l.sw + kx;
                   if (x.u8) {
-                    const uint8_t* v = x.bat(i, iy, ix);
-                    for (int ch = 0; ch < c; ++ch) sum[ch] += v[ch];
+                    add_pixel(x.bat(i, iy, ix), sum);
+                  } else if (x.f16) {
+                    add_pixel(x.hat(i, iy, ix), sum);
                   } else {
-                    const float* v = x.fat(i, iy, ix);
-                    for (int ch = 0; ch < c; ++ch) sum[ch] += v[ch];
+                    add_pixel(x.fat(i, iy, ix), sum);
                   }
                 }
               }
@@ -777,14 +855,17 @@ class Net {
         sums_.resize(c);
         for (int i = 0; i < y.n; ++i) {
           std::fill(sums_.begin(), sums_.end(), 0.0);
+          auto add_pixel = [&](const auto* v) {
+            for (int ch = 0; ch < c; ++ch) sums_[ch] += stored(v[ch]);
+          };
           for (int py = 0; py < x.h; ++py) {
             for (int px = 0; px < x.w; ++px) {
               if (x.u8) {
-                const uint8_t* v = x.bat(i, py, px);
-                for (int ch = 0; ch < c; ++ch) sums_[ch] += v[ch];
+                add_pixel(x.bat(i, py, px));
+              } else if (x.f16) {
+                add_pixel(x.hat(i, py, px));
               } else {
-                const float* v = x.fat(i, py, px);
-                for (int ch = 0; ch < c; ++ch) sums_[ch] += v[ch];
+                add_pixel(x.fat(i, py, px));
               }
             }
           }
@@ -846,13 +927,31 @@ class Net {
       for (int oy = 0; oy < oh; ++oy) {
         if (y.u8) {
           e.out_u8 = y.bat(i, oy, 0);
+        } else if (y.f16) {
+          e.out_f16 = y.hat(i, oy, 0);
         } else {
           e.out_f32 = y.fat(i, oy, 0);
         }
         if (r && r->u8) e.residual_u8 = r->bat(i, oy, 0);
-        if (r && !r->u8) e.residual_f32 = r->fat(i, oy, 0);
+        if (r && r->f16) e.residual_f16 = r->hat(i, oy, 0);
+        if (r && !r->u8 && !r->f16) e.residual_f32 = r->fat(i, oy, 0);
         const int y0 = oy * l.sh - l.pt, x0 = -l.pl;
-        if (!l.int8) {
+        const int64_t step = int64_t{l.sw} * x.c;
+        if (l.half && x.f16) {  // FP16 activations: the FP16 kernels' own arithmetic
+          const cpu::Rows<uint16_t> rows = cpu::grid(x.hat(i, y0, x0), step, taps, offsets_.data());
+          if (l.kind == Kind::kConv) {
+            cpu::gemm_f16(rows, l.weights16, ow, e);
+          } else {
+            cpu::dwconv_f16(rows, l.dw16.data(), l.cin, ow, e, isa_);
+          }
+        } else if (l.half) {  // FP32 activations, FP16 weights
+          const cpu::Rows<float> rows = cpu::grid(x.fat(i, y0, x0), step, taps, offsets_.data());
+          if (l.kind == Kind::kConv) {
+            cpu::gemm_f16(rows, l.weights16, ow, e);
+          } else {
+            cpu::dwconv_f16(rows, l.dw16.data(), l.cin, ow, e, isa_);
+          }
+        } else if (!l.int8) {
           const cpu::Rows<float> rows = cpu::grid(x.fat(i, y0, x0), int64_t{l.sw} * x.c, taps, offsets_.data());
           if (l.kind == Kind::kConv) {
             cpu::gemm_f32(rows, l.weights, ow, e);
@@ -897,6 +996,18 @@ class Net {
     }
     Tensor t = Tensor::empty(DType::kFloat32, s);
     float* o = t.data<float>().data();
+    if (v.f16) {  // not a graph output's storage (those are FP32), but any value's
+      for (int i = 0; i < v.n; ++i) {
+        for (int y = 0; y < v.h; ++y) {
+          for (int x = 0; x < v.w; ++x) {
+            for (int ch = 0; ch < v.c; ++ch) {
+              o[((static_cast<int64_t>(i) * v.c + ch) * v.h + y) * v.w + x] = v.real(i, y, x, ch);
+            }
+          }
+        }
+      }
+      return t;
+    }
     float table[256];
     for (int q = 0; q < 256; ++q) table[q] = static_cast<float>(q - v.q.zero) * v.q.scale;
     // Pixels x channels to channels x pixels, in blocks of 16 x 16 (both sides
@@ -928,6 +1039,8 @@ class Net {
   }
 
   cpu::Isa isa_;
+  bool act16_ = false;  // an FP16 file's tensors in FP16
+  bool fp16_ = false;   // the file is FP16 (its input float16)
   std::vector<Value> values_;
   std::vector<Layer> layers_;
   std::vector<Output> outputs_;
@@ -953,10 +1066,29 @@ cpu::Isa isa(const std::string& name) {
   refuse("instruction set '" + name + "' is not available on this CPU");
 }
 
+// An FP16 file's tensors between layers: FP16 where the instruction set sums in
+// FP16, else FP32 (see the top of this file); CARBON_FP16_ACTIVATIONS=1 or 0 chooses.
+bool fp16_activations(cpu::Isa isa) {
+  const std::string v = env("CARBON_FP16_ACTIVATIONS");
+  if (v == "1") return true;
+  if (v == "0") return false;
+  return cpu::f16_arithmetic(isa);
+}
+
+// The file compiled for isa; what it refuses names the file.
+Net open_net(const std::filesystem::path& path, cpu::Isa isa) {
+  const onnx::Model model = onnx::load(path);
+  try {
+    return Net(model, isa, fp16_activations(isa));
+  } catch (const Error& e) {
+    throw Error(path.string() + ": " + e.what());
+  }
+}
+
 class NativeSession final : public Session {
  public:
   NativeSession(const std::filesystem::path& path, const SessionOptions& options)
-      : net_(onnx::load(path), isa(options.isa)) {
+      : net_(open_net(path, isa(options.isa))) {
     inputs_ = net_.inputs;
     outputs_ = net_.outputs;
     net_.profile();

@@ -70,7 +70,9 @@ struct SessionOptions {
 
   // The native backend: the instruction set its kernels use, by its name in
   // carbon/cpu.h ("avx2", "avx512", "neon-dot", ...).  Empty: the best the CPU
-  // has.  Every set gives the same bits; this is for tests and timing.
+  // has.  Every set gives the same bits, but an FP16 file's on a set with FP16
+  // arithmetic (avx512-fp16, neon-fp16), within FP16's rounding; this is for
+  // tests and timing.
   std::string isa;
 
   // TensorRT.

@@ -107,6 +107,8 @@ endif()
 #
 # One public-domain header that reads PNG, JPEG, BMP and PNM pages: the
 # pipeline's image input until libpng and libjpeg-turbo come.
+# PNG goes to Carbon's own decoder first (carbon/src/png.cpp), which gives
+# stb_image's bytes faster and leaves it the files it does not read itself.
 
 set(CARBON_STB_COMMIT 013ac3beddff3dbffafd5177e7972067cd2b5083)  # stb_image v2.30, 31 May 2024
 FetchContent_Declare(stb_image
@@ -119,7 +121,7 @@ set(CARBON_STB_INCLUDE_DIR ${stb_image_SOURCE_DIR})
 # -------------------------------------------------------------------- libdeflate
 #
 # libdeflate (MIT): deflate, adler-32 and crc-32 with SIMD: the searchable PDF's
-# images.
+# images and the PNG pages it reads.
 
 enable_language(C)
 set(LIBDEFLATE_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)

@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iterator>
 
+#include "carbon/cpu.h"
 #include "carbon/error.h"
 
 namespace carbon::onnx {
@@ -114,6 +115,7 @@ size_t element_size(int32_t dtype) {
   switch (dtype) {
     case kFloat:
     case kInt32: return 4;
+    case kFloat16: return 2;
     case kUint8:
     case kInt8: return 1;
     case kInt64: return 8;
@@ -153,7 +155,7 @@ TensorData read_tensor(std::string_view msg) {
       if (t.dtype != kFloat) bad("tensor '" + t.name + "' has float_data but is not float");
       t.bytes.resize(float_data.size() * 4);
       std::memcpy(t.bytes.data(), float_data.data(), t.bytes.size());
-    } else if (!int_data.empty()) {
+    } else if (!int_data.empty()) {  // float16 too: its bits in int32_data
       t.bytes.resize(int_data.size() * size);
       for (size_t i = 0; i < int_data.size(); ++i) {
         const int64_t v = int_data[i];
@@ -162,6 +164,9 @@ TensorData read_tensor(std::string_view msg) {
         } else if (size == 4) {
           const int32_t v32 = static_cast<int32_t>(v);
           std::memcpy(t.bytes.data() + 4 * i, &v32, 4);
+        } else if (size == 2) {
+          const uint16_t v16 = static_cast<uint16_t>(v);
+          std::memcpy(t.bytes.data() + 2 * i, &v16, 2);
         } else {
           t.bytes[i] = static_cast<uint8_t>(v);
         }
@@ -300,8 +305,16 @@ int64_t TensorData::count() const {
 }
 
 std::vector<float> TensorData::floats() const {
-  if (dtype != kFloat) throw Error("ONNX: tensor '" + name + "' is not float");
   std::vector<float> out(static_cast<size_t>(count()));
+  if (dtype == kFloat16) {
+    for (size_t i = 0; i < out.size(); ++i) {
+      uint16_t h;
+      std::memcpy(&h, bytes.data() + 2 * i, 2);
+      out[i] = cpu::f16_to_f32(h);
+    }
+    return out;
+  }
+  if (dtype != kFloat) throw Error("ONNX: tensor '" + name + "' is not float");
   std::memcpy(out.data(), bytes.data(), bytes.size());
   return out;
 }

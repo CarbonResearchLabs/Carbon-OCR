@@ -16,7 +16,7 @@
 namespace carbon::onnx {
 
 // TensorProto.DataType
-enum DataType : int32_t { kFloat = 1, kUint8 = 2, kInt8 = 3, kInt32 = 6, kInt64 = 7 };
+enum DataType : int32_t { kFloat = 1, kUint8 = 2, kInt8 = 3, kInt32 = 6, kInt64 = 7, kFloat16 = 10 };
 
 struct TensorData {
   std::string name;
@@ -25,7 +25,7 @@ struct TensorData {
   std::vector<uint8_t> bytes;  // the elements, little-endian
 
   int64_t count() const;
-  std::vector<float> floats() const;    // a float tensor
+  std::vector<float> floats() const;    // a float or float16 tensor (float16 widened, exactly)
   std::vector<int64_t> ints() const;    // any integer tensor
   std::vector<int8_t> int8s() const;    // an int8 tensor
   std::vector<uint8_t> uint8s() const;  // a uint8 tensor

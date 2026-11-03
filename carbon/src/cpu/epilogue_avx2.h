@@ -1,5 +1,6 @@
 // The output stage on AVX2, 8 columns at a time (kernels.h), for the files built
-// with AVX2: avx2.cpp and avxvnni.cpp.
+// with AVX2: avx2.cpp and avxvnni.cpp.  FP16 residuals and outputs through F16C
+// (vcvtph2ps, vcvtps2ph rounding to nearest even), for the FP16 kernels.
 #pragma once
 
 #include <immintrin.h>
@@ -22,10 +23,12 @@ inline void epilogue_avx2(const S* s, int ld, int rows, int64_t i0, int j0, int 
   const float* const bias = e.bias;
   const float* const res_f32 = e.residual_f32;
   const uint8_t* const res_u8 = e.residual_u8;
+  const uint16_t* const res_f16 = e.residual_f16;
   const int64_t res_ld = e.residual_ld, out_ld = e.out_ld;
   const bool relu = e.relu;
   float* const out_f32 = e.out_f32;
   uint8_t* const out_u8 = e.out_u8;
+  uint16_t* const out_f16 = e.out_f16;
   const __m256 lo = _mm256_set1_ps(static_cast<float>(-e.out_zero));
   const __m256 hi = _mm256_set1_ps(static_cast<float>(255 - e.out_zero));
   const __m256 inv = _mm256_set1_ps(e.out_inv_scale), rscale = _mm256_set1_ps(e.residual_scale);
@@ -51,12 +54,18 @@ inline void epilogue_avx2(const S* s, int ld, int rows, int64_t i0, int j0, int 
         const __m256i rv = _mm256_sub_epi32(_mm256_cvtepu8_epi32(r8), rzero);
         v = _mm256_add_ps(v, _mm256_mul_ps(_mm256_cvtepi32_ps(rv), rscale));
       }
+      if (res_f16) {
+        const __m128i r16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(res_f16 + i * res_ld + j));
+        v = _mm256_add_ps(v, _mm256_cvtph_ps(r16));
+      }
       if (relu) v = _mm256_max_ps(v, _mm256_setzero_ps());
       if (out_u8) {
         const __m256 q = _mm256_min_ps(_mm256_max_ps(_mm256_mul_ps(v, inv), lo), hi);
         const __m256i qi = _mm256_add_epi32(_mm256_cvtps_epi32(q), ozero);
         const __m128i p16 = _mm_packus_epi32(_mm256_castsi256_si128(qi), _mm256_extracti128_si256(qi, 1));
         _mm_storel_epi64(reinterpret_cast<__m128i*>(out_u8 + i * out_ld + j), _mm_packus_epi16(p16, p16));
+      } else if (out_f16) {
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out_f16 + i * out_ld + j), _mm256_cvtps_ph(v, 0));
       } else {
         _mm256_storeu_ps(out_f32 + i * out_ld + j, v);
       }
@@ -90,6 +99,11 @@ inline void epilogue_avx2(const S* s, int ld, int rows, int64_t i0, int j0, int 
       const __m256i rv = _mm256_sub_epi32(_mm256_cvtepu8_epi32(r8v), rzero);
       v = _mm256_add_ps(v, _mm256_mul_ps(_mm256_cvtepi32_ps(rv), rscale));
     }
+    if (res_f16) {
+      uint16_t r16[8] = {};
+      std::memcpy(r16, res_f16 + i * res_ld + j, 2 * left);
+      v = _mm256_add_ps(v, _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(r16))));
+    }
     if (relu) v = _mm256_max_ps(v, _mm256_setzero_ps());
     if (out_u8) {
       const __m256 q = _mm256_min_ps(_mm256_max_ps(_mm256_mul_ps(v, inv), lo), hi);
@@ -98,6 +112,10 @@ inline void epilogue_avx2(const S* s, int ld, int rows, int64_t i0, int j0, int 
       uint8_t q8[16];
       _mm_storeu_si128(reinterpret_cast<__m128i*>(q8), _mm_packus_epi16(p16, p16));
       std::memcpy(out_u8 + i * out_ld + j, q8, left);
+    } else if (out_f16) {
+      uint16_t h8[8];
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(h8), _mm256_cvtps_ph(v, 0));
+      std::memcpy(out_f16 + i * out_ld + j, h8, 2 * left);
     } else {
       _mm256_maskstore_ps(out_f32 + i * out_ld + j, mask, v);
     }

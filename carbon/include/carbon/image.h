@@ -6,6 +6,7 @@
 #include <span>
 #include <vector>
 
+#include "carbon/cpu.h"
 #include "carbon/lines.h"
 
 namespace carbon {
@@ -18,10 +19,15 @@ struct GrayImage {
   GrayView view() const { return {pixels.data(), width, height, width}; }
 };
 
-// Reads a PNG, JPEG, BMP or PNM file (stb_image) and converts it to gray.
-// Throws Error if it cannot be read or is larger than 32768 px a side.
+// Reads a PNG, JPEG, BMP or PNM file and converts it to gray: the bytes stb_image
+// gives when asked for one channel.  PNG through Carbon's own decoder (libdeflate,
+// and the CPU kernels of `isa`, best_isa() by default: carbon/cpu.h), which leaves
+// interlaced and damaged files and a few rare kinds to stb_image; the other
+// formats through stb_image.  Throws Error if it cannot be read or is larger than
+// 32768 px a side, or if `isa` is not available.
 GrayImage load_image(const std::filesystem::path& file);
 GrayImage decode_image(std::span<const uint8_t> bytes);
+GrayImage decode_image(std::span<const uint8_t> bytes, cpu::Isa isa);
 
 // The image turned clockwise by quarter_turns times 90 degrees.
 GrayImage rotate_quarter(const GrayView& image, int quarter_turns);

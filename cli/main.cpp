@@ -2,6 +2,7 @@
 // times models and model sets.
 //
 //   carbon-ocr ocr IMAGE|PDF... --set DIR [--rec rec-latin] [--backend ort|native]
+//                           [--precision auto|fp32|fp16|int8]
 //                           [--dpi 200] [--text-layer auto|off] [--hybrid auto|off] [--second-pass auto|off]
 //                           [--format text|json|hocr|alto|page|markdown|html|pdf] [--out-dir DIR]
 //                           [--output FILE] [--text-out FILE] [--text-only] [--image-dpi 300] [--as-given]
@@ -14,6 +15,7 @@
 //                          [--runs 100] [--warmup 10] [--threads 1] [--engine-cache DIR]
 //                          [--opt-level 3] [--no-graphs] [--workers 1,2,4,all] [--no-pin]
 //   carbon-ocr pages SETDIR [--rec rec-latin] [--lines 40] [--batch 8] [--pages 32] [--backend ort|native]
+//                           [--precision auto|fp32|fp16|int8]
 //                           [--in-flight N] [--workers 1,2,4,all] [--no-pin] [--threads 1]
 //                           [--det auto|one|wide|strips]
 //   carbon-ocr compare MODEL [--shape NAME=1x1x32x256 ...] [--isa NAME] [--against MODEL]
@@ -38,7 +40,11 @@
 //
 // ocr and pages run each model of a set on the native backend where the set has
 // its int8 file (<model>.int8.onnx), else on ONNX Runtime (carbon::open_set_model);
-// --backend runs every model on one (order stays on ONNX Runtime).
+// --backend runs every model on one (order stays on ONNX Runtime).  --precision
+// picks the files instead (carbon::Precision): fp32 <model>.onnx (on ONNX Runtime
+// unless --backend native), fp16 <model>.fp16.onnx on the native backend's FP16
+// kernels, int8 <model>.int8.onnx (native unless --backend ort); a set without
+// the file is an error.  auto, the default, is the choice above.
 //
 // ocr writes text, JSON, hOCR, ALTO XML, markdown, HTML, a searchable PDF (the pages'
 // images under their words, --output FILE; carbon/output.h; --text-only: the
@@ -147,13 +153,15 @@ struct Args {
   std::string isa;  // the native backend's
   std::string against;  // compare: ONNX Runtime runs this file
   bool backend_given = false;  // ocr and pages choose per model otherwise
+  carbon::Precision precision = carbon::Precision::kAuto;  // ocr and pages: the set's files
 };
 
 [[noreturn]] void usage(const std::string& why) {
   std::fprintf(stderr,
                "carbon-ocr: %s\n"
                "usage: carbon-ocr ocr IMAGE|PDF... --set DIR [--rec NAME] [--workers N]\n"
-               "                        [--no-pin] [--backend ort|native] [--dpi N] [--text-layer auto|off]\n"
+               "                        [--no-pin] [--backend ort|native] [--precision auto|fp32|fp16|int8]\n"
+               "                        [--dpi N] [--text-layer auto|off]\n"
                "                        [--hybrid auto|off] [--second-pass auto|off]\n"
                "                        [--format text|json|hocr|alto|page|markdown|html|pdf] [--out-dir DIR]\n"
                "                        [--output FILE] [--text-out FILE] [--text-only] [--image-dpi N]\n"
@@ -166,7 +174,7 @@ struct Args {
                "                        [--runs N] [--warmup N] [--threads N] [--engine-cache DIR]\n"
                "                        [--opt-level 0-5] [--no-graphs] [--workers N,N,...|all] [--no-pin]\n"
                "       carbon-ocr pages SETDIR [--rec NAME] [--lines N] [--batch N] [--pages N]\n"
-               "                        [--backend ort|native]\n"
+               "                        [--backend ort|native] [--precision auto|fp32|fp16|int8]\n"
                "                        [--in-flight N] [--workers N,N,...|all] [--no-pin] [--threads N]\n"
                "                        [--det auto|one|wide|strips]\n"
                "       carbon-ocr compare MODEL [--shape NAME=AxBxC ...] [--isa NAME] [--against MODEL]\n",
@@ -245,6 +253,11 @@ Args parse(int argc, char** argv) {
       if (!b) usage("unknown backend '" + v + "' (ort, trt, native)");
       a.backend = *b;
       a.backend_given = true;
+    } else if (arg == "--precision") {
+      std::string v = value();
+      auto p = carbon::parse_precision(v);
+      if (!p) usage("unknown precision '" + v + "' (auto, fp32, fp16, int8)");
+      a.precision = *p;
     } else if (arg == "--shape") {
       a.shapes.push_back(to_shape(value()));
     } else if (arg == "--runs") {
@@ -691,8 +704,9 @@ int cpus(const Args& a) {
 // core takes more of them than a slow one (P- and E-cores), as the pipeline's
 // tasks do.
 int bench_workers(const Args& a) {
-  std::printf("%s on ort, %d thread%s a session, %d runs a worker after %d warm-up%s\n", a.model.c_str(),
-              a.threads, a.threads == 1 ? "" : "s", a.runs, a.warmup, a.pin ? ", pinned" : "");
+  std::printf("%s on %s, %d thread%s a session, %d runs a worker after %d warm-up%s\n", a.model.c_str(),
+              std::string(carbon::backend_name(a.backend)).c_str(), a.threads, a.threads == 1 ? "" : "s", a.runs,
+              a.warmup, a.pin ? ", pinned" : "");
   std::printf("  workers     runs/s  per worker  median ms   scaling  runs by worker\n");
   double base = 0;  // the first count's runs/s per worker
   for (int n : a.workers) {
@@ -794,7 +808,7 @@ int pages(const Args& a) {
   std::string models;
   for (const std::string& name : names) {
     const carbon::SetModel m =
-        carbon::choose_set_model(dir, name, a.backend_given ? std::optional(a.backend) : std::nullopt);
+        carbon::choose_set_model(dir, name, a.backend_given ? std::optional(a.backend) : std::nullopt, a.precision);
     models += (models.empty() ? "" : ", ") + m.file.filename().string() + " on " +
               std::string(carbon::backend_name(m.backend));
   }
@@ -815,7 +829,8 @@ int pages(const Args& a) {
       carbon::SessionOptions o;
       o.threads = a.threads;
       auto load = [&](const std::string& name) {
-        return carbon::open_set_model(dir, name, a.backend_given ? std::optional(a.backend) : std::nullopt, o);
+        return carbon::open_set_model(dir, name, a.backend_given ? std::optional(a.backend) : std::nullopt, o,
+                                      a.precision);
       };
       SetWorker& s = m[w];
       s.orient = load("orient");
@@ -882,7 +897,8 @@ int pages(const Args& a) {
       std::mutex m;
     };
     std::vector<std::unique_ptr<Wide>> wides;
-    if (a.det == "auto" || a.det == "wide") {
+    const bool fp32_det = a.precision == carbon::Precision::kAuto || a.precision == carbon::Precision::kFp32;
+    if ((a.det == "auto" || a.det == "wide") && fp32_det) {  // det.onnx on ONNX Runtime: FP32, as the engine
       for (int t : {6, 4, 2}) {
         if (t > pool.fast()) continue;
         auto wd = std::make_unique<Wide>();
@@ -1032,6 +1048,7 @@ int ocr(const Args& a) {
   carbon::EngineOptions o;
   o.rec = a.rec;
   if (a.backend_given) o.backend = a.backend;
+  o.precision = a.precision;
   o.pool.workers = a.workers.empty() ? 0 : a.workers.front();
   o.pool.pin = a.pin;
   if (a.second_pass == "off") o.det.second_pass_below = 0;  // one detection pass, whatever the lines' size

@@ -9,10 +9,12 @@ add_library(carbon
   src/engine.cpp
   src/pipeline.cpp
   src/image.cpp
+  src/png.cpp
   src/parallel.cpp
   src/strips.cpp
   src/cpu/features.cpp
   src/cpu/kernels.cpp
+  src/cpu/turns.cpp
   src/textlayer.cpp
   src/order.cpp
   src/score.cpp
@@ -30,7 +32,8 @@ target_include_directories(carbon
   PRIVATE src)
 target_compile_features(carbon PUBLIC cxx_std_20)
 find_package(Threads REQUIRED)
-# stb_image's header, compiled into src/image.cpp only
+# stb_image's header, compiled into src/image.cpp only; libdeflate for the searchable PDF's
+# images and the PNG pages (src/png.cpp)
 target_include_directories(carbon SYSTEM PRIVATE ${CARBON_STB_INCLUDE_DIR})
 target_link_libraries(carbon PUBLIC Threads::Threads PRIVATE libdeflate::libdeflate_static)
 carbon_warnings(carbon)

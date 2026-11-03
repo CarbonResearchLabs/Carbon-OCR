@@ -9,9 +9,11 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <string>
 #include <vector>
 
+#include "carbon/cpu.h"
 #include "carbon/error.h"
 
 namespace {
@@ -52,6 +54,75 @@ TEST(CropRule, IdentityResampleKeepsEveryByte) {
   std::vector<uint8_t> out(40 * 32);
   carbon::resample_gray(p.view(), 0, 0, 40, 32, 40, 32, out.data(), 40);
   EXPECT_EQ(out, p.px);
+}
+
+// Every vector version of the resampling gives the scalar reference's bytes:
+// down- and upscaling, odd sizes, windows wider than 8 taps, rectangles partly or
+// wholly off the image (paper), one-pixel outputs, images and outputs with rows
+// wider than their pixels, and the crop rule's own rectangles.
+TEST(CropRule, EveryIsaResamplesAsTheReference) {
+  using carbon::cpu::Isa;
+  std::mt19937 rng(23);
+  auto pick = [&](int a, int b) { return std::uniform_int_distribution<int>(a, b)(rng); };
+  auto real = [&](double a, double b) { return std::uniform_real_distribution<double>(a, b)(rng); };
+  // An image of random bytes in rows up to 9 bytes wider than it, those bytes ink: a
+  // version reading past a row's end would read 0 where the reference reads paper.
+  struct Image {
+    int w, h, stride;
+    std::vector<uint8_t> px;
+    GrayView view() const { return {px.data(), w, h, stride}; }
+  };
+  auto image = [&](int w, int h) {
+    Image im{w, h, w + pick(0, 9), {}};
+    im.px.assign(static_cast<size_t>(im.stride) * h, 0);
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x) im.px[static_cast<size_t>(y) * im.stride + x] = static_cast<uint8_t>(pick(0, 255));
+    return im;
+  };
+  const auto isas = carbon::cpu::isas_available();
+  int checked = 0;
+  auto check = [&](const Image& im, double x0, double y0, double x1, double y1, int ow, int oh) {
+    const int64_t os = ow + pick(0, 3);  // the bytes past each row's width stay as they were
+    std::vector<uint8_t> want(static_cast<size_t>(oh) * os, 7);
+    carbon::resample_gray(im.view(), x0, y0, x1, y1, ow, oh, want.data(), os, Isa::kScalar);
+    for (Isa isa : isas) {
+      std::vector<uint8_t> got(want.size(), 7);
+      carbon::resample_gray(im.view(), x0, y0, x1, y1, ow, oh, got.data(), os, isa);
+      ASSERT_EQ(got, want) << carbon::cpu::isa_name(isa) << ": " << im.w << " x " << im.h << ", [" << x0 << ", "
+                           << x1 << ") x [" << y0 << ", " << y1 << ") to " << ow << " x " << oh;
+    }
+    ++checked;
+  };
+  for (int i = 0; i < 120; ++i) {  // whole images, down and up
+    const Image im = image(pick(1, 160), pick(1, 160));
+    const bool down = i % 2 == 0;
+    const int ow = down ? pick(1, im.w) : pick(im.w, 3 * im.w + 5);
+    const int oh = down ? pick(1, im.h) : pick(im.h, 3 * im.h + 5);
+    check(im, 0, 0, im.w, im.h, ow, oh);
+  }
+  for (int i = 0; i < 160; ++i) {  // rectangles anywhere: inside, across the edges, off the image
+    const Image im = image(pick(1, 120), pick(1, 120));
+    const double x0 = real(-0.7 * im.w - 20, 1.2 * im.w), y0 = real(-0.7 * im.h - 20, 1.2 * im.h);
+    const double x1 = x0 + real(0.05, 1.6 * im.w + 10), y1 = y0 + real(0.05, 1.6 * im.h + 10);
+    check(im, x0, y0, x1, y1, pick(1, 70), pick(1, 70));
+  }
+  for (int i = 0; i < 30; ++i) {  // one pixel, and windows of many chunks
+    const Image im = image(pick(1, 400), pick(1, 90));
+    check(im, 0, 0, im.w, im.h, 1, pick(1, 5));
+    check(im, real(-30, 30), real(-10, 10), im.w + real(-20, 40), im.h + real(-10, 10), pick(1, 5), 1);
+    check(im, 0, 0, im.w, im.h, pick(1, 1 + im.w / 9), pick(1, 1 + im.h / 9));
+  }
+  const Image page = image(900, 400);  // the crop rule's rectangles, some at the page's edges
+  for (int i = 0; i < 60; ++i) {
+    const double h = real(6, 70), x0 = real(-40, 880), y0 = real(-20, 390);
+    const carbon::CropRegion r = carbon::crop_region({x0, y0, x0 + real(4, 700), y0 + h});
+    check(page, r.x0, r.y0, r.x1, r.y1, r.width, 32);
+  }
+  for (int i = 0; i < 4; ++i) {  // a reversed range (mirrored), which every version leaves to the reference
+    const Image im = image(pick(1, 50), pick(1, 50));
+    check(im, im.w + real(-5, 5), 0, real(-5, 5), im.h, pick(1, 40), pick(1, 40));
+  }
+  EXPECT_EQ(checked, 120 + 160 + 90 + 60 + 4);
 }
 
 TEST(CropRule, PaperStaysPaperAndOutsideThePageIsPaper) {

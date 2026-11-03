@@ -13,6 +13,8 @@
 #include <span>
 #include <vector>
 
+#include "carbon/cpu.h"
+
 namespace carbon {
 
 // A line box of height h becomes a crop `height` px high: h * pad_v of padding
@@ -62,8 +64,13 @@ struct GrayView {
 // (in_h - out_h > 2 (in_w - out_w)): never for a line canvas with margins, so
 // training has always read these bytes.  The rule itself never depends on the
 // size of the image around the box.
+//
+// The integer passes run on the CPU's vectors (carbon/cpu.h: avx2 for every x86-64
+// set, neon for Arm), which give the scalar reference's bytes: the sums are exact
+// in 32 bits whatever their order.  isa: any available one, kScalar for the
+// reference itself (tests, benchmarks).
 void resample_gray(const GrayView& image, double x0, double y0, double x1, double y1, int out_width,
-                   int out_height, uint8_t* out, int64_t out_stride);
+                   int out_height, uint8_t* out, int64_t out_stride, cpu::Isa isa = cpu::best_isa());
 
 // Crops `boxes` from `page` into out[n][rule.height][out_width] (uint8, paper
 // 255), each finished by finish_crop: flipped if light on dark, then padded past

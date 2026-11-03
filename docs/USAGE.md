@@ -41,6 +41,7 @@ By default the pages run in parallel on the CPU, one worker per physical core. `
 | `--hybrid auto\|off` | `auto` | read the pictures of a page that was read from its text layer by OCR |
 | `--second-pass auto\|off` | `auto` | detect a page of tiny text (its median line under 9 px at the detector's scale) again at twice the scale, and merge the two passes |
 | `--as-given` | off | no quarter turns and no deskew: the page as given |
+| `--precision auto\|fp32\|fp16\|int8` | `auto` | the files the models run: `fp16` the set's `.fp16.onnx` on the engine's own kernels, `int8` its `.int8.onnx`, `fp32` its `.onnx`; `auto` as below |
 | `--backend ort\|native` | per model | run every model on one backend; by default a model runs on the native int8 backend where the set has its `.int8.onnx`, else on ONNX Runtime |
 | `--workers N` | one per physical core | CPU workers |
 | `--no-pin` | pinned | do not pin workers to cores |

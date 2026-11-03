@@ -3,8 +3,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <limits>
+#include <type_traits>
 #include <vector>
 
 #include "carbon/error.h"
@@ -13,21 +15,64 @@
 namespace carbon::cpu {
 
 // Here, built for the baseline, so the instruction sets' files make no vector code (kernels.h).
-void* detail::scratch(Scratch slot, size_t bytes) {
-  thread_local std::array<std::vector<std::byte>, 3> buffers;
-  std::vector<std::byte>& b = buffers[static_cast<size_t>(slot)];
-  if (b.size() < bytes + 64) b.resize(bytes + 64);
+namespace {
+
+struct ScratchSlot {
+  std::vector<std::byte> buffer;
+  uint64_t tag = 0;  // what it holds (scratch_kept), 0: nothing to keep
+};
+
+ScratchSlot& slot_of(detail::Scratch slot, size_t bytes, bool& grew) {
+  thread_local std::array<ScratchSlot, 4> slots;
+  ScratchSlot& s = slots[static_cast<size_t>(slot)];
+  grew = s.buffer.size() < bytes + 64;
+  if (grew) s.buffer.resize(bytes + 64);
+  return s;
+}
+
+void* line_start(std::vector<std::byte>& b) {
   const auto at = reinterpret_cast<uintptr_t>(b.data());
-  return b.data() + ((64 - at % 64) % 64);  // a cache line's start
+  return b.data() + ((64 - at % 64) % 64);
+}
+
+}  // namespace
+
+void* detail::scratch(Scratch slot, size_t bytes) {
+  bool grew;
+  ScratchSlot& s = slot_of(slot, bytes, grew);
+  s.tag = 0;
+  return line_start(s.buffer);
+}
+
+void* detail::scratch_kept(Scratch slot, size_t bytes, uint64_t tag, bool& kept) {
+  bool grew;
+  ScratchSlot& s = slot_of(slot, bytes, grew);
+  kept = tag != 0 && s.tag == tag && !grew;  // a tag's contents are the same size each time
+  s.tag = tag;
+  return line_start(s.buffer);
 }
 
 namespace {
 
 // The kernel each instruction set runs: Arm without dotprod has no int8 kernel
-// of its own, and AVX-VNNI and dotprod add nothing to FP32.
-Isa int8_kernel(Isa isa) { return isa == Isa::kNeon ? Isa::kScalar : isa; }
+// of its own, AVX-VNNI and dotprod add nothing to FP32, and FP16 arithmetic
+// nothing to int8 and FP32.
+Isa int8_kernel(Isa isa) {
+  switch (isa) {
+    case Isa::kNeon: return Isa::kScalar;
+    case Isa::kAvx512Fp16: return Isa::kAvx512;
+    case Isa::kNeonFp16: return Isa::kNeonDot;
+    default: return isa;
+  }
+}
 Isa f32_kernel(Isa isa) {
-  return isa == Isa::kAvxVnni ? Isa::kAvx2 : isa == Isa::kNeonDot ? Isa::kNeon : isa;
+  switch (isa) {
+    case Isa::kAvxVnni: return Isa::kAvx2;
+    case Isa::kNeonDot:
+    case Isa::kNeonFp16: return Isa::kNeon;
+    case Isa::kAvx512Fp16: return Isa::kAvx512;
+    default: return isa;
+  }
 }
 
 // The depthwise kernels: avx2 for every x86-64 set, neon for Arm.
@@ -35,24 +80,58 @@ Isa dw_kernel(Isa isa) {
   switch (isa) {
     case Isa::kAvx2:
     case Isa::kAvxVnni:
-    case Isa::kAvx512: return Isa::kAvx2;
+    case Isa::kAvx512:
+    case Isa::kAvx512Fp16: return Isa::kAvx2;
     case Isa::kNeon:
-    case Isa::kNeonDot: return Isa::kNeon;
+    case Isa::kNeonDot:
+    case Isa::kNeonFp16: return Isa::kNeon;
     default: return Isa::kScalar;
   }
+}
+
+// The FP16 kernels.  On x86-64 the FP32 arithmetic ones widen FP16 with F16C (avx2)
+// or AVX-512 F (avx512): F16C came before AVX2 on every CPU there is, but a
+// virtual machine could hide it, so without it they are the reference's.  FP32 A
+// on an FP16 arithmetic set runs on the same CPU's FP32 arithmetic (the `wide` kernels).
+Isa f16_kernel(Isa isa) {
+  switch (isa) {
+    case Isa::kAvx2:
+    case Isa::kAvxVnni: return features().f16c ? Isa::kAvx2 : Isa::kScalar;
+    case Isa::kNeonDot: return Isa::kNeon;
+    default: return isa;
+  }
+}
+Isa f16_wide_kernel(Isa isa) {
+  return isa == Isa::kAvx512Fp16 ? Isa::kAvx512 : isa == Isa::kNeonFp16 ? Isa::kNeon : f16_kernel(isa);
+}
+// The FP16 depthwise kernels: the FP16 arithmetic sets' own, else dwconv_f32's
+// (avx2 for every x86-64 set, with F16C; neon for Arm).
+Isa dw16_wide_kernel(Isa isa) {
+  const Isa k = dw_kernel(isa);
+  return k == Isa::kAvx2 && !features().f16c ? Isa::kScalar : k;
+}
+Isa dw16_kernel(Isa isa) {
+  return isa == Isa::kAvx512Fp16 || isa == Isa::kNeonFp16 ? isa : dw16_wide_kernel(isa);
 }
 
 int k_group(Isa isa) {
   isa = int8_kernel(isa);
   return isa == Isa::kScalar ? 1 : isa == Isa::kAvx2 ? 2 : 4;
 }
-int panel(Isa isa) { return isa == Isa::kScalar ? 1 : isa == Isa::kAvx512 ? 32 : 16; }
+int panel(Isa isa) {
+  return isa == Isa::kScalar ? 1 : isa == Isa::kAvx512 || isa == Isa::kAvx512Fp16 ? 32 : 16;
+}
 int round_up(int v, int to) { return (v + to - 1) / to * to; }
 
 detail::BView view(const PackedB& b) {
   return {b.data.data(), b.col_sums.data(), b.k, b.n, b.taps, b.seg, b.segp, b.np};
 }
 detail::F32View view(const PackedF32& b) { return {b.data.data(), b.k, b.n, b.np}; }
+detail::F16View view(const PackedF16& b) { return {b.data.data(), b.k, b.n, b.np, b.id}; }
+
+// An activation as FP32: an FP16 one widened.
+inline float value_of(float v) { return v; }
+inline float value_of(uint16_t h) { return detail::half_to_float(h); }
 
 void check(Isa isa, const char* what) {
   if (!isa_available(isa)) throw Error(std::string(what) + ": " + isa_name(isa) + " is not available on this CPU");
@@ -109,6 +188,41 @@ void dwconv_u8s8_scalar(Rows<uint8_t> a, int32_t a_zero, const int8_t* w, int c,
     for (int t = 0; t < a.taps; ++t) {
       const uint8_t* x = a.piece(i, t);
       for (int j = 0; j < c; ++j) sum[j] += (static_cast<int32_t>(x[j]) - a_zero) * w[static_cast<size_t>(t) * c + j];
+    }
+    detail::epilogue_scalar(sum.data(), i, 0, c, e);
+  }
+}
+
+// The FP16 references: every value widened to FP32, then gemm_f32's and
+// dwconv_f32's sums.
+template <typename A>
+void gemm_f16_scalar(Rows<A> a, const PackedF16& b, int m, const Epilogue& e) {
+  const int seg = b.k / a.taps;
+  std::vector<float> sum(b.n), bf(b.data.size());
+  for (size_t i = 0; i < bf.size(); ++i) bf[i] = detail::half_to_float(b.data[i]);
+  for (int i = 0; i < m; ++i) {
+    std::fill(sum.begin(), sum.end(), 0.0f);
+    for (int t = 0; t < a.taps; ++t) {
+      const A* piece = a.piece(i, t);
+      for (int kk = 0; kk < seg; ++kk) {
+        const float av = value_of(piece[kk]);
+        const float* br = &bf[(static_cast<size_t>(t) * seg + kk) * b.n];
+        for (int j = 0; j < b.n; ++j) sum[j] = std::fma(av, br[j], sum[j]);
+      }
+    }
+    detail::epilogue_scalar(sum.data(), i, 0, b.n, e);
+  }
+}
+
+template <typename A>
+void dwconv_f16_scalar(Rows<A> a, const uint16_t* w, int c, int m, const Epilogue& e) {
+  std::vector<float> sum(c), wf(static_cast<size_t>(a.taps) * c);
+  for (size_t i = 0; i < wf.size(); ++i) wf[i] = detail::half_to_float(w[i]);
+  for (int i = 0; i < m; ++i) {
+    std::fill(sum.begin(), sum.end(), 0.0f);
+    for (int t = 0; t < a.taps; ++t) {
+      const A* x = a.piece(i, t);
+      for (int j = 0; j < c; ++j) sum[j] = std::fma(value_of(x[j]), wf[static_cast<size_t>(t) * c + j], sum[j]);
     }
     detail::epilogue_scalar(sum.data(), i, 0, c, e);
   }
@@ -294,6 +408,145 @@ void dwconv_u8s8(Rows<uint8_t> a, int32_t a_zero, const int8_t* w, int c, int m,
     case Isa::kNeon: detail::dwconv_u8s8_neon(a, a_zero, w, c, m, out); return;
 #endif
     default: throw Error(std::string("dwconv_u8s8: no kernel for ") + isa_name(isa) + " in this build");
+  }
+}
+
+// ---------------------------------------------------------------- FP16
+
+float f16_to_f32(uint16_t h) { return detail::half_to_float(h); }
+uint16_t f32_to_f16(float v) { return detail::float_to_half(v); }
+bool f16_arithmetic(Isa isa) { return isa == Isa::kAvx512Fp16 || isa == Isa::kNeonFp16; }
+
+void to_f16(const float* in, uint16_t* out, size_t n, Isa isa) {
+  check(isa, "to_f16");
+  switch (dw16_wide_kernel(isa)) {
+#if defined(CARBON_KERNEL_AVX2)
+    case Isa::kAvx2: detail::to_f16_avx2(in, out, n); return;
+#endif
+#if defined(CARBON_KERNEL_NEON)
+    case Isa::kNeon: detail::to_f16_neon(in, out, n); return;
+#endif
+    default:
+      for (size_t i = 0; i < n; ++i) out[i] = detail::float_to_half(in[i]);
+  }
+}
+
+void to_f32(const uint16_t* in, float* out, size_t n, Isa isa) {
+  check(isa, "to_f32");
+  switch (dw16_wide_kernel(isa)) {
+#if defined(CARBON_KERNEL_AVX2)
+    case Isa::kAvx2: detail::to_f32_avx2(in, out, n); return;
+#endif
+#if defined(CARBON_KERNEL_NEON)
+    case Isa::kNeon: detail::to_f32_neon(in, out, n); return;
+#endif
+    default:
+      for (size_t i = 0; i < n; ++i) out[i] = detail::half_to_float(in[i]);
+  }
+}
+
+PackedF16 pack_f16(const uint16_t* b, int k, int n, Isa isa) {
+  check(isa, "pack_f16");
+  static std::atomic<uint64_t> packings{0};
+  PackedF16 p;
+  p.isa = isa;
+  p.k = k;
+  p.n = n;
+  p.id = ++packings;
+  const int w = panel(f16_kernel(isa));  // f16_wide_kernel's is the same
+  p.np = round_up(n, w);
+  if (w == 1) {
+    p.data.assign(b, b + static_cast<size_t>(k) * n);
+    return p;
+  }
+  p.data.assign(static_cast<size_t>(p.np) * k, 0);  // [panel][k][w], zeros past n
+  uint16_t* out = p.data.data();
+  for (int pj = 0; pj < p.np / w; ++pj) {
+    for (int kk = 0; kk < k; ++kk) {
+      for (int l = 0; l < w; ++l) {
+        const int j = pj * w + l;
+        *out++ = j < n ? b[static_cast<size_t>(kk) * n + j] : uint16_t{0};
+      }
+    }
+  }
+  return p;
+}
+
+void gemm_f16(Rows<uint16_t> a, const PackedF16& b, int m, const Epilogue& out) {
+  if (m <= 0) return;
+  if (a.taps < 1 || b.k % a.taps) throw Error("gemm_f16: k must be a whole number of taps");
+  switch (f16_kernel(b.isa)) {
+    case Isa::kScalar: gemm_f16_scalar(a, b, m, out); return;
+#if defined(CARBON_KERNEL_AVX2)
+    case Isa::kAvx2: detail::gemm_f16_avx2(a, view(b), m, out); return;
+#endif
+#if defined(CARBON_KERNEL_AVX512)
+    case Isa::kAvx512: detail::gemm_f16_avx512(a, view(b), m, out); return;
+#endif
+#if defined(CARBON_KERNEL_AVX512FP16)
+    case Isa::kAvx512Fp16: detail::gemm_f16_avx512fp16(a, view(b), m, out); return;
+#endif
+#if defined(CARBON_KERNEL_NEON)
+    case Isa::kNeon: detail::gemm_f16_neon(a, view(b), m, out); return;
+#endif
+#if defined(CARBON_KERNEL_NEONFP16)
+    case Isa::kNeonFp16: detail::gemm_f16_neonfp16(a, view(b), m, out); return;
+#endif
+    default: throw Error(std::string("gemm_f16: no kernel for ") + isa_name(b.isa) + " in this build");
+  }
+}
+
+void gemm_f16(Rows<float> a, const PackedF16& b, int m, const Epilogue& out) {
+  if (m <= 0) return;
+  if (a.taps < 1 || b.k % a.taps) throw Error("gemm_f16: k must be a whole number of taps");
+  switch (f16_wide_kernel(b.isa)) {
+    case Isa::kScalar: gemm_f16_scalar(a, b, m, out); return;
+#if defined(CARBON_KERNEL_AVX2)
+    case Isa::kAvx2: detail::gemm_f16_avx2(a, view(b), m, out); return;
+#endif
+#if defined(CARBON_KERNEL_AVX512)
+    case Isa::kAvx512: detail::gemm_f16_avx512(a, view(b), m, out); return;
+#endif
+#if defined(CARBON_KERNEL_NEON)
+    case Isa::kNeon: detail::gemm_f16_neon(a, view(b), m, out); return;
+#endif
+    default: throw Error(std::string("gemm_f16: no kernel for ") + isa_name(b.isa) + " in this build");
+  }
+}
+
+void dwconv_f16(Rows<uint16_t> a, const uint16_t* w, int c, int m, const Epilogue& out, Isa isa) {
+  if (m <= 0) return;
+  check(isa, "dwconv_f16");
+  switch (dw16_kernel(isa)) {
+    case Isa::kScalar: dwconv_f16_scalar(a, w, c, m, out); return;
+#if defined(CARBON_KERNEL_AVX2)
+    case Isa::kAvx2: detail::dwconv_f16_avx2(a, w, c, m, out); return;
+#endif
+#if defined(CARBON_KERNEL_AVX512FP16)
+    case Isa::kAvx512Fp16: detail::dwconv_f16_avx512fp16(a, w, c, m, out); return;
+#endif
+#if defined(CARBON_KERNEL_NEON)
+    case Isa::kNeon: detail::dwconv_f16_neon(a, w, c, m, out); return;
+#endif
+#if defined(CARBON_KERNEL_NEONFP16)
+    case Isa::kNeonFp16: detail::dwconv_f16_neonfp16(a, w, c, m, out); return;
+#endif
+    default: throw Error(std::string("dwconv_f16: no kernel for ") + isa_name(isa) + " in this build");
+  }
+}
+
+void dwconv_f16(Rows<float> a, const uint16_t* w, int c, int m, const Epilogue& out, Isa isa) {
+  if (m <= 0) return;
+  check(isa, "dwconv_f16");
+  switch (dw16_wide_kernel(isa)) {
+    case Isa::kScalar: dwconv_f16_scalar(a, w, c, m, out); return;
+#if defined(CARBON_KERNEL_AVX2)
+    case Isa::kAvx2: detail::dwconv_f16_avx2(a, w, c, m, out); return;
+#endif
+#if defined(CARBON_KERNEL_NEON)
+    case Isa::kNeon: detail::dwconv_f16_neon(a, w, c, m, out); return;
+#endif
+    default: throw Error(std::string("dwconv_f16: no kernel for ") + isa_name(isa) + " in this build");
   }
 }
 

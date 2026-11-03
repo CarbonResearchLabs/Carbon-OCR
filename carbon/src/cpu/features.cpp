@@ -113,7 +113,7 @@ Features detect() {
   f.neon = true;  // Advanced SIMD is part of Armv8-A
 #if defined(__linux__)
   const unsigned long hw = getauxval(AT_HWCAP), hw2 = getauxval(AT_HWCAP2);
-  f.fp16 = hw >> 10 & 1;     // HWCAP_ASIMDHP
+  f.fp16 = hw >> 10 & 1;     // HWCAP_ASIMDHP: FP16 arithmetic on vectors
   f.dotprod = hw >> 20 & 1;  // HWCAP_ASIMDDP
   f.sve = hw >> 22 & 1;      // HWCAP_SVE
   f.sve2 = hw2 >> 1 & 1;     // HWCAP2_SVE2
@@ -146,6 +146,8 @@ const char* isa_name(Isa isa) {
     case Isa::kAvxVnni: return "avx-vnni";
     case Isa::kAvx512: return "avx512";
     case Isa::kNeonDot: return "neon-dot";
+    case Isa::kAvx512Fp16: return "avx512-fp16";
+    case Isa::kNeonFp16: return "neon-fp16";
   }
   return "?";
 }
@@ -164,11 +166,18 @@ bool isa_available(Isa isa) {
     case Isa::kAvx512:  // depthwise as avx2
       return f.avx2 && f.fma && f.avx512f && f.avx512bw && f.avx512vl && f.avx512dq && f.avx512vnni;
 #endif
+#if defined(CARBON_KERNEL_AVX2) && defined(CARBON_KERNEL_AVX512) && defined(CARBON_KERNEL_AVX512FP16)
+    case Isa::kAvx512Fp16:  // int8 and FP32 as avx512
+      return f.avx2 && f.fma && f.avx512f && f.avx512bw && f.avx512vl && f.avx512dq && f.avx512vnni && f.avx512fp16;
+#endif
 #if defined(CARBON_KERNEL_NEON)
     case Isa::kNeon: return f.neon;
 #endif
 #if defined(CARBON_KERNEL_NEON) && defined(CARBON_KERNEL_NEONDOT)
     case Isa::kNeonDot: return f.neon && f.dotprod;  // FP32 as neon
+#endif
+#if defined(CARBON_KERNEL_NEON) && defined(CARBON_KERNEL_NEONDOT) && defined(CARBON_KERNEL_NEONFP16)
+    case Isa::kNeonFp16: return f.neon && f.dotprod && f.fp16;  // int8 as neon-dot, FP32 as neon
 #endif
     default: return false;
   }
@@ -176,7 +185,8 @@ bool isa_available(Isa isa) {
 
 std::vector<Isa> isas_available() {
   std::vector<Isa> out;
-  for (Isa i : {Isa::kScalar, Isa::kNeon, Isa::kAvx2, Isa::kAvxVnni, Isa::kAvx512, Isa::kNeonDot}) {
+  for (Isa i : {Isa::kScalar, Isa::kNeon, Isa::kAvx2, Isa::kAvxVnni, Isa::kAvx512, Isa::kAvx512Fp16, Isa::kNeonDot,
+                Isa::kNeonFp16}) {
     if (isa_available(i)) out.push_back(i);
   }
   return out;

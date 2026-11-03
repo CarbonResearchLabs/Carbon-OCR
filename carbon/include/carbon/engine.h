@@ -19,11 +19,13 @@
 // script classifier and other recognizers, and the language model.
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "carbon/detect.h"
@@ -58,9 +60,16 @@ struct TableRule {
   int max_cell_chars = 30;
 };
 
+// The precision a set's models run in on the CPU: which of each model's files
+// (choose_set_model).  auto: the fastest the set has.
+enum class Precision : uint8_t { kAuto, kFp32, kFp16, kInt8 };
+std::string_view precision_name(Precision precision);  // "auto", "fp32", "fp16", "int8"
+std::optional<Precision> parse_precision(std::string_view name);
+
 struct EngineOptions {
   PoolOptions pool;               // the workers: one per physical core by default
   std::optional<Backend> backend; // the models' backend (open_set_model); none: the fastest the set has
+  Precision precision = Precision::kAuto;  // the models' files (open_set_model)
   std::string rec = "rec-latin";  // the recognizer: <set>/<rec>.onnx and <rec>.vocab.json
   int det_long_side = 1024;       // the page's long side at detection, padded to a multiple of 32
   // The second detection pass's page (det.second_pass_below and second_pass_scale, carbon/detect.h): its long
@@ -146,29 +155,41 @@ struct OcrPage {
   std::string json() const;
 };
 
-// A model of a Fullerene set, <set>/<name>, on the CPU:
+// A model of a Fullerene set, <set>/<name>, on the CPU, by precision:
 //
-//   kNative       the engine's own kernels, on <name>.int8.onnx (Q/DQ int8) when
-//                 the set has it, else on <name>.onnx
-//   kOnnxRuntime  ONNX Runtime on <name>.onnx
-//   none          the fastest the set has: native on <name>.int8.onnx, else ONNX
-//                 Runtime on <name>.onnx where it is built in, else native
+//   auto  by backend:
+//           kNative       the engine's own kernels, on <name>.int8.onnx (Q/DQ int8)
+//                         when the set has it, else on <name>.onnx
+//           kOnnxRuntime  ONNX Runtime on <name>.onnx
+//           none          the fastest the set has: native on <name>.int8.onnx, else
+//                         ONNX Runtime on <name>.onnx where it is built in, else native
+//   fp32  <name>.onnx, on the backend given, else ONNX Runtime where it is built in,
+//         else native
+//   fp16  <name>.fp16.onnx (float16 weights, input and output) on the native
+//         backend's FP16 kernels (carbon/cpu.h); another backend given throws, as
+//         ONNX Runtime has no FP16 convolutions on x86-64 CPUs
+//   int8  <name>.int8.onnx, on the backend given, else native
 //
-// On one core the native int8 recognizer runs 2.5 times as fast as ONNX Runtime
-// in FP32; the native backend in FP32 is slower than ONNX Runtime's.
+// A precision given (not auto) throws Error when the set has no file for it.  On
+// one core the native int8 recognizer runs 2.5 times as fast as ONNX Runtime in
+// FP32; the native backend in FP32 is slower than ONNX Runtime's,
+// and in FP16 about as fast as in FP32 on a CPU without FP16 arithmetic (net.cpp).
 struct SetModel {
   Backend backend;
   std::filesystem::path file;
 };
-SetModel choose_set_model(const std::filesystem::path& set, const std::string& name, std::optional<Backend> backend);
+SetModel choose_set_model(const std::filesystem::path& set, const std::string& name, std::optional<Backend> backend,
+                          Precision precision = Precision::kAuto);
 std::unique_ptr<Session> open_set_model(const std::filesystem::path& set, const std::string& name,
-                                        std::optional<Backend> backend, const SessionOptions& options = {});
+                                        std::optional<Backend> backend, const SessionOptions& options = {},
+                                        Precision precision = Precision::kAuto);
 
 // The Fullerene set in `set` (a directory: orient.onnx, det.onnx, <rec>.onnx,
-// <rec>.vocab.json, and .int8.onnx files where it has them), each model as
-// open_set_model chooses; detection on several threads (fast cores idle) is ONNX
-// Runtime's.  Throws Error if a file is missing or the recognizer's classes do
-// not match its vocabulary.  Use from one thread.
+// <rec>.vocab.json, and .int8.onnx and .fp16.onnx files where it has them), each
+// model as open_set_model chooses for the options' backend and precision;
+// detection on several threads (fast cores idle) is ONNX Runtime's, on det.onnx
+// (not with precision fp16 or int8).  Throws Error if a file is missing or the
+// recognizer's classes do not match its vocabulary.  Use from one thread.
 class Engine {
  public:
   explicit Engine(const std::filesystem::path& set, EngineOptions options = {});

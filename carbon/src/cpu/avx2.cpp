@@ -4,7 +4,13 @@
 // values, A widened to uint16 and B packed as int16 pairs of k, so every product
 // is exact (vpmaddubsw would saturate at 255 * 127 * 2).
 // FP32: vfmadd231ps, the sums in 12 registers.
-// Built with -mavx2 -mfma (/arch:AVX2).
+// Also the depthwise convolutions, CTC greedy decoding, the crop rule's
+// resampling and the page turns (bilinear in doubles with vpgatherdd for the
+// taps; 16 x 16 byte transposes, two to a register), which every x86-64 set runs
+// from here.
+// FP16 (F16C, no FP16 arithmetic): the weights stay FP16 and a panel is widened
+// (vcvtph2ps) into L1 as a call starts on it, then the FP32 tiles run on it.
+// Built with -mavx2 -mfma -mf16c (/arch:AVX2).
 
 #include <immintrin.h>
 
@@ -13,6 +19,7 @@
 
 #include "epilogue_avx2.h"
 #include "kernels.h"
+#include "resample_math.h"
 
 namespace carbon::cpu::detail {
 namespace {
@@ -136,16 +143,22 @@ void gemm_f32_avx2(Rows<float> a, const F32View& b, int m, const Epilogue& e) {
 
 namespace {
 
-template <int PX>
-void dw_tile_f32(const Rows<float>& a, int64_t i0, int taps, const float* w, int c, int off, float* buf) {
+// 8 activations as FP32: FP32 loaded, FP16 widened.
+inline __m256 load8(const float* x) { return _mm256_loadu_ps(x); }
+inline __m256 load8(const uint16_t* x) { return _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(x))); }
+inline float load1(const float* x) { return *x; }
+inline float load1(const uint16_t* x) { return half_to_float(*x); }
+
+template <int PX, typename A>
+void dw_tile_f32(const Rows<A>& a, int64_t i0, int taps, const float* w, int c, int off, float* buf) {
   __m256 acc[PX][2];
   for (int r = 0; r < PX; ++r) acc[r][0] = acc[r][1] = _mm256_setzero_ps();
   for (int t = 0; t < taps; ++t) {
     const __m256 w0 = _mm256_loadu_ps(w + t * c), w1 = _mm256_loadu_ps(w + t * c + 8);
     for (int r = 0; r < PX; ++r) {
-      const float* x = piece(a, i0 + r, t) + off;
-      acc[r][0] = _mm256_fmadd_ps(_mm256_loadu_ps(x), w0, acc[r][0]);
-      acc[r][1] = _mm256_fmadd_ps(_mm256_loadu_ps(x + 8), w1, acc[r][1]);
+      const A* x = piece(a, i0 + r, t) + off;
+      acc[r][0] = _mm256_fmadd_ps(load8(x), w0, acc[r][0]);
+      acc[r][1] = _mm256_fmadd_ps(load8(x + 8), w1, acc[r][1]);
     }
   }
   for (int r = 0; r < PX; ++r) {
@@ -208,9 +221,9 @@ void dw_tile_u8(const Rows<uint8_t>& a, int64_t i0, int taps, __m256i zero, cons
   }
 }
 
-}  // namespace
-
-void dwconv_f32_avx2(Rows<float> a, const float* w, int c, int m, const Epilogue& e) {
+// FP32 weights; FP32 or FP16 activations.
+template <typename A>
+void dwconv_avx2(const Rows<A>& a, const float* w, int c, int m, const Epilogue& e) {
   const int taps = a.taps;
   alignas(32) float buf[4 * 64];
   for (int i0 = 0; i0 < m; i0 += 4) {
@@ -232,14 +245,14 @@ void dwconv_f32_avx2(Rows<float> a, const float* w, int c, int m, const Epilogue
         for (; ct + 8 <= cw; ct += 8) {
           __m256 acc = _mm256_setzero_ps();
           for (int t = 0; t < taps; ++t) {
-            const __m256 x = _mm256_loadu_ps(piece(a, i0 + r, t) + c0 + ct);
+            const __m256 x = load8(piece(a, i0 + r, t) + c0 + ct);
             acc = _mm256_fmadd_ps(x, _mm256_loadu_ps(w + t * c + c0 + ct), acc);
           }
           _mm256_storeu_ps(buf + r * 64 + ct, acc);
         }
         for (; ct < cw; ++ct) {
           float s = 0.0f;
-          for (int t = 0; t < taps; ++t) s = fma1(piece(a, i0 + r, t)[c0 + ct], w[t * c + c0 + ct], s);
+          for (int t = 0; t < taps; ++t) s = fma1(load1(piece(a, i0 + r, t) + c0 + ct), w[t * c + c0 + ct], s);
           buf[r * 64 + ct] = s;
         }
       }
@@ -247,6 +260,10 @@ void dwconv_f32_avx2(Rows<float> a, const float* w, int c, int m, const Epilogue
     }
   }
 }
+
+}  // namespace
+
+void dwconv_f32_avx2(Rows<float> a, const float* w, int c, int m, const Epilogue& e) { dwconv_avx2(a, w, c, m, e); }
 
 void dwconv_u8s8_avx2(Rows<uint8_t> a, int32_t a_zero, const int8_t* w, int c, int m, const Epilogue& e) {
   const int taps = a.taps;
@@ -294,6 +311,122 @@ void dwconv_u8s8_avx2(Rows<uint8_t> a, int32_t a_zero, const int8_t* w, int c, i
       epilogue_avx2(buf, 64, px, i0, c0, cw, e);
     }
   }
+}
+
+// ---------------------------------------------------------------- FP16 (F16C)
+//
+// FP16 stored, FP32 arithmetic (net.cpp says why the activations stay FP32 here).
+// B widened whole into the kB scratch and kept there for the next call on the same
+// packing (a layer's next output row), up to kKeepB; past it a panel at a time.
+// FP32 A: a panel of B at a time, every row of A past it, as gemm_f32_avx2.  FP16
+// A: a block of 6 rows at a time widened into the kA scratch, once for every
+// panel, each row's pieces end to end, so tile_f32 reads it as one piece of k
+// values.  Either way the same sums in the same order as over the taps: the
+// reference's bits.  Depthwise: the weights widened once a call, FP16 activations
+// as they are loaded.
+
+namespace {
+
+// n FP16 values widened: 8 an instruction, the rest one at a time (the same bits).
+inline void widen_f16(const uint16_t* src, float* dst, int64_t n) {
+  int64_t i = 0;
+  for (; i + 8 <= n; i += 8) {
+    _mm256_storeu_ps(dst + i, _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i))));
+  }
+  for (; i < n; ++i) dst[i] = half_to_float(src[i]);
+}
+
+// tile_f32 on mr rows, 1 to 6.
+inline void tile_rows(int mr, const float* const* rows, int taps, int seg, const float* bp, float* buf) {
+  switch (mr) {
+    case 6: tile_f32<6>(rows, taps, seg, bp, buf); break;
+    case 5: tile_f32<5>(rows, taps, seg, bp, buf); break;
+    case 4: tile_f32<4>(rows, taps, seg, bp, buf); break;
+    case 3: tile_f32<3>(rows, taps, seg, bp, buf); break;
+    case 2: tile_f32<2>(rows, taps, seg, bp, buf); break;
+    default: tile_f32<1>(rows, taps, seg, bp, buf); break;
+  }
+}
+
+// All of B widened (k x np floats, its panels as packed), as the last call on the
+// same packing left it where it fits under kKeepB.
+const float* widened(const F16View& b) {
+  const size_t n = static_cast<size_t>(b.k) * b.np;
+  bool kept = false;
+  float* const bw = static_cast<float*>(
+      n * sizeof(float) <= kKeepB ? scratch_kept(Scratch::kB, n * sizeof(float), b.id, kept)
+                                  : scratch(Scratch::kB, n * sizeof(float)));
+  if (!kept) widen_f16(b.data, bw, static_cast<int64_t>(n));
+  return bw;
+}
+
+void gemm_f16_wide(const Rows<float>& a, const F16View& b, int m, const Epilogue& e) {
+  const int taps = a.taps, k = b.k, seg = k / taps, panels = b.np / 16;
+  const size_t panel = static_cast<size_t>(k) * 16;
+  const bool whole = panel * panels * sizeof(float) <= kKeepB;
+  const float* const bw = whole ? widened(b) : nullptr;
+  float* const bp = whole ? nullptr : scratch_of<float>(Scratch::kB, panel);
+  const float* const* all = block(a, 0, m);
+  alignas(32) float buf[6 * 16];
+  for (int pj = 0; pj < panels; ++pj) {
+    if (!whole) widen_f16(b.data + pj * panel, bp, static_cast<int64_t>(panel));
+    const float* const p = whole ? bw + pj * panel : bp;
+    for (int m0 = 0; m0 < m; m0 += 6) {
+      const int mr = min_of(6, m - m0);
+      tile_rows(mr, all + static_cast<size_t>(m0) * taps, taps, seg, p, buf);
+      epilogue_avx2(buf, 16, mr, m0, pj * 16, min_of(16, b.n - pj * 16), e);
+    }
+  }
+}
+
+void gemm_f16_half(const Rows<uint16_t>& a, const F16View& b, int m, const Epilogue& e) {
+  const int taps = a.taps, k = b.k, seg = k / taps, panels = b.np / 16;
+  const float* const bw = widened(b);
+  float* const a32 = scratch_of<float>(Scratch::kA, static_cast<size_t>(6) * k);
+  const float* rows[6];
+  alignas(32) float buf[6 * 16];
+  for (int m0 = 0; m0 < m; m0 += 6) {
+    const int mr = min_of(6, m - m0);
+    for (int r = 0; r < mr; ++r) {
+      float* row = a32 + static_cast<size_t>(r) * k;
+      for (int t = 0; t < taps; ++t) widen_f16(piece(a, m0 + r, t), row + static_cast<size_t>(t) * seg, seg);
+      rows[r] = row;
+    }
+    for (int pj = 0; pj < panels; ++pj) {
+      tile_rows(mr, rows, 1, k, bw + static_cast<size_t>(pj) * k * 16, buf);
+      epilogue_avx2(buf, 16, mr, m0, pj * 16, min_of(16, b.n - pj * 16), e);
+    }
+  }
+}
+
+template <typename A>
+void dwconv_f16_impl(const Rows<A>& a, const uint16_t* w, int c, int m, const Epilogue& e) {
+  const int64_t n = static_cast<int64_t>(a.taps) * c;
+  float* const wf = scratch_of<float>(Scratch::kB, static_cast<size_t>(n));
+  widen_f16(w, wf, n);
+  dwconv_avx2(a, wf, c, m, e);
+}
+
+}  // namespace
+
+void gemm_f16_avx2(Rows<uint16_t> a, const F16View& b, int m, const Epilogue& e) { gemm_f16_half(a, b, m, e); }
+void gemm_f16_avx2(Rows<float> a, const F16View& b, int m, const Epilogue& e) { gemm_f16_wide(a, b, m, e); }
+
+void dwconv_f16_avx2(Rows<uint16_t> a, const uint16_t* w, int c, int m, const Epilogue& e) {
+  dwconv_f16_impl(a, w, c, m, e);
+}
+void dwconv_f16_avx2(Rows<float> a, const uint16_t* w, int c, int m, const Epilogue& e) {
+  dwconv_f16_impl(a, w, c, m, e);
+}
+
+void to_f32_avx2(const uint16_t* in, float* out, size_t n) { widen_f16(in, out, static_cast<int64_t>(n)); }
+
+void to_f16_avx2(const float* in, uint16_t* out, size_t n) {
+  size_t i = 0;
+  for (; i + 8 <= n; i += 8) {
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(out + i), _mm256_cvtps_ph(_mm256_loadu_ps(in + i), 0));
+  }
+  for (; i < n; ++i) out[i] = float_to_half(in[i]);
 }
 
 // ---------------------------------------------------------------- CTC greedy
@@ -358,6 +491,318 @@ void ctc_argmax_avx2(const float* logits, int classes, int frames, int t_n, int3
     for (int c = 0; c < classes; ++c) sum = sum + exp_neg(logits[static_cast<size_t>(c) * frames + t] - best);
     probs[t] = 1.0f / sum;
   }
+}
+
+// ---------------------------------------------------------------- resampling
+//
+// The weights are 22-bit fixed point (up to 2^22), too wide for vpmaddwd, so each is
+// split into two 16-bit halves, k = 2048 * hi + lo; the pixel times each half is
+// exact, and (sum of the hi products << 11) + (sum of the lo products) is the sum of
+// the whole products, below 2^31 (255 times the weights' sum, about 2^22).
+
+void resample_hk_avx2(const int32_t* k, const int32_t* count, int taps, int width, int chunks, void* out) {
+  auto* o = static_cast<int16_t*>(out);
+  for (int x = 0; x < width; ++x) {
+    // sample x is sample q of its group's pair q (the low lane) or q + 4 (the high one)
+    const int g = x / 8, q = x % 4, lane = x % 8 / 4;
+    for (int t = 0; t < count[x]; ++t) {
+      int16_t* at = o + ((static_cast<size_t>(g) * chunks + t / 8) * 4 + q) * 32 + lane * 8 + t % 8;
+      const int32_t v = k[static_cast<size_t>(x) * taps + t];
+      at[0] = static_cast<int16_t>(v & 2047);
+      at[16] = static_cast<int16_t>(v >> 11);
+    }
+  }
+}
+
+namespace {
+
+// Samples q and q + 4 of a group, which share a register, 8 taps of each in 16 bits,
+// one in each 128-bit lane: vpmaddwd leaves 4 sums of pairs a sample, (hi << 11) +
+// lo.  a and b: their first pixels; kq: their weights, a chunk every 128 values.
+// kChunks: the chunks known when compiled (0: `chunks`).
+template <int kChunks>
+inline __m256i h_pair(const uint8_t* a, const uint8_t* b, const int16_t* kq, int chunks) {
+  const int n = kChunks ? kChunks : chunks;
+  __m256i lo = _mm256_setzero_si256(), hi = _mm256_setzero_si256();
+  for (int c = 0; c < n; ++c, a += 8, b += 8, kq += 128) {
+    const __m256i v = _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(a)),
+                                                              _mm_loadl_epi64(reinterpret_cast<const __m128i*>(b))));
+    const __m256i l = _mm256_madd_epi16(v, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(kq)));
+    const __m256i h = _mm256_madd_epi16(v, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(kq + 16)));
+    lo = c ? _mm256_add_epi32(lo, l) : l;
+    hi = c ? _mm256_add_epi32(hi, h) : h;
+  }
+  return _mm256_add_epi32(_mm256_slli_epi32(hi, 11), lo);
+}
+
+// Groups [g0, g1): three vphaddd make each sample's 4 sums one, in order.
+template <int kChunks>
+void h_groups(const uint8_t* src, int col0, const int32_t* first, const int16_t* k, int chunks, int g0, int g1,
+              uint8_t* out) {
+  const __m256i half = _mm256_set1_epi32(carbon::detail::kHalf);
+  for (int g = g0; g < g1; ++g) {
+    const int32_t* f = first + 8 * g;
+    const int16_t* kg = k + static_cast<size_t>(g) * chunks * 128;
+    const __m256i s0 = h_pair<kChunks>(src + (f[0] - col0), src + (f[4] - col0), kg, chunks);
+    const __m256i s1 = h_pair<kChunks>(src + (f[1] - col0), src + (f[5] - col0), kg + 32, chunks);
+    const __m256i s2 = h_pair<kChunks>(src + (f[2] - col0), src + (f[6] - col0), kg + 64, chunks);
+    const __m256i s3 = h_pair<kChunks>(src + (f[3] - col0), src + (f[7] - col0), kg + 96, chunks);
+    __m256i sum = _mm256_hadd_epi32(_mm256_hadd_epi32(s0, s1), _mm256_hadd_epi32(s2, s3));
+    sum = _mm256_srai_epi32(_mm256_add_epi32(sum, half), carbon::detail::kPrecisionBits);
+    // clip8: the shifted sums fit 16 bits, and packus clamps them to 0 .. 255
+    const __m128i w = _mm_packs_epi32(_mm256_castsi256_si128(sum), _mm256_extracti128_si256(sum, 1));
+    _mm_storel_epi64(reinterpret_cast<__m128i*>(out + 8 * g), _mm_packus_epi16(w, w));
+  }
+}
+
+}  // namespace
+
+void resample_h_avx2(const uint8_t* src, int col0, const int32_t* first, const void* k, int chunks, int g0, int g1,
+                     uint8_t* out) {
+  const auto* kk = static_cast<const int16_t*>(k);
+  switch (chunks) {
+    case 1: h_groups<1>(src, col0, first, kk, chunks, g0, g1, out); break;
+    case 2: h_groups<2>(src, col0, first, kk, chunks, g0, g1, out); break;
+    default: h_groups<0>(src, col0, first, kk, chunks, g0, g1, out); break;
+  }
+}
+
+namespace {
+
+inline __m256i load8_u32(const uint8_t* p) {
+  return _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(p)));
+}
+
+}  // namespace
+
+// 32 pixels of the row at a time, in four registers of 8 int32 sums: vpmulld is
+// exact (255 * 2^22 < 2^31).
+void resample_v_avx2(const uint8_t* const* rows, const int32_t* k, int n, int width, uint8_t* out) {
+  const __m256i half = _mm256_set1_epi32(carbon::detail::kHalf);
+  const __m256i order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);  // undoes the packs' lane interleave
+  constexpr int bits = carbon::detail::kPrecisionBits;
+  for (int x = 0; x < width; x += 32) {
+    __m256i a0 = half, a1 = half, a2 = half, a3 = half;
+    for (int i = 0; i < n; ++i) {
+      const uint8_t* r = rows[i] + x;
+      const __m256i w = _mm256_set1_epi32(k[i]);
+      a0 = _mm256_add_epi32(a0, _mm256_mullo_epi32(load8_u32(r), w));
+      a1 = _mm256_add_epi32(a1, _mm256_mullo_epi32(load8_u32(r + 8), w));
+      a2 = _mm256_add_epi32(a2, _mm256_mullo_epi32(load8_u32(r + 16), w));
+      a3 = _mm256_add_epi32(a3, _mm256_mullo_epi32(load8_u32(r + 24), w));
+    }
+    const __m256i lo = _mm256_packs_epi32(_mm256_srai_epi32(a0, bits), _mm256_srai_epi32(a1, bits));
+    const __m256i hi = _mm256_packs_epi32(_mm256_srai_epi32(a2, bits), _mm256_srai_epi32(a3, bits));
+    const __m256i b = _mm256_permutevar8x32_epi32(_mm256_packus_epi16(lo, hi), order);
+    if (x + 32 <= width) {
+      _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + x), b);
+    } else {
+      alignas(32) uint8_t last[32];
+      _mm256_store_si256(reinterpret_cast<__m256i*>(last), b);
+      for (int j = 0; j < width - x; ++j) out[x + j] = last[j];
+    }
+  }
+}
+
+// ---------------------------------------------------------------- page turns
+
+namespace {
+
+// The double just below 0.5: for 0 <= v < 256, v plus it truncated is v rounded
+// half away from zero (lround), since the sum rounds up to the next integer only
+// when v's fraction is at least one half.
+constexpr double kBelowHalf = 0.49999999999999994;
+
+// Lanes 0-3 (k = 0) or 4-7 of eight int32 as doubles.
+inline __m256d lanes_pd(__m256i v, int k) {
+  return _mm256_cvtepi32_pd(k ? _mm256_extracti128_si256(v, 1) : _mm256_castsi256_si128(v));
+}
+
+// a <= b for each lane as unsigned int32: a negative a is past any b.
+inline __m256i at_most(__m256i a, __m256i b) { return _mm256_cmpeq_epi32(_mm256_max_epu32(a, b), b); }
+
+}  // namespace
+
+// Eight pixels at a time: where they were on the page in doubles (vroundpd for the
+// floor), then, when all their taps are on the page, the taps by two gathers of
+// four bytes (a row's two taps and the two past them; x0 <= w - 4 keeps those on
+// the row), the blend in doubles as the reference orders it, and rounding by
+// kBelowHalf and truncation.  Pixels with a tap off the page, or x0 past w - 4,
+// go to turn_pixels, unless none of their taps is on it.
+void rotate_bilinear_avx2(const TurnView& t, uint8_t* dst) {
+  const int w = t.w, h = t.h;
+  // w - 4 and h - 2 not negative, and every tap's offset an int32 (the gathers')
+  const bool wide = w >= 8 && h >= 2 && t.stride <= INT32_MAX && (h - 1) * t.stride + w <= INT32_MAX;
+  const __m256d cx = _mm256_set1_pd(t.cx), cy = _mm256_set1_pd(t.cy), one = _mm256_set1_pd(1.0);
+  const __m256d lo = _mm256_setzero_pd(), hi = _mm256_set1_pd(255.0), half = _mm256_set1_pd(kBelowHalf);
+  const __m256i x_last = _mm256_set1_epi32(w - 4), y_last = _mm256_set1_epi32(h - 2);
+  const __m256i x_seen = _mm256_set1_epi32(w), y_seen = _mm256_set1_epi32(h), one_i = _mm256_set1_epi32(1);
+  const __m256i stride = _mm256_set1_epi32(wide ? static_cast<int32_t>(t.stride) : 0);
+  const __m256i byte = _mm256_set1_epi32(0xff);
+  const int* top_row = reinterpret_cast<const int*>(t.src);
+  const int* next_row = reinterpret_cast<const int*>(t.src + (wide ? t.stride : 0));
+  for (int y = 0; y < h; ++y) {
+    const double dy = y - t.cy, ds = dy * t.s, dc = dy * t.c;
+    const __m256d vds = _mm256_set1_pd(ds), vdc = _mm256_set1_pd(dc);
+    uint8_t* d = dst + static_cast<int64_t>(y) * w;
+    int x = 0;
+    for (; wide && x + 8 <= w; x += 8) {
+      __m256d fx[2], fy[2];
+      __m128i ix[2], iy[2];
+      for (int k = 0; k < 2; ++k) {
+        const __m256d sx = _mm256_add_pd(_mm256_sub_pd(_mm256_loadu_pd(t.xc + x + 4 * k), vds), cx);
+        const __m256d sy = _mm256_add_pd(_mm256_add_pd(_mm256_loadu_pd(t.xs + x + 4 * k), vdc), cy);
+        const __m256d x0 = _mm256_floor_pd(sx), y0 = _mm256_floor_pd(sy);
+        fx[k] = _mm256_sub_pd(sx, x0);
+        fy[k] = _mm256_sub_pd(sy, y0);
+        ix[k] = _mm256_cvttpd_epi32(x0);
+        iy[k] = _mm256_cvttpd_epi32(y0);
+      }
+      const __m256i x0 = _mm256_inserti128_si256(_mm256_castsi128_si256(ix[0]), ix[1], 1);
+      const __m256i y0 = _mm256_inserti128_si256(_mm256_castsi128_si256(iy[0]), iy[1], 1);
+      const __m256i inside = _mm256_and_si256(at_most(x0, x_last), at_most(y0, y_last));
+      if (_mm256_movemask_ps(_mm256_castsi256_ps(inside)) != 0xff) {
+        // a tap off the page: x0 + 1 in [0, w] and y0 + 1 in [0, h] when any is on it
+        const __m256i seen = _mm256_and_si256(at_most(_mm256_add_epi32(x0, one_i), x_seen),
+                                              at_most(_mm256_add_epi32(y0, one_i), y_seen));
+        if (_mm256_movemask_ps(_mm256_castsi256_ps(seen))) turn_pixels(t, ds, dc, x, x + 8, d);
+        continue;
+      }
+      const __m256i at = _mm256_add_epi32(_mm256_mullo_epi32(y0, stride), x0);
+      const __m256i top = _mm256_i32gather_epi32(top_row, at, 1), bottom = _mm256_i32gather_epi32(next_row, at, 1);
+      const __m256i p00 = _mm256_and_si256(top, byte), p10 = _mm256_and_si256(_mm256_srli_epi32(top, 8), byte);
+      const __m256i p01 = _mm256_and_si256(bottom, byte), p11 = _mm256_and_si256(_mm256_srli_epi32(bottom, 8), byte);
+      __m128i v[2];
+      for (int k = 0; k < 2; ++k) {
+        const __m256d gx = _mm256_sub_pd(one, fx[k]), gy = _mm256_sub_pd(one, fy[k]);
+        const __m256d upper =
+            _mm256_add_pd(_mm256_mul_pd(lanes_pd(p00, k), gx), _mm256_mul_pd(lanes_pd(p10, k), fx[k]));
+        const __m256d lower =
+            _mm256_add_pd(_mm256_mul_pd(lanes_pd(p01, k), gx), _mm256_mul_pd(lanes_pd(p11, k), fx[k]));
+        const __m256d blend = _mm256_add_pd(_mm256_mul_pd(upper, gy), _mm256_mul_pd(lower, fy[k]));
+        v[k] = _mm256_cvttpd_epi32(_mm256_add_pd(_mm256_max_pd(_mm256_min_pd(blend, hi), lo), half));
+      }
+      const __m128i words = _mm_packs_epi32(v[0], v[1]);
+      _mm_storel_epi64(reinterpret_cast<__m128i*>(d + x), _mm_packus_epi16(words, words));
+    }
+    turn_pixels(t, ds, dc, x, w, d);
+  }
+}
+
+namespace {
+
+// 16 rows of 16 bytes transposed: column i of the rows (r[0] first) to o + i * os.
+// Interleaving bytes, then pairs, fours and eights of them, as a 16 x 16 transpose
+// is done in SSE2.
+inline void transpose16(const uint8_t* const* r, uint8_t* o, int64_t os) {
+  __m128i a[16], b[16];
+  for (int i = 0; i < 16; ++i) a[i] = _mm_loadu_si128(reinterpret_cast<const __m128i*>(r[i]));
+  for (int i = 0; i < 8; ++i) {  // b[2i]: columns 0-7 of rows 2i and 2i + 1, b[2i + 1]: columns 8-15
+    b[2 * i] = _mm_unpacklo_epi8(a[2 * i], a[2 * i + 1]);
+    b[2 * i + 1] = _mm_unpackhi_epi8(a[2 * i], a[2 * i + 1]);
+  }
+  for (int i = 0; i < 4; ++i) {  // a[4i + k]: columns 4k to 4k + 3 of rows 4i to 4i + 3
+    a[4 * i] = _mm_unpacklo_epi16(b[4 * i], b[4 * i + 2]);
+    a[4 * i + 1] = _mm_unpackhi_epi16(b[4 * i], b[4 * i + 2]);
+    a[4 * i + 2] = _mm_unpacklo_epi16(b[4 * i + 1], b[4 * i + 3]);
+    a[4 * i + 3] = _mm_unpackhi_epi16(b[4 * i + 1], b[4 * i + 3]);
+  }
+  for (int i = 0; i < 2; ++i) {  // b[8i + m]: columns 2m and 2m + 1 of rows 8i to 8i + 7
+    for (int k = 0; k < 4; ++k) {
+      b[8 * i + 2 * k] = _mm_unpacklo_epi32(a[8 * i + k], a[8 * i + 4 + k]);
+      b[8 * i + 2 * k + 1] = _mm_unpackhi_epi32(a[8 * i + k], a[8 * i + 4 + k]);
+    }
+  }
+  for (int m = 0; m < 8; ++m) {  // columns 2m and 2m + 1, all 16 rows
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(o + 2 * m * os), _mm_unpacklo_epi64(b[m], b[8 + m]));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(o + (2 * m + 1) * os), _mm_unpackhi_epi64(b[m], b[8 + m]));
+  }
+}
+
+// 16 rows of 32 bytes transposed, as two 16 x 16 tiles side by side in the halves
+// of the registers (vpunpck* works within each half): the same steps as
+// transpose16 for half the instructions.  Column i to o + i * os, i < 32.
+inline void transpose32(const uint8_t* const* r, uint8_t* o, int64_t os) {
+  __m256i a[16], b[16];
+  for (int i = 0; i < 16; ++i) a[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(r[i]));
+  for (int i = 0; i < 8; ++i) {
+    b[2 * i] = _mm256_unpacklo_epi8(a[2 * i], a[2 * i + 1]);
+    b[2 * i + 1] = _mm256_unpackhi_epi8(a[2 * i], a[2 * i + 1]);
+  }
+  for (int i = 0; i < 4; ++i) {
+    a[4 * i] = _mm256_unpacklo_epi16(b[4 * i], b[4 * i + 2]);
+    a[4 * i + 1] = _mm256_unpackhi_epi16(b[4 * i], b[4 * i + 2]);
+    a[4 * i + 2] = _mm256_unpacklo_epi16(b[4 * i + 1], b[4 * i + 3]);
+    a[4 * i + 3] = _mm256_unpackhi_epi16(b[4 * i + 1], b[4 * i + 3]);
+  }
+  for (int i = 0; i < 2; ++i) {
+    for (int k = 0; k < 4; ++k) {
+      b[8 * i + 2 * k] = _mm256_unpacklo_epi32(a[8 * i + k], a[8 * i + 4 + k]);
+      b[8 * i + 2 * k + 1] = _mm256_unpackhi_epi32(a[8 * i + k], a[8 * i + 4 + k]);
+    }
+  }
+  for (int m = 0; m < 8; ++m) {  // columns 2m and 2m + 1 in the low halves, 16 + 2m and 17 + 2m in the high
+    const __m256i even = _mm256_unpacklo_epi64(b[m], b[8 + m]), odd = _mm256_unpackhi_epi64(b[m], b[8 + m]);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(o + 2 * m * os), _mm256_castsi256_si128(even));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(o + (2 * m + 1) * os), _mm256_castsi256_si128(odd));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(o + (2 * m + 16) * os), _mm256_extracti128_si256(even, 1));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(o + (2 * m + 17) * os), _mm256_extracti128_si256(odd, 1));
+  }
+}
+
+}  // namespace
+
+// q = 0: the rows copied; q = 2: each row reversed, 32 bytes at a time (vpshufb
+// reverses each half, vpermq swaps them), into the row opposite; q odd: tiles
+// of 16 rows transposed in registers, 32 columns at a time (then 16), in blocks
+// of 64 columns by 256 rows (16 KB read, 16 KB written: they stay in L1, and each
+// output row takes 256 bytes in a row), the bytes left over one at a time.
+//
+//   q = 1: (x, y) to row x, column h - 1 - y: a tile's rows taken bottom up
+//   q = 3: (x, y) to row w - 1 - x, column y: its columns stored bottom up
+void rotate_quarters_avx2(const uint8_t* src, int w, int h, int64_t stride, int q, uint8_t* dst) {
+  if (q == 0) {
+    for (int y = 0; y < h; ++y) std::memcpy(dst + static_cast<int64_t>(y) * w, src + y * stride, w);
+    return;
+  }
+  if (q == 2) {
+    const __m256i reverse = _mm256_setr_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,  //
+                                             15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+    for (int y = 0; y < h; ++y) {
+      const uint8_t* r = src + y * stride;
+      uint8_t* o = dst + static_cast<int64_t>(h - 1 - y) * w;
+      int x = 0;
+      for (; x + 32 <= w; x += 32) {
+        const __m256i v = _mm256_shuffle_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(r + x)), reverse);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(o + w - 32 - x), _mm256_permute4x64_epi64(v, 0x4e));
+      }
+      for (; x < w; ++x) o[w - 1 - x] = r[x];
+    }
+    return;
+  }
+  const int w32 = w / 32 * 32, w16 = w / 16 * 16, h16 = h / 16 * 16;
+  const int64_t os = q == 1 ? h : -h;
+  const uint8_t* rows[16];
+  for (int by = 0; by < h16; by += 256) {
+    const int by1 = min_of(h16, by + 256);
+    for (int bx = 0; bx < w32; bx += 64) {
+      const int bx1 = min_of(w32, bx + 64);
+      for (int x = bx; x < bx1; x += 32) {
+        for (int y = by; y < by1; y += 16) {
+          uint8_t* o = quarter_tile(src, stride, w, h, q, x, y, dst, rows);
+          transpose32(rows, o, os);
+        }
+      }
+    }
+    if (w16 > w32) {
+      for (int y = by; y < by1; y += 16) {  // the next 16 columns
+        uint8_t* o = quarter_tile(src, stride, w, h, q, w32, y, dst, rows);
+        transpose16(rows, o, os);
+      }
+    }
+  }
+  quarter_bytes(src, stride, w, h, q, w16, 0, h16, dst);  // the columns past the tiles
+  quarter_bytes(src, stride, w, h, q, 0, h16, h, dst);    // the rows below them
 }
 
 }  // namespace carbon::cpu::detail

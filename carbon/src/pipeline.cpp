@@ -86,9 +86,9 @@ class CpuModels final : public PipelineModels {
   CpuModels(const std::filesystem::path& set, const EngineOptions& o, int threads) {
     SessionOptions so;
     so.threads = threads;
-    orient_ = open_set_model(set, "orient", o.backend, so);
-    det_ = open_set_model(set, "det", o.backend, so);
-    rec_ = open_set_model(set, o.rec, o.backend, so);
+    orient_ = open_set_model(set, "orient", o.backend, so, o.precision);
+    det_ = open_set_model(set, "det", o.backend, so, o.precision);
+    rec_ = open_set_model(set, o.rec, o.backend, so, o.precision);
   }
 
   Device device() const override { return Device::kCpu; }

@@ -253,6 +253,12 @@ std::vector<DecodedLine> to_python(std::vector<carbon::CtcLine>&& lines) {
   return out;
 }
 
+carbon::Precision precision_of(const std::string& name) {
+  const auto p = carbon::parse_precision(name);
+  if (!p) throw carbon::Error("precision: auto, fp32, fp16 or int8, not '" + name + "'");
+  return *p;
+}
+
 }  // namespace
 
 NB_MODULE(carbon_ocr, m) {
@@ -303,17 +309,20 @@ NB_MODULE(carbon_ocr, m) {
       .def(
           "__init__",
           [](carbon::Engine* e, const std::filesystem::path& set, int workers, bool pin, const std::string& rec,
-             std::optional<std::filesystem::path> order_model) {
+             std::optional<std::filesystem::path> order_model, const std::string& precision) {
             carbon::EngineOptions o;
             o.pool.workers = workers;
             o.pool.pin = pin;
             o.rec = rec;
             if (order_model) o.order_model = *order_model;
+            o.precision = precision_of(precision);
             new (e) carbon::Engine(set, o);
           },
           "set"_a, "workers"_a = 0, "pin"_a = true, "rec"_a = "rec-latin", "order_model"_a = nb::none(),
+          "precision"_a = "auto",
           "A Fullerene set's directory (orient.onnx, det.onnx, <rec>.onnx, <rec>.vocab.json, and order.onnx "
-          "where it has one; order_model another); workers 0 is one per physical core.")
+          "where it has one; order_model another); workers 0 is one per physical core. precision: the models' "
+          "files, \"auto\" (the fastest the set has), \"fp32\", \"fp16\" or \"int8\" (carbon::choose_set_model).")
       .def_prop_ro("workers", &carbon::Engine::workers)
       .def(
           "ocr",
@@ -343,8 +352,10 @@ NB_MODULE(carbon_ocr, m) {
           "__init__",
           [](carbon::Pipeline* p, const std::filesystem::path& set, std::optional<std::string> device,
              int page_batch, int line_batch, int in_flight, int threads, int model_threads, const std::string& rec,
-             std::optional<std::filesystem::path> order_model, std::optional<std::filesystem::path> engine_cache) {
+             std::optional<std::filesystem::path> order_model, std::optional<std::filesystem::path> engine_cache,
+             const std::string& precision) {
             carbon::PipelineOptions o;
+            o.engine.precision = precision_of(precision);
             if (device) {
               if (*device != "cpu" && *device != "cuda") throw carbon::Error("device: cpu or cuda");
               o.device = *device == "cuda" ? carbon::Device::kCuda : carbon::Device::kCpu;
@@ -361,11 +372,12 @@ NB_MODULE(carbon_ocr, m) {
           },
           "set"_a, "device"_a = nb::none(), "page_batch"_a = 8, "line_batch"_a = 256, "in_flight"_a = 32,
           "threads"_a = 0, "model_threads"_a = 0, "rec"_a = "rec-latin", "order_model"_a = nb::none(),
-          "engine_cache"_a = nb::none(),
+          "engine_cache"_a = nb::none(), "precision"_a = "auto",
           "A Fullerene set's directory; device \"cpu\" or \"cuda\" (None: the GPU where this build has CUDA and "
           "TensorRT and a GPU is there); page_batch pages an orientation or detection run, line_batch lines a "
           "recognition run, in_flight pages at once; threads the CPU threads preparing and assembling pages and "
-          "model_threads a CPU model run's (0: the physical cores).")
+          "model_threads a CPU model run's (0: the physical cores); precision the CPU's files, as Engine's (the "
+          "GPU runs the set's FP16 files).")
       .def_prop_ro("device",
                    [](const carbon::Pipeline& p) { return p.device() == carbon::Device::kCuda ? "cuda" : "cpu"; })
       .def(

@@ -52,7 +52,8 @@ enum class Device : uint8_t { kCpu, kCuda };
 
 struct PipelineOptions {
   EngineOptions engine;          // the recognizer, the crop rule, orientation, deskew, order, splitting, tables;
-                                 // engine.backend the CPU device's models (none: the fastest the set has)
+                                 // engine.backend and engine.precision the CPU device's models (none and auto:
+                                 // the fastest the set has); the GPU runs the set's FP16 files
   std::optional<Device> device;  // none: CUDA where it is built in with TensorRT and a GPU is there, else the CPU
   int page_batch = 8;            // pages an orientation or detection run holds at most
   int line_batch = 256;          // lines a recognition run holds at most

@@ -556,19 +556,57 @@ std::string OcrPage::json() const {
 
 // ---------------------------------------------------------------- the engine
 
-SetModel choose_set_model(const std::filesystem::path& set, const std::string& name, std::optional<Backend> backend) {
+std::string_view precision_name(Precision precision) {
+  switch (precision) {
+    case Precision::kAuto: return "auto";
+    case Precision::kFp32: return "fp32";
+    case Precision::kFp16: return "fp16";
+    case Precision::kInt8: return "int8";
+  }
+  return "?";
+}
+
+std::optional<Precision> parse_precision(std::string_view name) {
+  for (Precision p : {Precision::kAuto, Precision::kFp32, Precision::kFp16, Precision::kInt8}) {
+    if (name == precision_name(p)) return p;
+  }
+  return std::nullopt;
+}
+
+SetModel choose_set_model(const std::filesystem::path& set, const std::string& name, std::optional<Backend> backend,
+                          Precision precision) {
   const std::filesystem::path int8 = set / (name + ".int8.onnx"), fp32 = set / (name + ".onnx");
+  const auto built = compiled_backends();
+  const bool ort = std::find(built.begin(), built.end(), Backend::kOnnxRuntime) != built.end();
+  // A precision asked for: its file, which the set must have.
+  auto file = [&](const char* kind) {
+    const std::filesystem::path f = set / (name + kind + ".onnx");
+    if (!std::filesystem::is_regular_file(f)) {
+      throw Error(f.string() + ": the set has no " + std::string(precision_name(precision)) + " file for " + name);
+    }
+    return f;
+  };
+  switch (precision) {
+    case Precision::kFp32: return {backend.value_or(ort ? Backend::kOnnxRuntime : Backend::kNative), file("")};
+    case Precision::kFp16:
+      if (backend && backend != Backend::kNative) {
+        throw Error(name + ": FP16 on the CPU runs on the native backend, not " +
+                    std::string(backend_name(*backend)));
+      }
+      return {Backend::kNative, file(".fp16")};
+    case Precision::kInt8: return {backend.value_or(Backend::kNative), file(".int8")};
+    case Precision::kAuto: break;
+  }
   const bool has_int8 = std::filesystem::is_regular_file(int8);
   if (backend == Backend::kNative || (!backend && has_int8)) return {Backend::kNative, has_int8 ? int8 : fp32};
   if (backend) return {*backend, fp32};
-  const auto built = compiled_backends();
-  const bool ort = std::find(built.begin(), built.end(), Backend::kOnnxRuntime) != built.end();
   return {ort ? Backend::kOnnxRuntime : Backend::kNative, fp32};
 }
 
 std::unique_ptr<Session> open_set_model(const std::filesystem::path& set, const std::string& name,
-                                        std::optional<Backend> backend, const SessionOptions& options) {
-  const SetModel m = choose_set_model(set, name, backend);
+                                        std::optional<Backend> backend, const SessionOptions& options,
+                                        Precision precision) {
+  const SetModel m = choose_set_model(set, name, backend, precision);
   return open_session(m.backend, m.file, options);
 }
 
@@ -604,9 +642,9 @@ struct Engine::Impl {
     single.threads = 1;
     const detail::OrderModel order_model = detail::choose_order(set, o);
     pool.on_each_worker([&](int k) {
-      w[k].orient = open_set_model(set, "orient", o.backend, single);
-      w[k].det = open_set_model(set, "det", o.backend, single);
-      w[k].rec = open_set_model(set, o.rec, o.backend, single);
+      w[k].orient = open_set_model(set, "orient", o.backend, single, o.precision);
+      w[k].det = open_set_model(set, "det", o.backend, single, o.precision);
+      w[k].rec = open_set_model(set, o.rec, o.backend, single, o.precision);
       if (!order_model.file.empty()) w[k].order = open_session(order_model.backend, order_model.file, single);
     });
     const Shape& lines_in = w[0].rec->inputs().at(0).shape;  // [N, 1, height, W]
@@ -621,8 +659,10 @@ struct Engine::Impl {
     }
     const auto built = compiled_backends();
     const bool ort = std::find(built.begin(), built.end(), Backend::kOnnxRuntime) != built.end();
+    // (ONNX Runtime on det.onnx: FP32, so not where another precision is asked for)
+    const bool fp32_det = o.precision == Precision::kAuto || o.precision == Precision::kFp32;
     for (int t : {6, 4, 2}) {
-      if (t > pool.fast() || !ort || o.backend == Backend::kNative) continue;
+      if (t > pool.fast() || !ort || o.backend == Backend::kNative || !fp32_det) continue;
       auto wd = std::make_unique<Wide>();
       wd->threads = t;
       SessionOptions so;

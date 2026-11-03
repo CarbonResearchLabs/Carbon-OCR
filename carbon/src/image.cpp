@@ -5,12 +5,17 @@
 #include <algorithm>
 #include <fstream>
 #include <iterator>
+#include <new>
 #include <string>
 
+#include "carbon/cpu.h"
 #include "carbon/error.h"
+#include "png.h"
 
 // stb_image for PNG, JPEG, BMP and PNM only, from memory (paths with any
-// characters work through std::filesystem), at most 32768 px a side.
+// characters work through std::filesystem), at most 32768 px a side.  PNG goes
+// to png.cpp first, which gives the same bytes faster and leaves to stb_image
+// what it does not read itself.
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
 #define STBI_ONLY_JPEG
@@ -22,7 +27,18 @@
 
 namespace carbon {
 
-GrayImage decode_image(std::span<const uint8_t> bytes) {
+GrayImage decode_image(std::span<const uint8_t> bytes) { return decode_image(bytes, cpu::best_isa()); }
+
+GrayImage decode_image(std::span<const uint8_t> bytes, cpu::Isa isa) {
+  if (!cpu::isa_available(isa)) {
+    throw Error(std::string("decode_image: ") + cpu::isa_name(isa) + " is not available on this CPU");
+  }
+  try {
+    GrayImage img;
+    if (detail::png_to_gray(bytes, isa, img)) return img;
+  } catch (const std::bad_alloc&) {
+    // stb_image reports running out of memory itself
+  }
   int w = 0, h = 0, channels = 0;
   stbi_uc* data = stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()), &w, &h, &channels, 1);
   if (!data) throw Error(std::string("the image could not be read: ") + stbi_failure_reason());
@@ -45,6 +61,8 @@ GrayImage load_image(const std::filesystem::path& file) {
   }
 }
 
+// The bytes moved by carbon::cpu::rotate_quarters: rows copied or reversed, or
+// tiles transposed in registers where the CPU has vectors.
 GrayImage rotate_quarter(const GrayView& image, int quarter_turns) {
   const int q = ((quarter_turns % 4) + 4) % 4;
   const int w = image.width, h = image.height;
@@ -52,23 +70,7 @@ GrayImage rotate_quarter(const GrayView& image, int quarter_turns) {
   out.width = q % 2 ? h : w;
   out.height = q % 2 ? w : h;
   out.pixels.resize(static_cast<size_t>(w) * h);
-  for (int y = 0; y < h; ++y) {
-    const uint8_t* row = image.data + y * image.stride;
-    for (int x = 0; x < w; ++x) {
-      int nx = x, ny = y;  // where (x, y) lands, turned clockwise q times
-      if (q == 1) {
-        nx = h - 1 - y;
-        ny = x;
-      } else if (q == 2) {
-        nx = w - 1 - x;
-        ny = h - 1 - y;
-      } else if (q == 3) {
-        nx = y;
-        ny = w - 1 - x;
-      }
-      out.pixels[static_cast<size_t>(ny) * out.width + nx] = row[x];
-    }
-  }
+  cpu::rotate_quarters(image.data, w, h, image.stride, q, out.pixels.data());
   return out;
 }
 
@@ -92,12 +94,20 @@ void ink_input(const GrayView& page, int fit_w, int fit_h, int out_w, int out_h,
     small = resize_gray(page, fit_w, fit_h);
     src = small.view();
   }
-  std::fill(out, out + static_cast<size_t>(out_w) * out_h, 0.0f);
+  // Each value written once: the page's, then paper to the right of it and below.
+  // The conversion is a loop compilers vectorize (a division, not a multiply by
+  // 1 / 255, which would round differently).
   for (int y = 0; y < fit_h; ++y) {
     const uint8_t* row = src.data + y * src.stride;
     float* o = out + static_cast<size_t>(y) * out_w;
     for (int x = 0; x < fit_w; ++x) o[x] = 1.0f - row[x] / 255.0f;
   }
+  if (fit_w < out_w) {
+    for (int y = 0; y < fit_h; ++y) {
+      std::fill(out + static_cast<size_t>(y) * out_w + fit_w, out + static_cast<size_t>(y + 1) * out_w, 0.0f);
+    }
+  }
+  std::fill(out + static_cast<size_t>(fit_h) * out_w, out + static_cast<size_t>(out_w) * out_h, 0.0f);
 }
 
 }  // namespace carbon

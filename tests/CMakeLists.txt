@@ -2,8 +2,12 @@ include(GoogleTest)
 
 add_executable(carbon_tests cpp/tensor_test.cpp cpp/lines_test.cpp cpp/parallel_test.cpp cpp/strips_test.cpp cpp/detect_test.cpp
   cpp/pipeline_test.cpp cpp/cpu_test.cpp cpp/net_test.cpp cpp/textlayer_test.cpp cpp/output_test.cpp cpp/deskew_test.cpp cpp/order_test.cpp
-  cpp/score_test.cpp cpp/order_net_test.cpp)
-target_link_libraries(carbon_tests PRIVATE carbon::carbon GTest::gtest_main)
+  cpp/score_test.cpp cpp/order_net_test.cpp cpp/image_test.cpp
+  cpp/png_test.cpp)
+# png_test writes PNGs with libdeflate and holds the decoder to stb_image, whose
+# functions carbon carries (src/image.cpp)
+target_link_libraries(carbon_tests PRIVATE carbon::carbon GTest::gtest_main libdeflate::libdeflate_static)
+target_include_directories(carbon_tests SYSTEM PRIVATE ${CARBON_STB_INCLUDE_DIR})
 target_compile_definitions(carbon_tests PRIVATE
   CARBON_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/data")
 carbon_warnings(carbon_tests)
@@ -43,6 +47,10 @@ if(CARBON_BUILD_CLI AND CARBON_WITH_ONNXRUNTIME)
   add_test(NAME Cli.OcrPathAnyCharacters
     COMMAND ${CMAKE_COMMAND} -DCLI=$<TARGET_FILE:carbon-ocr> -DDATA=${CMAKE_CURRENT_SOURCE_DIR}/data
             -DOUT=${CMAKE_CURRENT_BINARY_DIR}/cli -P ${CMAKE_CURRENT_SOURCE_DIR}/cli_test.cmake)
+  # carbon-ocr ocr --precision: the files it picks, and a set without them
+  add_test(NAME Cli.OcrPrecision
+    COMMAND ${CMAKE_COMMAND} -DCLI=$<TARGET_FILE:carbon-ocr> -DDATA=${CMAKE_CURRENT_SOURCE_DIR}/data
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cli_precision_test.cmake)
   if(CARBON_WITH_PDFIUM)
     # carbon-ocr ocr on a PDF: its pages in helper processes, read from their text layer
     add_test(NAME Cli.OcrPdfTextLayer

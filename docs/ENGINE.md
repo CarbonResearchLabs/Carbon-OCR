@@ -59,7 +59,7 @@ print(page["text"])
 
 ## <img src="assets/chip-02.svg" height="22" alt=""> Inputs: images, PDFs and text layers
 
-**Images.** `carbon::load_image` reads PNG, JPEG, BMP and PNM files and converts them to 8-bit gray, paper 255 and ink 0. It refuses an image more than 32,768 px on a side. Every later step works on gray pixels.
+**Images.** `carbon::load_image` reads PNG, JPEG, BMP and PNM files and converts them to 8-bit gray, paper 255 and ink 0. It refuses an image more than 32,768 px on a side. Every later step works on gray pixels. A PNG goes through the engine's own decoder (`carbon/src/png.cpp`): libdeflate's inflate, the rows unfiltered with SIMD and turned gray as they come, giving stb_image's bytes about three times as fast; stb_image reads every other image, and any PNG the decoder would not read byte for byte as it does (interlaced files, for one).
 
 **PDFs.** PDFium renders a PDF's pages and reads their text, and it runs only in helper processes. `carbon::PdfPool` starts `carbon-pdf` helpers, one per physical core by default, each with its own PDFium, and gives each one request at a time. A page's pixels come back through a shared memory region of the helper's (48 MiB, enough for a Letter or A4 page at 600 dpi); a larger page comes down the helper's pipe. PDFium is not thread-safe, so the helpers are how many pages render at once. A PDF that crashes PDFium takes down one helper, which is started again; the page it was on fails with `carbon::Error`, and the calling program carries on. A page is rendered as shown (its `/Rotate` applied, its annotations drawn, on white paper). `carbon-ocr ocr` renders PDF pages at `--dpi`, 200 by default.
 
@@ -78,11 +78,11 @@ A page that passes skips detection and recognition. Its lines end at PDFium's li
 
 ## <img src="assets/chip-03.svg" height="22" alt=""> Orientation and deskew
 
-Each page is resampled once to the detector's scale, its long side 1024 px (`det_long_side`), with the crop rule's antialiased bilinear filter (section 5). Orientation reads a thumbnail of that copy, fitted into 512 × 512 (`orient_side`) at the top left, as an ink map (1 − gray / 255: ink 1, paper 0) with paper around it.
+Each page is resampled once to the detector's scale, its long side 1024 px (`det_long_side`), with the crop rule's antialiased bilinear filter (section 5). Orientation reads a thumbnail of that copy, fitted into 512 × 512 (`orient_side`) at the top left, as an ink map (1 − gray / 255: ink 1, paper 0) with paper around it. The resampling runs on the CPU's vectors (AVX2 or NEON), the scalar code's bytes.
 
 `orient` gives 13 class scores: 12 bins of 30° (bin k: the text turned 30k° clockwise) and one for vertical CJK columns. The engine turns a page only by a quarter turn, for the 90°, 180° and 270° bins, and only when that bin's softmax probability reaches the turn threshold. The threshold is `EngineOptions::turn_probability` when it is set, else the one stored in the set's orientation model (`carbon.orient.turn_probability`, see [MODELS.md](MODELS.md)), else 0.95. Any other answer leaves the page as it is, since a wrong turn loses the whole page. `OcrPage::rotation` records the turn.
 
-Deskew (`carbon/deskew.h`) levels what is left, without a model. On the page at the detector's scale, it finds the ink (Otsu's threshold), samples it to a fixed number of pixels and projects it onto the rows of the page turned by each candidate angle. The sum of the squared row counts is largest when the lines are level, because their ink falls in few rows and the gaps between them are empty. The search takes 0.5° steps within ±5° (`max_skew`), then 0.05° steps around the best. The page is levelled only when the angle is at least 0.2° (`min_skew`) and its score beats the level page's by 5% (`min_skew_gain` 1.05). `OcrPage::skew` records the angle.
+Deskew (`carbon/deskew.h`) levels what is left, without a model. On the page at the detector's scale, it finds the ink (Otsu's threshold), samples it to a fixed number of pixels and projects it onto the rows of the page turned by each candidate angle. The sum of the squared row counts is largest when the lines are level, because their ink falls in few rows and the gaps between them are empty. The search takes 0.5° steps within ±5° (`max_skew`), then 0.05° steps around the best. The page is levelled only when the angle is at least 0.2° (`min_skew`) and its score beats The turn runs in AVX2 or NEON doubles and the quarter turns by tile transposes, each the scalar code's bytes. the level page's by 5% (`min_skew_gain` 1.05). `OcrPage::skew` records the angle.
 
 A page's boxes are in the pixels of the page as turned upright and levelled. `carbon-ocr ocr --as-given` skips both steps, so the boxes are the given page's; the OCRmyPDF plugin uses it, because OCRmyPDF turns and levels pages itself.
 
@@ -167,13 +167,15 @@ ocrmypdf --plugin tools/ocrmypdf/carbon_ocrmypdf.py \
 
 | name | instructions | CPUs |
 |---|---|---|
-| `avx2` | AVX2 and FMA: FP32, and int8 through exact 16-bit products (`vpmaddwd`) | AMD Zen 2 and 3, Intel before Ice Lake |
+| `avx2` | AVX2 and FMA: FP32, int8 through exact 16-bit products (`vpmaddwd`), FP16 widened by F16C (`vcvtph2ps`) | AMD Zen 2 and 3, Intel before Ice Lake |
 | `avx-vnni` | AVX-VNNI: `vpdpbusd` on 256 bits | Intel Alder Lake and later clients, AMD Zen 5 |
 | `avx512` | AVX-512 F, BW, VL, DQ and VNNI: `vpdpbusd` on 512 bits | Intel Ice Lake and later servers, AMD Zen 4 and 5 |
-| `neon` | Armv8-A Advanced SIMD: FP32; int8 by the scalar reference | every Armv8-A |
+| `avx512-fp16` | AVX-512 FP16: FP16 arithmetic (`vfmadd231ph`, 32 halves a vector) | Intel Sapphire Rapids and later servers |
+| `neon` | Armv8-A Advanced SIMD: FP32, FP16 widened (`fcvtl`); int8 by the scalar reference | every Armv8-A |
 | `neon-dot` | the dot product extension (`sdot`) | Armv8.2-A and later: Graviton 2 to 4, Apple M, Neoverse, Cortex-A76 on |
+| `neon-fp16` | dotprod and FP16 arithmetic (`fmla` on 8 halves) | the same CPUs, but a few |
 
-The kernels are an int8 GEMM (uint8 activations with a zero point, int8 weights packed once per instruction set), an FP32 GEMM, a depthwise convolution and CTC's argmax. A convolution reads its input in place, each row of A a list of pieces, one per tap of the kernel, so nothing is copied into columns (no im2col). The output stage runs inside the kernel while the sums are still in L1: scale, bias, a float or uint8 residual, ReLU, then out as float or requantized uint8 (rounded half to even). Every version gives the scalar reference's bits. Integer sums are exact, a float sum is one fused multiply-add after another in the order of k, and the output stage is the same float operations in the same order everywhere, so a page reads the same on Intel, AMD and Arm. Each instruction set's code is compiled with its own flags in its own file, and the rest of the library stays baseline x86-64 or Armv8-A. `CARBON_ISA=<name>` (or `SessionOptions::isa`) picks another set for tests and timing, and `carbon-ocr cpus --gemm` times the GEMM with each one.
+The kernels are an int8 GEMM (uint8 activations with a zero point, int8 weights packed once per instruction set), an FP32 GEMM, an FP16 GEMM and depthwise convolution, a depthwise convolution and CTC's argmax; and the page's own work: the crop rule's resampling (each output's taps as exact 32-bit integer products, the scalar code's bytes), the deskew's turn (bilinear in doubles, each operation rounded as the scalar code's), the quarter turns (tile transposes in registers) and PNG's row filters. A convolution reads its input in place, each row of A a list of pieces, one per tap of the kernel, so nothing is copied into columns (no im2col). The output stage runs inside the kernel while the sums are still in L1: scale, bias, a float or uint8 residual, ReLU, then out as float or requantized uint8 (rounded half to even). Every version gives the scalar reference's bits. Integer sums are exact, a float sum is one fused multiply-add after another in the order of k, and the output stage is the same float operations in the same order everywhere, so a page reads the same on Intel, AMD and Arm. Each instruction set's code is compiled with its own flags in its own file, and the rest of the library stays baseline x86-64 or Armv8-A. `CARBON_ISA=<name>` (or `SessionOptions::isa`) picks another set for tests and timing, and `carbon-ocr cpus --gemm` times the GEMM with each one.
 
 ## <img src="assets/chip-09.svg" height="22" alt=""> Backends and the files they run
 
@@ -181,7 +183,7 @@ Every model runs through `carbon::Session` (`carbon/session.h`), so a step never
 
 | backend | name | runs | where |
 |---|---|---|---|
-| native | `native` | the convolutional networks from their ONNX files, int8 (Q/DQ) or FP32; `order` from `order.native.bin` | every build, on the CPU |
+| native | `native` | the convolutional networks from their ONNX files, int8 (Q/DQ), FP16 or FP32; `order` from `order.native.bin` | every build, on the CPU |
 | ONNX Runtime | `ort` | any ONNX file on the CPU; the engine gives it the FP32 files | builds with ONNX Runtime (1.31.0, pinned) |
 | TensorRT | `trt` | an ONNX file in its own precision: TensorRT 11 builds strongly typed networks, so an FP16 file runs in FP16 and a Q/DQ file in INT8 | builds with CUDA 12.9 or 13.x and TensorRT 11, on an NVIDIA GPU |
 
@@ -194,6 +196,8 @@ Every model runs through `carbon::Session` (`carbon/session.h`), so a step never
 | `orient`, `det`, the recognizer | native on `<m>.int8.onnx` where the set has it; else ONNX Runtime on `<m>.onnx` where it is built in; else native on `<m>.onnx` | native on `<m>.int8.onnx`, else `<m>.onnx` | ONNX Runtime on `<m>.onnx` |
 | `order` | native on `order.native.bin`; else ONNX Runtime on `order.onnx` | the same | ONNX Runtime on `order.onnx` |
 | `det` on idle cores | ONNX Runtime on `det.onnx`, 2, 4 or 6 threads | not used | the same |
+
+**Precision** (`EngineOptions::precision`, `--precision`, `precision=` in Python): `auto` is the table above; `fp32` runs `<m>.onnx`, `fp16` `<m>.fp16.onnx` on the native backend and `int8` `<m>.int8.onnx`, each an error where the set lacks the file. An FP16 file's tensors are float32 at the session: where the CPU has no FP16 arithmetic (AVX2 with F16C, plain NEON) a layer's weights are widened to FP32 once a run and summed as FP32 (the FP32 kernels' bits), so FP16 runs at native FP32's speed with half the weights' memory; with FP16 arithmetic (AVX-512 FP16, Armv8.2 FP16) products are summed in FP16 at most 64 at a time, then in FP32, and the activations stay FP16 between layers. `order` stays FP32.
 
 `EngineOptions::order_model` names another order model: a `.bin` file runs natively, an ONNX file on ONNX Runtime. On one core the native int8 recognizer runs 2.5 times as fast as ONNX Runtime in FP32, and a native FP32 run is slower than ONNX Runtime's, so the int8 files are the CPU's path. ONNX Runtime sessions keep their memory arena on (`SessionOptions::cpu_arena`): a session reuses its runs' activation memory, which grows to the largest batch it has run, a size the width buckets bound.
 
@@ -231,6 +235,7 @@ Every model runs through `carbon::Session` (`carbon/session.h`), so a step never
 |---|---|---|
 | `pool` | one worker per physical core, pinned | `PoolOptions`: `workers` (0: one per physical core, at most a CPU quota), `pin`, `fast` (the workers that count as fast; -1: those on the fastest class of core) |
 | `backend` | none: per model, as in section 9 | one backend for every model: `kNative` or `kOnnxRuntime` |
+| `precision` | `kAuto` | the files the models run: `kAuto` (section 9), `kFp32`, `kFp16` or `kInt8` |
 | `rec` | `"rec-latin"` | the recognizer: `<set>/<rec>.onnx` and `<rec>.vocab.json` |
 | `det_long_side` | 1024 | the page's long side at detection, padded to a multiple of 32 |
 | `second_pass_long_side` | 2048 | the page's long side at most, in the second detection pass |

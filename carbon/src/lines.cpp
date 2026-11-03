@@ -1,5 +1,8 @@
 // The crop rule and CTC greedy decoding on the CPU: the reference the CUDA code
-// matches byte for byte (carbon/lines.h).
+// matches byte for byte (carbon/lines.h).  The resampling's coefficients are
+// computed here, in double precision without contraction; its integer passes run
+// on the CPU's vectors (carbon/src/cpu/kernels.h), the scalar loops kept as the
+// reference they match byte for byte.
 
 #include "carbon/lines.h"
 
@@ -16,6 +19,7 @@
 
 #include "carbon/cpu.h"
 #include "carbon/error.h"
+#include "cpu/kernels.h"
 #include "resample_math.h"
 
 namespace carbon {
@@ -59,15 +63,60 @@ struct Axis {
       first[i] = coefficients(f, in0, i, &k[static_cast<size_t>(i) * taps], &count[i]);
     }
   }
+
+  int most_taps() const {  // the most any sample has, at most `taps`
+    int n = 1;
+    for (int c : count) n = std::max(n, c);
+    return n;
+  }
+
+  // Whether the windows move only forward (both ends nondecreasing), as they do for
+  // any in1 >= in0; a reversed range is left to the scalar reference.
+  bool forward() const {
+    for (size_t i = 1; i < first.size(); ++i) {
+      if (first[i] < first[i - 1] || first[i] + count[i] < first[i - 1] + count[i - 1]) return false;
+    }
+    return true;
+  }
 };
 
-}  // namespace
+// The vector kernels of the two passes (carbon/src/cpu/kernels.h): avx2 for every
+// x86-64 set, neon for Arm; none for the scalar reference.
+struct ResampleKernels {
+  void (*layout)(const int32_t*, const int32_t*, int, int, int, void*) = nullptr;
+  void (*h)(const uint8_t*, int, const int32_t*, const void*, int, int, int, uint8_t*) = nullptr;
+  void (*v)(const uint8_t* const*, const int32_t*, int, int, uint8_t*) = nullptr;
+};
 
-void resample_gray(const GrayView& im, double x0, double y0, double x1, double y1, int ow, int oh,
-                   uint8_t* out, int64_t os) {
-  if (ow <= 0 || oh <= 0) throw Error("resample_gray: empty output");
-  const Axis ax(x0, x1, ow), ay(y0, y1, oh);
-  // The horizontal pass covers the rows the vertical one reads, as in PIL.
+ResampleKernels resample_kernels(cpu::Isa isa) {
+  namespace kd = cpu::detail;
+  switch (isa) {
+#if defined(CARBON_KERNEL_AVX2)
+    case cpu::Isa::kAvx2:
+    case cpu::Isa::kAvxVnni:
+    case cpu::Isa::kAvx512: return {kd::resample_hk_avx2, kd::resample_h_avx2, kd::resample_v_avx2};
+#endif
+#if defined(CARBON_KERNEL_NEON)
+    case cpu::Isa::kNeon:
+    case cpu::Isa::kNeonDot: return {kd::resample_hk_neon, kd::resample_h_neon, kd::resample_v_neon};
+#endif
+    default: return {};
+  }
+}
+
+// Columns [a, b) of an image row `width` wide into dst, paper outside the row (all
+// of it for a null row: outside the image).
+void paper_copy(const uint8_t* row, int width, int a, int b, uint8_t* dst) {
+  int in0 = std::max(a, 0), in1 = std::min(b, width);
+  if (!row || in1 <= in0) in0 = in1 = b;
+  std::memset(dst, 255, static_cast<size_t>(in0 - a));
+  if (in1 > in0) std::memcpy(dst + (in0 - a), row + in0, static_cast<size_t>(in1 - in0));
+  std::memset(dst + (in1 - a), 255, static_cast<size_t>(b - in1));
+}
+
+// The scalar passes, the reference: the horizontal one over every row the vertical
+// one reads, into an 8-bit intermediate, as in PIL.
+void resample_scalar(const GrayView& im, const Axis& ax, const Axis& ay, int ow, int oh, uint8_t* out, int64_t os) {
   const int top = ay.first[0];
   const int rows = ay.first[oh - 1] + ay.count[oh - 1] - top;
   std::vector<uint8_t> tmp(static_cast<size_t>(rows) * ow);
@@ -97,6 +146,94 @@ void resample_gray(const GrayView& im, double x0, double y0, double x1, double y
       for (int i = 0; i < n; ++i) ss += src[static_cast<size_t>(i) * ow + xx] * k[i];
       o[xx] = clip8(ss);
     }
+  }
+}
+
+// The same passes on vectors.  Horizontal: each output sample reads 8 taps a chunk,
+// as many chunks as the widest sample needs (its weights past its own taps are
+// zeros), in groups of 8 samples, the last group padded with copies of the last
+// sample's window.  The groups whose windows lie inside the image read its rows where
+// they are; the groups at the ends, a copy of the columns they read with paper
+// outside the image.  A row wholly outside the image is the same paper row each time,
+// made once.  Vertical: an output row at a time, from the rows of its taps, which
+// the horizontal pass keeps in a ring as tall as the tallest window: the windows only
+// move down, so each row goes through the horizontal pass once, in order.
+void resample_vector(const GrayView& im, const Axis& ax, const Axis& ay, int ow, int oh, uint8_t* out, int64_t os,
+                     const ResampleKernels& kern) {
+  const int chunks = (ax.most_taps() + 7) / 8, reach = 8 * chunks, groups = (ow + 7) / 8;
+  std::vector<int32_t> first(static_cast<size_t>(groups) * 8);
+  for (size_t i = 0; i < first.size(); ++i) first[i] = ax.first[std::min(i, static_cast<size_t>(ow - 1))];
+  std::vector<int32_t> k(first.size() * reach);  // 32 bytes a sample a chunk
+  kern.layout(ax.k.data(), ax.count.data(), ax.taps, ow, chunks, k.data());
+
+  // Groups [0, ga) read columns [span0, left1), groups [gb, groups) columns [right0,
+  // span1); those between, only columns of the image (first is nondecreasing).
+  const int span0 = first.front(), span1 = first.back() + reach;
+  int ga = 0, gb = 0;
+  while (ga < groups && first[8 * ga] < 0) ++ga;
+  for (gb = ga; gb < groups && first[8 * gb + 7] + reach <= im.width;) ++gb;
+  const int left1 = ga > 0 ? first[8 * ga - 1] + reach : span0;
+  const int right0 = gb < groups ? first[8 * gb] : span1;
+  std::vector<uint8_t> edge(static_cast<size_t>(span1 - span0));  // column c at edge[c - span0]
+
+  // The ring's rows, and the paper row after them, `stride` bytes apart: the vertical
+  // kernel reads them to a multiple of 32.
+  const int tall = ay.most_taps(), top = ay.first[0];
+  const size_t stride = static_cast<size_t>((groups * 8 + 31) / 32 * 32);
+  std::vector<uint8_t> ring(static_cast<size_t>(tall + 1) * stride);
+  uint8_t* const paper = ring.data() + static_cast<size_t>(tall) * stride;
+  auto inside = [&](int y) { return y >= 0 && y < im.height; };
+  auto slot = [&](int y) { return inside(y) ? ring.data() + static_cast<size_t>((y - top) % tall) * stride : paper; };
+  auto horizontal = [&](const uint8_t* row, uint8_t* t) {
+    if (!row) {
+      paper_copy(nullptr, 0, span0, span1, edge.data());
+      kern.h(edge.data(), span0, first.data(), k.data(), chunks, 0, groups, t);
+      return;
+    }
+    if (ga > 0) {
+      paper_copy(row, im.width, span0, left1, edge.data());
+      kern.h(edge.data(), span0, first.data(), k.data(), chunks, 0, ga, t);
+    }
+    if (gb > ga) kern.h(row, 0, first.data(), k.data(), chunks, ga, gb, t);
+    if (gb < groups) {
+      paper_copy(row, im.width, right0, span1, edge.data() + (right0 - span0));
+      kern.h(edge.data(), span0, first.data(), k.data(), chunks, gb, groups, t);
+    }
+  };
+
+  std::vector<const uint8_t*> rows(static_cast<size_t>(tall));
+  bool have_paper = false;
+  int next = top;  // the first row not through the horizontal pass yet
+  for (int yy = 0; yy < oh; ++yy) {
+    const int f = ay.first[yy], n = ay.count[yy];
+    for (int y = std::max(next, f); y < f + n; ++y) {
+      if (inside(y)) {
+        horizontal(im.data + y * im.stride, slot(y));
+      } else if (!have_paper) {
+        horizontal(nullptr, paper);
+        have_paper = true;
+      }
+    }
+    next = std::max(next, f + n);
+    for (int i = 0; i < n; ++i) rows[i] = slot(f + i);
+    kern.v(rows.data(), &ay.k[static_cast<size_t>(yy) * ay.taps], n, ow, out + yy * os);
+  }
+}
+
+}  // namespace
+
+void resample_gray(const GrayView& im, double x0, double y0, double x1, double y1, int ow, int oh,
+                   uint8_t* out, int64_t os, cpu::Isa isa) {
+  if (ow <= 0 || oh <= 0) throw Error("resample_gray: empty output");
+  if (!cpu::isa_available(isa)) {
+    throw Error(std::string("resample_gray: ") + cpu::isa_name(isa) + " is not available on this CPU");
+  }
+  const Axis ax(x0, x1, ow), ay(y0, y1, oh);
+  const ResampleKernels kern = resample_kernels(isa);
+  if (kern.h && ax.forward() && ay.forward()) {
+    resample_vector(im, ax, ay, ow, oh, out, os, kern);
+  } else {
+    resample_scalar(im, ax, ay, ow, oh, out, os);
   }
 }
 

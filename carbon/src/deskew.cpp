@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "carbon/cpu.h"
+
 namespace carbon {
 namespace {
 
@@ -108,32 +110,16 @@ Skew find_skew(const GrayView& page, double max_degrees) {
   return out;
 }
 
+// Each pixel of the turned page is where it was turned back clockwise, sampled
+// bilinear (carbon::cpu::rotate_bilinear: vectors where the CPU has them, the same
+// bytes as the scalar reference).
 GrayImage rotate_page(const GrayView& page, double degrees) {
   GrayImage out;
   out.width = page.width;
   out.height = page.height;
   out.pixels.assign(static_cast<size_t>(page.width) * page.height, 255);
   const double a = degrees * kPi / 180.0, s = std::sin(a), c = std::cos(a);
-  const double cx = (page.width - 1) / 2.0, cy = (page.height - 1) / 2.0;
-  for (int y = 0; y < page.height; ++y) {
-    uint8_t* dst = out.pixels.data() + static_cast<int64_t>(y) * page.width;
-    const double dy = y - cy;
-    for (int x = 0; x < page.width; ++x) {
-      // where this pixel of the turned page was: turned back clockwise
-      const double dx = x - cx;
-      const double sx = dx * c - dy * s + cx, sy = dx * s + dy * c + cy;
-      const int x0 = static_cast<int>(std::floor(sx)), y0 = static_cast<int>(std::floor(sy));
-      if (x0 < -1 || y0 < -1 || x0 >= page.width || y0 >= page.height) continue;
-      const double fx = sx - x0, fy = sy - y0;
-      auto at = [&](int xx, int yy) -> double {
-        if (xx < 0 || yy < 0 || xx >= page.width || yy >= page.height) return 255.0;
-        return page.data[yy * page.stride + xx];
-      };
-      const double v = (at(x0, y0) * (1 - fx) + at(x0 + 1, y0) * fx) * (1 - fy) +
-                       (at(x0, y0 + 1) * (1 - fx) + at(x0 + 1, y0 + 1) * fx) * fy;
-      dst[x] = static_cast<uint8_t>(std::lround(std::clamp(v, 0.0, 255.0)));
-    }
-  }
+  cpu::rotate_bilinear(page.data, page.width, page.height, page.stride, s, c, out.pixels.data());
   return out;
 }
 

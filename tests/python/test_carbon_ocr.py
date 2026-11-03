@@ -238,6 +238,25 @@ def test_engine_reads_a_page():
     assert e.ocr([page], html=True)[0]["html"] == "<p>aaa</p>\n<p>aaaaa</p>\n<p>aa</p>\n"  # no blocks: by their gaps
 
 
+def test_engine_precision_picks_the_files():
+    # carbon::choose_set_model by precision; the fake set has its models in FP32 alone (its orient.fp16.onnx and
+    # det.fp16.onnx are the GPU's, with Casts the native backend does not run)
+    page = carbon_ocr.load_image(str(DATA / "fake-set" / "page.png"))
+    for precision in ("auto", "fp32"):
+        e = carbon_ocr.Engine(str(DATA / "fake-set"), workers=1, precision=precision)
+        assert [l["text"] for l in e.ocr([page])[0]["lines"]] == ["aaa", "aaaaa", "aa"]
+    with pytest.raises(RuntimeError, match="no int8 file for orient"):
+        carbon_ocr.Engine(str(DATA / "fake-set"), workers=1, precision="int8")
+    with pytest.raises(RuntimeError, match="orient.fp16.onnx"):
+        carbon_ocr.Engine(str(DATA / "fake-set"), workers=1, precision="fp16")
+    with pytest.raises(RuntimeError, match="precision"):
+        carbon_ocr.Engine(str(DATA / "fake-set"), precision="half")
+    with pytest.raises(RuntimeError, match="no int8 file"):
+        carbon_ocr.Pipeline(str(DATA / "fake-set"), device="cpu", threads=1, model_threads=1, precision="int8")
+    p = carbon_ocr.Pipeline(str(DATA / "fake-set"), device="cpu", threads=1, model_threads=1, precision="fp32")
+    assert p.ocr([page])[0]["text"] == "aaa\naaaaa\naa\n"
+
+
 def test_the_batched_pipeline_reads_as_the_engine_does():
     # carbon::Pipeline on the CPU: each model run on a batch from the pages in flight, page for page the engine's
     page = carbon_ocr.load_image(str(DATA / "fake-set" / "page.png"))
