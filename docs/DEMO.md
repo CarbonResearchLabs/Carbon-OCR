@@ -194,10 +194,10 @@ Seven of the eleven can be fixed in the engine, with no new training: the block 
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/fig-bench-dark.svg">
-  <img src="assets/fig-bench-light.svg" alt="OmniParseBench, all 2,937 pages: fullerene-3M scores a headline of 43.5 against Tesseract 5.5's 5.9; text 26.2 against 17.8, tables 23.6 and layout 80.6 against 0." width="100%">
+  <img src="assets/fig-bench-light.svg" alt="OmniParseBench, all 2,937 pages: fullerene-3M scores a headline of 43.5 against Tesseract 5.5's 5.9; text 26.2 against 17.8, tables 23.5 and layout 80.6 against 0." width="100%">
 </picture>
 
-Three invented pages show what the engine does; they do not measure how well. That is OmniParseBench, read end to end on all its 2,937 pages and graded by its own grader: `fullerene-3M` scores a headline of 43.5 against Tesseract 5.5's 5.9 (text 26.2 against 17.8; tables 23.6 and layout 80.6, which Tesseract, writing text alone, scores 0), and reads 3.79 pages a second on one core against 0.76 ([the model card](https://huggingface.co/CarbonResearchLabs/fullerene-3M) has every score). Tables are where it leaves the most points, which is what these pages show: tables found and their cells placed, but with rules in their cells, captions as rows, and their place in the page's order.
+Three invented pages show what the engine does; they do not measure how well. That is OmniParseBench, read end to end on all its 2,937 pages and graded by its own grader: `fullerene-3M` scores a headline of 43.5 against Tesseract 5.5's 5.9 (text 26.2 against 17.8; tables 23.5 and layout 80.6, which Tesseract, writing text alone, scores 0), and reads 4.06 pages a second on one core against 0.76 ([the model card](https://huggingface.co/CarbonResearchLabs/fullerene-3M) has every score). Tables are where it leaves the most points, which is what these pages show: tables found and their cells placed, but with rules in their cells, captions as rows, and their place in the page's order.
 
 ## <img src="assets/chip-10.svg" height="22" alt=""> Run it yourself
 

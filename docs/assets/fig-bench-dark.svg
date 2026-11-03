@@ -4,8 +4,8 @@
 <rect x="149.6" y="6.0" width="10.0" height="9.0" rx="2" fill="#d95926"/>
 <text x="164.6" y="14.0" font-size="8" fill="#a4a4a4">Tesseract 5.5</text>
 <text x="62.0" y="40.0" font-size="8.2" text-anchor="end" fill="#a4a4a4">headline</text>
-<path d="M70.0 30.0 H314.2 Q316.2 30.0 316.2 32.0 V36.5 Q316.2 38.5 314.2 38.5 H70.0 Z" fill="#3987e5"/>
-<text x="320.2" y="37.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">43.5</text>
+<path d="M70.0 30.0 H314.0 Q316.0 30.0 316.0 32.0 V36.5 Q316.0 38.5 314.0 38.5 H70.0 Z" fill="#3987e5"/>
+<text x="320.0" y="37.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">43.5</text>
 <path d="M70.0 40.0 H101.7 Q103.7 40.0 103.7 42.0 V46.5 Q103.7 48.5 101.7 48.5 H70.0 Z" fill="#d95926"/>
 <text x="107.7" y="47.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">5.9</text>
 <text x="62.0" y="64.0" font-size="8.2" text-anchor="end" fill="#a4a4a4">text</text>
@@ -14,8 +14,8 @@
 <path d="M70.0 64.0 H169.0 Q171.0 64.0 171.0 66.0 V70.5 Q171.0 72.5 169.0 72.5 H70.0 Z" fill="#d95926"/>
 <text x="175.0" y="71.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">17.8</text>
 <text x="62.0" y="88.0" font-size="8.2" text-anchor="end" fill="#a4a4a4">tables</text>
-<path d="M70.0 78.0 H201.7 Q203.7 78.0 203.7 80.0 V84.5 Q203.7 86.5 201.7 86.5 H70.0 Z" fill="#3987e5"/>
-<text x="207.7" y="85.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">23.6</text>
+<path d="M70.0 78.0 H201.3 Q203.3 78.0 203.3 80.0 V84.5 Q203.3 86.5 201.3 86.5 H70.0 Z" fill="#3987e5"/>
+<text x="207.3" y="85.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">23.5</text>
 <path d="M70.0 88.0 H70.8 Q71.5 88.0 71.5 88.8 V95.8 Q71.5 96.5 70.8 96.5 H70.0 Z" fill="#d95926"/>
 <text x="75.5" y="95.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">0.0</text>
 <text x="62.0" y="112.0" font-size="8.2" text-anchor="end" fill="#a4a4a4">layout</text>

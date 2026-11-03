@@ -11,8 +11,8 @@
 <text x="207.6" y="47.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.17</text>
 <text x="110.0" y="64.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">table cells</text>
 <text x="110.0" y="74.0" font-family="PlexMono" font-size="6.8" text-anchor="end" fill="#6b6b6b">5,386 tests</text>
-<path d="M118.0 56.0 H238.3 Q240.3 56.0 240.3 58.0 V62.5 Q240.3 64.5 238.3 64.5 H118.0 Z" fill="#2a78d6"/>
-<text x="244.3" y="63.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.24</text>
+<path d="M118.0 56.0 H238.0 Q240.0 56.0 240.0 58.0 V62.5 Q240.0 64.5 238.0 64.5 H118.0 Z" fill="#2a78d6"/>
+<text x="244.0" y="63.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.24</text>
 <path d="M118.0 66.0 H118.8 Q119.5 66.0 119.5 66.8 V73.8 Q119.5 74.5 118.8 74.5 H118.0 Z" fill="#eb6834"/>
 <text x="123.5" y="73.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.00</text>
 <text x="110.0" y="90.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">layout labels</text>

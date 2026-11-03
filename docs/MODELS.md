@@ -61,11 +61,11 @@ Recognition is 77% of a Latin page and 90% of a CJK page, which is why the recog
 
 The engine does not run all of this yet: it reads every line of a page with one recognizer (`rec-latin` by default), so `script` and the routing it drives are still to come ([ENGINE.md](ENGINE.md), section 1).
 
-**Trained, end to end.** The trained `fullerene-3M` ([on Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M)), read by the engine on all 2,937 pages of OmniParseBench and graded by the benchmark's own grader, against Tesseract 5.5 with its defaults, on the same laptop (3 November 2026): a headline of **43.5** against 5.9 (text 26.2 against 17.8; tables 23.6 and layout 80.6, which Tesseract, writing text alone, scores 0), and **3.79 pages a second on one core** against 0.76 (a median page of 223 ms against 947), 12.3 against 3.0 in six processes. Its FP16 files on the CPU score the same. Each model alone, on held-out pages and lines: `orient` keeps every upright page and turns 97.2% of the rotated ones right at a threshold of 0.65; `det` 0.9936 line F1; `rec-latin` 0.98% CER on held-out print; `order` a Kendall's tau of 1.0 and block F1 0.9916.
+**Trained, end to end.** The trained `fullerene-3M` ([on Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M)), read by the engine on all 2,937 pages of OmniParseBench and graded by the benchmark's own grader, against Tesseract 5.5 with its defaults, on the same laptop (3 November 2026): a headline of **43.5** against 5.9 (text 26.2 against 17.8; tables 23.5 and layout 80.6, which Tesseract, writing text alone, scores 0), and **4.06 pages a second on one core** against 0.76 (a median page of 208 ms against 976), 13.6 against 3.2 in six processes. One process of 10 workers with 20 pages in flight reads **15.0 pages a second** over the whole set; one page at a time on 6 workers, the median page takes 79 ms. Its FP16 files on the CPU score 43.6. Each model alone, on held-out pages and lines: `orient` keeps every upright page and turns 97.2% of the rotated ones right at a threshold of 0.65; `det` 0.9936 line F1; `rec-latin` 0.98% CER on held-out print; `order` a Kendall's tau of 1.0 and block F1 0.9916.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/fig-bench-dark.svg">
-  <img src="assets/fig-bench-light.svg" alt="OmniParseBench, all 2,937 pages: fullerene-3M scores a headline of 43.5 against Tesseract 5.5's 5.9; text 26.2 against 17.8, tables 23.6 and layout 80.6 against 0." width="100%">
+  <img src="assets/fig-bench-light.svg" alt="OmniParseBench, all 2,937 pages: fullerene-3M scores a headline of 43.5 against Tesseract 5.5's 5.9; text 26.2 against 17.8, tables 23.5 and layout 80.6 against 0." width="100%">
 </picture>
 
 <picture>

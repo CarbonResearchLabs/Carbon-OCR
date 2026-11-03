@@ -5,8 +5,8 @@
 <text x="212.6" y="14.0" font-size="8" fill="#a4a4a4">Tesseract 5.5</text>
 <text x="110.0" y="38.0" font-size="8.2" text-anchor="end" fill="#a4a4a4">tables</text>
 <text x="110.0" y="48.0" font-family="PlexMono" font-size="6.8" text-anchor="end" fill="#8c8c8c">5,427 tests</text>
-<path d="M118.0 30.0 H267.9 Q269.9 30.0 269.9 32.0 V36.5 Q269.9 38.5 267.9 38.5 H118.0 Z" fill="#3987e5"/>
-<text x="273.9" y="37.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">0.29</text>
+<path d="M118.0 30.0 H267.5 Q269.5 30.0 269.5 32.0 V36.5 Q269.5 38.5 267.5 38.5 H118.0 Z" fill="#3987e5"/>
+<text x="273.5" y="37.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">0.29</text>
 <path d="M118.0 40.0 H124.4 Q126.4 40.0 126.4 42.0 V46.5 Q126.4 48.5 124.4 48.5 H118.0 Z" fill="#d95926"/>
 <text x="130.4" y="47.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">0.02</text>
 <text x="110.0" y="64.0" font-size="8.2" text-anchor="end" fill="#a4a4a4">arXiv math</text>

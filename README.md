@@ -70,16 +70,16 @@ A Latin page is 10.8 GMAC, and 77% of that is recognition. That is why the recog
 
 ## <img src="docs/assets/chip-04.svg" height="22" alt=""> Measured so far
 
-The trained `fullerene-3M` ([on Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M)), read by the engine on all 2,937 pages of OmniParseBench and graded by the benchmark's own grader, against Tesseract 5.5 with its defaults, on the same laptop (3 November 2026): a headline of **43.5** against 5.9 (text 26.2 against 17.8; tables 23.6 and layout 80.6, which Tesseract, writing text alone, scores 0), and **3.79 pages a second on one core** against 0.76 (a median page of 223 ms against 947), 12.3 against 3.0 in six processes. Its FP16 files on the CPU score the same.
+The trained `fullerene-3M` ([on Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M)), read by the engine on all 2,937 pages of OmniParseBench and graded by the benchmark's own grader, against Tesseract 5.5 with its defaults, on the same laptop (3 November 2026): a headline of **43.5** against 5.9 (text 26.2 against 17.8; tables 23.5 and layout 80.6, which Tesseract, writing text alone, scores 0), and **4.06 pages a second on one core** against 0.76 (a median page of 208 ms against 976), 13.6 against 3.2 in six processes. One process of 10 workers with 20 pages in flight reads **15.0 pages a second** over the whole set; one page at a time on 6 workers, the median page takes 79 ms. Its FP16 files on the CPU score 43.6.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/fig-bench-dark.svg">
-  <img src="docs/assets/fig-bench-light.svg" alt="OmniParseBench, all 2,937 pages: fullerene-3M scores a headline of 43.5 against Tesseract 5.5's 5.9; text 26.2 against 17.8, tables 23.6 and layout 80.6 against 0." width="100%">
+  <img src="docs/assets/fig-bench-light.svg" alt="OmniParseBench, all 2,937 pages: fullerene-3M scores a headline of 43.5 against Tesseract 5.5's 5.9; text 26.2 against 17.8, tables 23.5 and layout 80.6 against 0." width="100%">
 </picture>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/fig-bench-speed-dark.svg">
-  <img src="docs/assets/fig-bench-speed-light.svg" alt="Pages a second: 3.79 against Tesseract's 0.76 on one core, 12.26 against 2.97 in six processes." width="100%">
+  <img src="docs/assets/fig-bench-speed-light.svg" alt="Pages a second: 4.06 against Tesseract's 0.76 on one core, 13.54 against 2.97 in six processes." width="100%">
 </picture>
 
 **Pages, read** (3 November): `fullerene-3M` on three invented pages, a report page, a page of two tables and a rough photo of the first, every picture drawn from the engine's own output. On the report page it found every line, read 253 of 255 words right, ordered 18 blocks and wrote HTML, in 152 ms on one core; it turned the photo 180° and levelled it; it put all 73 table cells in their row and column. Every fault found is listed with where it comes from ([docs/DEMO.md](docs/DEMO.md), [PDF](docs/Carbon-OCR-Demo.pdf), [dark](docs/Carbon-OCR-Demo-Dark.pdf); the scripts in [docs/demo/](docs/demo/)).
