@@ -170,7 +170,7 @@ Two of them are also typeset as PDFs, each in a light and a dark edition:
 
 ## <img src="docs/assets/chip-09.svg" height="22" alt=""> License
 
-The code is licensed under [Apache 2.0](LICENSE). The Fullerene weights, once released, are licensed under [OpenRAIL-AMS](LICENSE-WEIGHTS.md).
+The code is licensed under [Apache 2.0](LICENSE). The Fullerene weights are licensed under the [Carbon-OCR OpenRAIL-AMS license](LICENSE-WEIGHTS.md): royalty-free use, modification and redistribution, under the use restrictions of its Attachment A, which every derivative and redistribution carries. The trained set is on Hugging Face: [CarbonResearchLabs/fullerene-3M](https://huggingface.co/CarbonResearchLabs/fullerene-3M).
 
 ## <img src="docs/assets/chip-10.svg" height="22" alt=""> Citation and credits
 

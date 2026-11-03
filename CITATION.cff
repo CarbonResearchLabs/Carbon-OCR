@@ -24,4 +24,5 @@ references:
         given-names: Karan
         affiliation: Carbon Research Labs
     url: "https://huggingface.co/CarbonResearchLabs/fullerene-3M"
+    license-url: "https://github.com/karanvora2599/Carbon-OCR/blob/main/LICENSE-WEIGHTS.md"
     date-released: 2026-11-03
