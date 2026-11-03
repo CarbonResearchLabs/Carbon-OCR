@@ -37,7 +37,7 @@ This document follows a page through the engine, step by step, then covers how t
 | recognize | the recognizer gives class scores every 4 px; greedy CTC decoding gives the text, each character's position and probability | `lines.h` |
 | split | lines split at wide gaps: column gutters, a table row's cells | `engine.h` |
 | order | the order model's reading order, labeled blocks and table cells, or the XY-cut's order | `order.h` |
-| output | text, JSON, hOCR, ALTO, PAGE XML, markdown or a searchable PDF | `output.h` |
+| output | text, JSON, hOCR, ALTO, PAGE XML, markdown, HTML or a searchable PDF | `output.h` |
 
 Two classes run these steps. `carbon::Engine` (`carbon/engine.h`) reads a list of pages on the CPU, in parallel. `carbon::Pipeline` (`carbon/pipeline.h`) reads a stream of pages with every model batched across the pages in flight, on the CPU or a GPU. Both use the same code for every step, and on the CPU a page comes out of the pipeline exactly as it comes out of the engine. `carbon/carbon.h` includes the whole public API.
 
@@ -141,6 +141,7 @@ Each page comes out as a `carbon::OcrPage`: its size, the `rotation` and `skew` 
 | ALTO | `alto` | ALTO XML 4.4: `Page`, `PrintSpace`, `TextBlock` (its label a `LayoutTag`), `TextLine`, `String` (with `WC`) and `SP` |
 | PAGE XML | `page` | PAGE XML (2019-07-15), one file a page in `--out-dir`: `TextRegion` (its type from the label), `TextLine`, `Word`, each with `Coords` and `TextEquiv` |
 | markdown | `markdown` | headings, paragraphs, lists, tables as HTML from their cells, captions in italics; running headers and footers left out; pages apart by a rule |
+| HTML | `html` | an HTML5 document, a `<section class="page">` per page: headings `<h2>`; paragraphs `<p>`, a block's lines joined and a word broken by a hyphen at a line's end joined again; lists `<ul>` and `<ol start>`; tables `<table>` from their cells; captions in `<figure><figcaption>`; running headers and footers `<header>` and `<footer>`, kept; footnotes, formulas and forms in elements of their own |
 | searchable PDF | `pdf` | each page's image (8-bit gray) with its words over it as invisible text, each stretched to its box, in a font with no glyphs and a ToUnicode map; `--text-only` writes the text alone |
 
 A searchable PDF needs `--output FILE`. Its pages are a PDF's at `--dpi` and an image's at `--image-dpi` (300). `--text-out FILE` writes the plain text beside any format.

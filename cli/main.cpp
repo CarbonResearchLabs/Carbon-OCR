@@ -3,7 +3,7 @@
 //
 //   carbon-ocr ocr IMAGE|PDF... --set DIR [--rec rec-latin] [--backend ort|native]
 //                           [--dpi 200] [--text-layer auto|off] [--hybrid auto|off] [--second-pass auto|off]
-//                           [--format text|json|hocr|alto|page|markdown|pdf] [--out-dir DIR]
+//                           [--format text|json|hocr|alto|page|markdown|html|pdf] [--out-dir DIR]
 //                           [--output FILE] [--text-out FILE] [--text-only] [--image-dpi 300] [--as-given]
 //                           [--workers N] [--no-pin] [--device cpu|cuda] [--batch 8] [--in-flight N]
 //                           [--engine-cache DIR]
@@ -40,7 +40,7 @@
 // its int8 file (<model>.int8.onnx), else on ONNX Runtime (carbon::open_set_model);
 // --backend runs every model on one (order stays on ONNX Runtime).
 //
-// ocr writes text, JSON, hOCR, ALTO XML, markdown, a searchable PDF (the pages'
+// ocr writes text, JSON, hOCR, ALTO XML, markdown, HTML, a searchable PDF (the pages'
 // images under their words, --output FILE; carbon/output.h; --text-only: the
 // words alone, an image's page at --image-dpi), or PAGE XML, a file a page in
 // --out-dir; --text-out FILE writes the text beside any of them.  --as-given
@@ -155,7 +155,7 @@ struct Args {
                "usage: carbon-ocr ocr IMAGE|PDF... --set DIR [--rec NAME] [--workers N]\n"
                "                        [--no-pin] [--backend ort|native] [--dpi N] [--text-layer auto|off]\n"
                "                        [--hybrid auto|off] [--second-pass auto|off]\n"
-               "                        [--format text|json|hocr|alto|page|markdown|pdf] [--out-dir DIR]\n"
+               "                        [--format text|json|hocr|alto|page|markdown|html|pdf] [--out-dir DIR]\n"
                "                        [--output FILE] [--text-out FILE] [--text-only] [--image-dpi N]\n"
                "                        [--as-given] [--device cpu|cuda] [--batch N] [--in-flight N]\n"
                "                        [--engine-cache DIR]\n"
@@ -297,8 +297,8 @@ Args parse(int argc, char** argv) {
     } else if (arg == "--format") {
       a.format = value();
       if (a.format != "text" && a.format != "json" && a.format != "hocr" && a.format != "alto" &&
-          a.format != "page" && a.format != "markdown" && a.format != "pdf") {
-        usage("--format takes text, json, hocr, alto, page, markdown or pdf");
+          a.format != "page" && a.format != "markdown" && a.format != "html" && a.format != "pdf") {
+        usage("--format takes text, json, hocr, alto, page, markdown, html or pdf");
       }
     } else if (arg == "--output") {
       a.output = value();
@@ -1172,7 +1172,8 @@ int ocr(const Args& a) {
   // Each page's image, as the formats name it: its file, a PDF's page as file#page=N.
   std::vector<std::string> names;
   for (const auto& [file, number] : sources) names.push_back(number ? file + "#page=" + std::to_string(number) : file);
-  if (a.format == "hocr" || a.format == "alto" || a.format == "markdown" || a.format == "pdf") {
+  if (a.format == "hocr" || a.format == "alto" || a.format == "markdown" || a.format == "html" ||
+      a.format == "pdf") {
     std::string out;
     if (a.format == "pdf") {  // each page's image at the dpi it was read at (a PDF's --dpi; an image's 300)
       std::vector<carbon::GrayView> views_all;
@@ -1181,6 +1182,7 @@ int ocr(const Args& a) {
     } else {
       out = a.format == "hocr" ? carbon::to_hocr(pages, names)
             : a.format == "alto" ? carbon::to_alto(pages, names)
+            : a.format == "html" ? carbon::to_html(pages)
                                  : carbon::to_markdown(pages);
     }
     if (a.output.empty()) {

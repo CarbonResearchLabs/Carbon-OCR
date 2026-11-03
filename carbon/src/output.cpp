@@ -1,11 +1,13 @@
-// The engine's pages as hOCR, ALTO, PAGE XML and markdown (carbon/output.h).
+// The engine's pages as hOCR, ALTO, PAGE XML, markdown and HTML (carbon/output.h).
 
 #include "carbon/output.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <optional>
 #include <string>
@@ -389,7 +391,162 @@ std::string md_block(const OcrPage& page, const Region& r) {
   return out;
 }
 
+// ------------------------------------------------------------------ HTML
+
+// Whether a UTF-8 string starts with a lowercase letter: ASCII, or a Latin-1
+// Supplement or Latin Extended-A lowercase (the pairs alternate there), or Greek
+// and Cyrillic lowercase.
+bool starts_lowercase(const std::string& t) {
+  if (t.empty()) return false;
+  const unsigned char c0 = static_cast<unsigned char>(t[0]);
+  if (c0 >= 'a' && c0 <= 'z') return true;
+  if (c0 < 0xC0 || t.size() < 2) return false;
+  const unsigned cp = (c0 & 0x1Fu) << 6 | (static_cast<unsigned char>(t[1]) & 0x3Fu);
+  if (cp >= 0xDF && cp <= 0xFF) return cp != 0xF7;   // ß..ÿ, not ÷
+  if (cp >= 0x100 && cp <= 0x17F) return cp % 2 == 1; // Latin Extended-A
+  return (cp >= 0x3AC && cp <= 0x3CE) || (cp >= 0x430 && cp <= 0x45F);  // Greek, Cyrillic
+}
+
+// A block's lines as one paragraph's text: joined by spaces, and a word that a
+// hyphen broke at a line's end (a letter, then "-", then a lowercase letter on the
+// next line) joined again, its hyphen dropped.
+std::string paragraph(const OcrPage& page, const std::vector<int>& lines) {
+  std::string out;
+  for (int i : lines) {
+    const std::string& t = page.lines[static_cast<size_t>(i)].text;
+    if (t.empty()) continue;
+    const size_t n = out.size();
+    const bool broken = n >= 2 && out[n - 1] == '-' && std::isalpha(static_cast<unsigned char>(out[n - 2])) &&
+                        starts_lowercase(t);
+    if (broken) {
+      out.pop_back();
+    } else if (n) {
+      out += ' ';
+    }
+    out += t;
+  }
+  return out;
+}
+
+// A list block as HTML: runs of numbered items an <ol> (from the first's number,
+// the numbers dropped from the text, as a browser draws them back), the rest a
+// <ul>, their bullets dropped; a line without a marker carries on the item before.
+std::string html_list(const OcrPage& page, const std::vector<int>& lines) {
+  struct Item {
+    bool ordered;
+    int number;
+    std::string text;
+  };
+  std::vector<Item> items;
+  for (int i : lines) {
+    const std::string& t = page.lines[static_cast<size_t>(i)].text;
+    if (const auto b = bulleted(t)) {
+      items.push_back({false, 0, *b});
+    } else if (numbered(t)) {
+      const size_t dot = t.find_first_of(".)");
+      items.push_back({true, std::atoi(t.substr(0, dot).c_str()), t.substr(dot + 2)});
+    } else if (!items.empty()) {
+      std::string& prev = items.back().text;
+      const bool broken = prev.size() >= 2 && prev.back() == '-' &&
+                          std::isalpha(static_cast<unsigned char>(prev[prev.size() - 2])) && starts_lowercase(t);
+      if (broken) prev.pop_back();
+      prev += (broken ? "" : " ") + t;
+    } else {
+      items.push_back({false, 0, t});
+    }
+  }
+  std::string out;
+  for (size_t k = 0; k < items.size();) {
+    const bool ordered = items[k].ordered;
+    out += ordered ? (items[k].number == 1 ? "<ol>" : "<ol start=\"" + std::to_string(items[k].number) + "\">")
+                   : "<ul>";
+    for (; k < items.size() && items[k].ordered == ordered; ++k) out += "<li>" + html(items[k].text) + "</li>";
+    out += ordered ? "</ol>\n" : "</ul>\n";
+  }
+  return out;
+}
+
+// A block as HTML, by its label.
+std::string html_block(const OcrPage& page, const Region& r) {
+  auto text = [&](int i) { return html(page.lines[static_cast<size_t>(i)].text); };
+  auto each = [&](const char* tag) {
+    std::string out;
+    for (int i : r.lines) out += std::string("<") + tag + ">" + text(i) + "</" + tag + ">";
+    return out;
+  };
+  const std::string para = html(paragraph(page, r.lines));
+  if (r.label == "Section-Header") return "<h2>" + para + "</h2>\n";
+  if (r.label == "Page-Header") return "<header>" + each("p") + "</header>\n";
+  if (r.label == "Page-Footer") return "<footer>" + each("p") + "</footer>\n";
+  if (r.label == "Caption") return "<figure><figcaption>" + para + "</figcaption></figure>\n";
+  if (r.label == "Footnote") return "<aside class=\"footnote\"><p>" + para + "</p></aside>\n";
+  if (r.label == "Formula") return "<p class=\"formula\">" + para + "</p>\n";
+  if (r.label == "List-Group") return html_list(page, r.lines);
+  if (r.label == "Table-Of-Contents") return "<nav><ul>" + each("li") + "</ul></nav>\n";
+  if (r.label == "Form") return "<div class=\"form\">" + each("p") + "</div>\n";
+  if (r.label == "Picture") return "<figure>" + each("p") + "</figure>\n";
+  if (r.label == "Table" && r.block && !r.block->cells.empty()) {
+    int rows = 0, cols = 0;
+    for (const OcrCell& c : r.block->cells) {
+      rows = std::max(rows, c.row + 1);
+      cols = std::max(cols, c.col + 1);
+    }
+    std::vector<std::vector<std::vector<int>>> grid(static_cast<size_t>(rows),
+                                                    std::vector<std::vector<int>>(static_cast<size_t>(cols)));
+    for (const OcrCell& c : r.block->cells) {
+      auto& cell = grid[static_cast<size_t>(c.row)][static_cast<size_t>(c.col)];
+      cell.insert(cell.end(), c.lines.begin(), c.lines.end());
+    }
+    std::string out = "<table>\n";
+    for (const auto& row : grid) {
+      out += "<tr>";
+      for (const auto& cell : row) out += "<td>" + html(paragraph(page, cell)) + "</td>";
+      out += "</tr>\n";
+    }
+    return out + "</table>\n";
+  }
+  if (r.label == "Table") return "<div class=\"table\">" + each("p") + "</div>\n";  // no cells found
+  return "<p>" + para + "</p>\n";
+}
+
 }  // namespace
+
+std::string to_html_body(const OcrPage& page) {
+  std::string s;
+  if (!page.blocks.empty()) {
+    for (const Region& r : regions(page)) s += html_block(page, r);
+    return s;
+  }
+  // No blocks: a paragraph where the gap between lines is wider than the median line.
+  std::vector<double> heights;
+  for (const OcrLine& l : page.lines) heights.push_back(l.box.y1 - l.box.y0);
+  std::nth_element(heights.begin(), heights.begin() + heights.size() / 2, heights.end());
+  const double h = heights.empty() ? 0 : heights[heights.size() / 2];
+  std::vector<int> run;
+  for (size_t i = 0; i < page.lines.size(); ++i) {
+    if (i) {
+      const LineBox& a = page.lines[i - 1].box;
+      const LineBox& b = page.lines[i].box;
+      if (b.y0 - a.y1 > h || b.y1 < a.y0) {
+        s += "<p>" + html(paragraph(page, run)) + "</p>\n";
+        run.clear();
+      }
+    }
+    run.push_back(static_cast<int>(i));
+  }
+  if (!run.empty()) s += "<p>" + html(paragraph(page, run)) + "</p>\n";
+  return s;
+}
+
+std::string to_html(std::span<const OcrPage> pages) {
+  std::string s = "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"generator\" content=\"" +
+                  std::string("Carbon-OCR ") + std::string(kVersion) + "\">\n<title>Carbon-OCR</title>\n</head>\n<body>\n";
+  for (size_t p = 0; p < pages.size(); ++p) {
+    s += "<section class=\"page\" id=\"page-" + std::to_string(p + 1) + "\">\n" + to_html_body(pages[p]) +
+         "</section>\n";
+  }
+  return s + "</body>\n</html>\n";
+}
 
 std::string to_markdown(std::span<const OcrPage> pages) {
   std::string s;

@@ -26,6 +26,7 @@
 
 #include "carbon/detect.h"
 #include "carbon/engine.h"
+#include "carbon/output.h"
 #include "carbon/error.h"
 #include "carbon/image.h"
 #include "carbon/lines.h"
@@ -199,11 +200,12 @@ nb::list infos(const std::vector<carbon::TensorInfo>& v) {
 
 // ---------------------------------------------------------------- pages
 
-nb::dict page_dict(const carbon::OcrPage& p) {
+nb::dict page_dict(const carbon::OcrPage& p, bool html = false) {
   nb::dict d;
   d["width"] = p.width;
   d["height"] = p.height;
   d["rotation"] = p.rotation;
+  d["skew"] = p.skew;
   nb::list lines;
   for (const auto& l : p.lines) {
     nb::dict ld;
@@ -240,6 +242,7 @@ nb::dict page_dict(const carbon::OcrPage& p) {
   ms["total"] = p.ms.total;
   d["ms"] = ms;
   d["text"] = p.text();
+  if (html) d["html"] = carbon::to_html_body(p);
   return d;
 }
 
@@ -314,7 +317,7 @@ NB_MODULE(carbon_ocr, m) {
       .def_prop_ro("workers", &carbon::Engine::workers)
       .def(
           "ocr",
-          [](carbon::Engine& e, std::vector<Gray> pages) {
+          [](carbon::Engine& e, std::vector<Gray> pages, bool html) {
             std::vector<carbon::GrayView> views;
             for (const Gray& g : pages) views.push_back(view(g));
             std::vector<carbon::OcrPage> out;
@@ -323,14 +326,15 @@ NB_MODULE(carbon_ocr, m) {
               out = e.ocr(views);
             }
             nb::list result;
-            for (const auto& p : out) result.append(page_dict(p));
+            for (const auto& p : out) result.append(page_dict(p, html));
             return result;
           },
-          "pages"_a,
+          "pages"_a, "html"_a = false,
           "Reads grayscale pages (uint8 [h, w], paper 255) in parallel; for each a dict: width, height, rotation, "
-          "lines (box, text, confidence, det_score) in reading order, pictures, order (\"model\" or \"xy-cut\"), "
-          "blocks (label, confidence, lines, cells), second_pass (detected again at a larger scale: tiny text), "
-          "ms (per stage), text.");
+          "skew, lines (box, text, confidence, det_score) in reading order, pictures, order (\"model\" or "
+          "\"xy-cut\"), blocks (label, confidence, lines, cells), second_pass (detected again at a larger scale: tiny "
+          "text), ms (per stage), text; with html, the page as carbon-ocr's --format html writes it, its blocks as "
+          "headings, paragraphs, lists and tables (carbon/output.h).");
 
   nb::class_<carbon::Pipeline>(m, "Pipeline",
                                "The batched OCR pipeline (carbon::Pipeline, carbon/pipeline.h): every model run on "
@@ -366,7 +370,7 @@ NB_MODULE(carbon_ocr, m) {
                    [](const carbon::Pipeline& p) { return p.device() == carbon::Device::kCuda ? "cuda" : "cpu"; })
       .def(
           "ocr",
-          [](carbon::Pipeline& p, std::vector<Gray> pages) {
+          [](carbon::Pipeline& p, std::vector<Gray> pages, bool html) {
             std::vector<carbon::GrayView> views;
             for (const Gray& g : pages) views.push_back(view(g));
             std::vector<carbon::OcrPage> out;
@@ -375,10 +379,11 @@ NB_MODULE(carbon_ocr, m) {
               out = p.ocr(views);
             }
             nb::list result;
-            for (const auto& page : out) result.append(page_dict(page));
+            for (const auto& page : out) result.append(page_dict(page, html));
             return result;
           },
-          "pages"_a, "Reads grayscale pages (uint8 [h, w], paper 255), each a dict as Engine.ocr gives it, in order.")
+          "pages"_a, "html"_a = false,
+          "Reads grayscale pages (uint8 [h, w], paper 255), each a dict as Engine.ocr gives it, in order.")
       .def_prop_ro("stats", [](const carbon::Pipeline& p) {
         const carbon::PipelineStats s = p.stats();
         nb::dict d;

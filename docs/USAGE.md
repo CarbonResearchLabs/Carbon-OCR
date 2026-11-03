@@ -30,7 +30,7 @@ By default the pages run in parallel on the CPU, one worker per physical core. `
 |---|---|---|
 | `--set DIR` | required | the model set |
 | `--rec NAME` | `rec-latin` | the recognizer: `DIR/NAME.onnx` and `DIR/NAME.vocab.json` |
-| `--format F` | `text` | `text`, `json`, `hocr`, `alto`, `page`, `markdown` or `pdf` |
+| `--format F` | `text` | `text`, `json`, `hocr`, `alto`, `page`, `markdown`, `html` or `pdf` |
 | `--output FILE` | standard output | the file to write; `pdf` needs one |
 | `--out-dir DIR` | | `page` (PAGE XML) writes one file per page here |
 | `--text-out FILE` | | also write the pages' text to this file, beside any format |
@@ -61,6 +61,7 @@ The reading order comes from the set's `order.onnx` when the set has one; otherw
 | `alto` | ALTO XML 4.4: text blocks with their labels, lines, words with their confidences |
 | `page` | PAGE XML (2019-07-15), one file per page in `--out-dir`: regions typed by their labels, lines, words |
 | `markdown` | headings, paragraphs, lists, tables (as HTML, from their cells) and captions, from the order model's blocks; running headers and footers are left out |
+| `html` | an HTML5 document, a `<section>` per page: the order model's blocks as headings, paragraphs (a word broken by a hyphen at a line's end joined again), lists, tables from their cells, figures with their captions, running headers and footers (kept), footnotes and formulas |
 | `pdf` | a searchable PDF: each page's image with its words as invisible text above it; `--text-only` writes the text layer alone |
 
 Boxes are in the page image's pixels. For a PDF page they are in the pixels of the page as rendered at `--dpi`.

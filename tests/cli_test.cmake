@@ -44,3 +44,18 @@ file(STRINGS "${OUT}/text-only.pdf" font REGEX "/GlyphLessFont")  # the words' (
 if(image OR NOT box OR NOT font)
   message(FATAL_ERROR "text-only.pdf: an image ('${image}'), not the page's size ('${box}') or no text font")
 endif()
+
+# --format html: an HTML5 document, the page a section of its paragraphs (the fake set has no
+# order model, so its lines make paragraphs by their gaps), every line's text in them, in order
+execute_process(COMMAND "${CLI}" ocr "${page}" --set "${DATA}/fake-set" --format html --workers 1
+                RESULT_VARIABLE code OUTPUT_VARIABLE html ERROR_VARIABLE err ENCODING UTF-8)
+if(NOT code EQUAL 0)
+  message(FATAL_ERROR "--format html failed (${code}): ${err}")
+endif()
+string(FIND "${html}" "<!DOCTYPE html>" doctype)
+string(FIND "${html}" "<section class=\"page\" id=\"page-1\">" section)
+string(REGEX MATCHALL "<p>[a ]+</p>" paras "${html}")
+string(REPLACE "</p>;<p>" " " paras "${paras}")
+if(NOT doctype EQUAL 0 OR section LESS 0 OR NOT paras STREQUAL "<p>aaa aaaaa aa</p>")
+  message(FATAL_ERROR "--format html wrote: ${html}")
+endif()

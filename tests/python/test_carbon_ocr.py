@@ -232,6 +232,10 @@ def test_engine_reads_a_page():
     o = ordered.ocr([page])[0]
     assert o["order"] == "xy-cut" and [l["text"] for l in o["lines"]] == ["aaa", "aaaaa", "aa"]
     assert [(b["label"], b["lines"]) for b in o["blocks"]] == [("Section-Header", [i]) for i in range(3)]
+    # html=True: the page as carbon-ocr --format html writes it (each of those blocks a heading); asked only
+    h = ordered.ocr([page], html=True)[0]
+    assert h["html"] == "<h2>aaa</h2>\n<h2>aaaaa</h2>\n<h2>aa</h2>\n" and "html" not in o and h["skew"] == 0.0
+    assert e.ocr([page], html=True)[0]["html"] == "<p>aaa</p>\n<p>aaaaa</p>\n<p>aa</p>\n"  # no blocks: by their gaps
 
 
 def test_the_batched_pipeline_reads_as_the_engine_does():
@@ -248,5 +252,7 @@ def test_the_batched_pipeline_reads_as_the_engine_does():
     assert [[l["box"] for l in o["lines"]] for o in out] == [[l["box"] for l in w["lines"]] for w in want]
     s = p.stats
     assert s["pages"] == 5 and s["lines"] == 9 and 1 <= s["detect_runs"] <= 5
+    assert p.ocr([page], html=True)[0]["html"] == carbon_ocr.Engine(str(DATA / "fake-set"), workers=1).ocr(
+        [page], html=True)[0]["html"]
     with pytest.raises(Exception):
         carbon_ocr.Pipeline(str(DATA / "fake-set"), device="tpu")

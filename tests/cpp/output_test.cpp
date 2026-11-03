@@ -1,4 +1,4 @@
-// The engine's pages as hOCR, ALTO, PAGE XML and markdown (carbon/output.h).
+// The engine's pages as hOCR, ALTO, PAGE XML, markdown and HTML (carbon/output.h).
 
 #include "carbon/output.h"
 
@@ -137,6 +137,44 @@ TEST(Output, WritesTheOrderModelsBlocks) {
   EXPECT_NE(x.find("type=\"footer\""), std::string::npos);
   EXPECT_NE(x.find("<TextLine id=\"r2l2\">"), std::string::npos);  // "plums", the list's third
   EXPECT_EQ(count(x, "<TextRegion"), count(x, "</TextRegion>"));
+}
+
+TEST(Output, WritesTheBlocksAsHtml) {
+  OcrPage p = laid_out();
+  p.lines[2].text = "line, then a hyphen-";  // "hyphen-" + "ated" on the next line: one word again
+  p.lines.push_back({{50, 600, 400, 620}, "ated word", 1, 0, {}});
+  p.blocks[1].lines = {1, 2, 11};
+  EXPECT_EQ(to_html_body(p),
+            "<h2>Report</h2>\n<p>First line of text line, then a hyphenated word</p>\n"
+            "<ul><li>apples</li><li>pears and plums</li></ul>\n<table>\n<tr><td>Name</td><td>Age</td></tr>\n"
+            "<tr><td>Ann &amp; Bo</td><td>31</td></tr>\n</table>\n<footer><p>Page 3</p></footer>\n");
+  const std::string doc = to_html(std::vector<OcrPage>{p, page()});
+  EXPECT_EQ(doc.rfind("<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">", 0), 0u) << doc;
+  EXPECT_EQ(count(doc, "<section class=\"page\""), 2);
+  EXPECT_NE(doc.find("<section class=\"page\" id=\"page-2\">\n<p>Hello world</p>\n"
+                     "<p># R&amp;D &lt;x&gt; \"q\"</p>\n</section>"),
+            std::string::npos)
+      << doc;  // no blocks: a paragraph at the wide gap, the text escaped and never read as markup
+}
+
+TEST(Output, WritesEachLabelAsItsHtml) {
+  OcrPage p;
+  p.width = 600;
+  p.height = 600;
+  const char* texts[] = {"3. third", "4. fourth", "• dot", "Fig. 2: a plot", "1 A note.", "E = mc2",
+                         "Name: ____", "Contents", "Chapter 1 ..... 5", "in the figure", "Running head",
+                         "Hyphen-", "Ated"};  // a capital after the hyphen: not a broken word
+  for (int i = 0; i < 13; ++i) p.lines.push_back({{10, 10.0 + 40 * i, 300, 30.0 + 40 * i}, texts[i], 1, 0, {}});
+  p.blocks = {{"List-Group", 1, {0, 1, 2}, {}}, {"Caption", 1, {3}, {}},        {"Footnote", 1, {4}, {}},
+              {"Formula", 1, {5}, {}},          {"Form", 1, {6}, {}},           {"Table-Of-Contents", 1, {7, 8}, {}},
+              {"Picture", 1, {9}, {}},          {"Page-Header", 1, {10}, {}},   {"Text", 1, {11, 12}, {}}};
+  EXPECT_EQ(to_html_body(p),
+            "<ol start=\"3\"><li>third</li><li>fourth</li></ol>\n<ul><li>dot</li></ul>\n"
+            "<figure><figcaption>Fig. 2: a plot</figcaption></figure>\n"
+            "<aside class=\"footnote\"><p>1 A note.</p></aside>\n<p class=\"formula\">E = mc2</p>\n"
+            "<div class=\"form\"><p>Name: ____</p></div>\n"
+            "<nav><ul><li>Contents</li><li>Chapter 1 ..... 5</li></ul></nav>\n<figure><p>in the figure</p></figure>\n"
+            "<header><p>Running head</p></header>\n<p>Hyphen- Ated</p>\n");
 }
 
 }  // namespace
