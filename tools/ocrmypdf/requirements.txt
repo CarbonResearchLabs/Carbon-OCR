@@ -1,0 +1,7 @@
+# The OCRmyPDF plugin's packages (Python 3.12). Pinned; CI's build job installs these to run
+# tests/python/test_ocrmypdf_plugin.py on the carbon-ocr it built.
+ocrmypdf==17.13.0        # the plugin interface (OcrEngine, OcrOptions) of 17.x
+pillow==13.0.0           # the page image's dpi
+
+# tests
+pytest==8.4.2

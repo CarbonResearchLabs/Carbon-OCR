@@ -1,0 +1,78 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": { "CARBON_BUILD_TESTS": "ON" }
+    },
+    {
+      "name": "vs2022",
+      "displayName": "Windows, Visual Studio 2022, CPU (ONNX Runtime)",
+      "inherits": "base",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    },
+    {
+      "name": "vs2022-trt",
+      "displayName": "Windows, Visual Studio 2022, CPU + GPU (TensorRT_ROOT set)",
+      "inherits": "vs2022",
+      "cacheVariables": { "CARBON_WITH_TENSORRT": "ON" }
+    },
+    {
+      "name": "ninja-release",
+      "displayName": "Ninja, Release, CPU (Linux, macOS, or a VS developer shell)",
+      "inherits": "base",
+      "generator": "Ninja",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "ninja-debug",
+      "displayName": "Ninja, Debug, CPU",
+      "inherits": "base",
+      "generator": "Ninja",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "ninja-trt",
+      "displayName": "Ninja, Release, CPU + GPU (TensorRT_ROOT set)",
+      "inherits": "ninja-release",
+      "cacheVariables": { "CARBON_WITH_TENSORRT": "ON" }
+    },
+    {
+      "name": "ninja-cuda",
+      "displayName": "Ninja, Release, CPU + the CUDA kernels (in a VS developer shell on Windows)",
+      "inherits": "ninja-release",
+      "cacheVariables": { "CARBON_WITH_CUDA": "ON" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "vs2022", "configurePreset": "vs2022", "configuration": "Release" },
+    { "name": "vs2022-trt", "configurePreset": "vs2022-trt", "configuration": "Release" },
+    { "name": "ninja-release", "configurePreset": "ninja-release" },
+    { "name": "ninja-debug", "configurePreset": "ninja-debug" },
+    { "name": "ninja-trt", "configurePreset": "ninja-trt" },
+    { "name": "ninja-cuda", "configurePreset": "ninja-cuda" }
+  ],
+  "testPresets": [
+    {
+      "name": "vs2022",
+      "configurePreset": "vs2022",
+      "configuration": "Release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "vs2022-trt",
+      "configurePreset": "vs2022-trt",
+      "configuration": "Release",
+      "output": { "outputOnFailure": true }
+    },
+    { "name": "ninja-release", "configurePreset": "ninja-release", "output": { "outputOnFailure": true } },
+    { "name": "ninja-debug", "configurePreset": "ninja-debug", "output": { "outputOnFailure": true } },
+    { "name": "ninja-trt", "configurePreset": "ninja-trt", "output": { "outputOnFailure": true } },
+    { "name": "ninja-cuda", "configurePreset": "ninja-cuda", "output": { "outputOnFailure": true } }
+  ]
+}

@@ -1,0 +1,116 @@
+# What git keeps: source, CMake files, tests and their tiny models (tests/data), the docs
+# and their images, model sets' metadata. What it never keeps: build trees, binaries,
+# weights, TensorRT engines, caches, secrets.
+
+# ----------------------------------------------------------------- C++ / CMake
+/build/
+/out/
+/cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+CMakeUserPresets.json
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+Testing/
+_deps/
+/.deps/
+compile_commands.json
+.cache/
+.ccache/
+
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.exp
+*.ilk
+*.pdb
+*.idb
+*.pch
+*.ipch
+*.gch
+*.tlog
+*.lastbuildstate
+*.recipe
+
+/.vs/
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+*.suo
+*.user
+x64/
+x86/
+Debug/
+Release/
+RelWithDebInfo/
+MinSizeRel/
+
+# ------------------------------------------------------------- CUDA / TensorRT
+*.cubin
+*.fatbin
+*.ptx
+*.cudafe*
+*.module_id
+# TensorRT engines are built per GPU and TensorRT version: never shipped
+*.engine
+*.engine.tmp
+*.plan
+*.trt
+.engines/
+*.timing.cache
+*.timing_cache
+
+# ------------------------------------------------------------ model weights
+# Weights are release assets; a set's meta.json and vocabularies stay in git.
+/models/**/*.onnx
+/models/**/*.onnx.data
+/models/**/*.bin
+*.onnx.data
+!/tests/data/*.onnx
+
+# ---------------------------------------------------------------- profiling
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+*.qdstrm
+perf.data*
+*.prof
+callgrind.out.*
+
+# ------------------------------------------------------------------- Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+wheelhouse/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ------------------------------------------------------------ editors and OS
+/.vscode/
+/.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# -------------------------------------------------------- secrets and local
+.env
+.env.*
+*.pem
+*.key
+*.local
+*.log

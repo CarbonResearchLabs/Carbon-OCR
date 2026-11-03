@@ -1,0 +1,185 @@
+#include "carbon/detect.h"
+
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <cmath>
+#include <random>
+#include <vector>
+
+namespace carbon {
+namespace {
+
+constexpr int kH = 512, kW = 400;  // the maps of a 1024 x 800 page
+constexpr size_t kPlane = static_cast<size_t>(kH) * kW;
+
+// Targets as a detector would ideally give them: the 0/1 maps as confident logits.
+std::vector<float> ideal_maps(const std::vector<LineBox>& lines, const std::vector<LineBox>& pictures = {}) {
+  std::vector<float> m(4 * kPlane);
+  det_targets(lines, pictures, kH, kW, m.data());
+  for (size_t i = 0; i < kPlane; ++i) {
+    m[i] = m[i] > 0.5f ? 8.0f : -8.0f;
+    m[3 * kPlane + i] = m[3 * kPlane + i] > 0.5f ? 8.0f : -8.0f;
+  }
+  return m;
+}
+
+// A page of two columns of lines, 10 to 30 px high, set 1.2 to 1.6 times their
+// height apart, of random length.
+std::vector<LineBox> random_page(std::mt19937& rng) {
+  std::uniform_real_distribution<double> height(10, 30), leading(1.2, 1.6), u(0, 1);
+  std::vector<LineBox> lines;
+  for (double col : {20.0, 420.0}) {
+    for (double y = 30; ; ) {
+      const double h = height(rng), x0 = col + 30 * u(rng), x1 = col + 120 + 230 * u(rng);
+      if (y + h > 1000) break;
+      lines.push_back({x0, y, x1, y + h});
+      y += h * leading(rng);
+    }
+  }
+  return lines;
+}
+
+// decode_det(det_targets(boxes)) gives the boxes back: the top and bottom
+// exactly (the distance maps carry them), the ends within the map's rounding.
+TEST(Detect, DecodingTheTargetsGivesTheBoxesBack) {
+  std::mt19937 rng(7);
+  for (int page = 0; page < 20; ++page) {
+    const std::vector<LineBox> lines = random_page(rng);
+    const Detection d = decode_det(ideal_maps(lines).data(), kH, kW);
+    ASSERT_EQ(d.lines.size(), lines.size()) << "page " << page;
+    std::vector<LineBox> want = lines;
+    std::sort(want.begin(), want.end(),
+              [](const LineBox& a, const LineBox& b) { return a.y0 != b.y0 ? a.y0 < b.y0 : a.x0 < b.x0; });
+    for (size_t i = 0; i < want.size(); ++i) {
+      const LineBox& got = d.lines[i].box;
+      EXPECT_NEAR(got.y0, want[i].y0, 1e-4) << "page " << page << " line " << i;
+      EXPECT_NEAR(got.y1, want[i].y1, 1e-4);
+      EXPECT_LE(std::abs(got.x0 - want[i].x0), 1.0);
+      EXPECT_LE(std::abs(got.x1 - want[i].x1), 1.0);
+      EXPECT_GT(d.lines[i].score, 0.99f);
+    }
+  }
+}
+
+TEST(Detect, BoxesScaleToThePage) {
+  const std::vector<LineBox> lines = {{100, 200, 500, 220}};
+  const Detection a = decode_det(ideal_maps(lines).data(), kH, kW);
+  const Detection b = decode_det(ideal_maps(lines).data(), kH, kW, 2.125);
+  ASSERT_EQ(a.lines.size(), 1u);
+  ASSERT_EQ(b.lines.size(), 1u);
+  EXPECT_NEAR(b.lines[0].box.y0, 2.125 * a.lines[0].box.y0, 1e-9);
+  EXPECT_NEAR(b.lines[0].box.x1, 2.125 * a.lines[0].box.x1, 1e-9);
+  EXPECT_NEAR(a.median_line_height(), 20, 1e-4);
+}
+
+// Two lines set so close that their bands overlap: the shared pixels go to
+// neither, so they still decode as two.
+TEST(Detect, LinesWhoseBandsWouldTouchStayApart) {
+  // bands: rows 112 to 128, and 117 to 133
+  const std::vector<LineBox> lines = {{100, 100, 400, 140}, {100, 105, 400, 145}};
+  const Detection d = decode_det(ideal_maps(lines).data(), kH, kW);
+  ASSERT_EQ(d.lines.size(), 2u);
+  EXPECT_NEAR(d.lines[0].box.y0, 100, 1e-4);
+  EXPECT_NEAR(d.lines[1].box.y1, 145, 1e-4);
+}
+
+// A line slanted by 3 px over its length: its box holds both ends.
+TEST(Detect, ASlantedLinesBoxHoldsItsEnds) {
+  std::vector<float> m(4 * kPlane, 0.0f);
+  for (size_t i = 0; i < kPlane; ++i) m[i] = m[3 * kPlane + i] = -8.0f;
+  for (int c = 50; c < 250; ++c) {
+    const double line_top = 200 + 3.0 * (c - 50) / 200, line_bottom = line_top + 20;  // input px
+    for (int r = 0; r < kH; ++r) {
+      const double y = 2.0 * r + 1;
+      if (y < line_top + 6 || y > line_bottom - 6) continue;  // the middle 40%
+      const size_t k = static_cast<size_t>(r) * kW + c;
+      m[k] = 8.0f;
+      m[kPlane + k] = static_cast<float>(y - line_top);
+      m[2 * kPlane + k] = static_cast<float>(line_bottom - y);
+    }
+  }
+  const Detection d = decode_det(m.data(), kH, kW);
+  ASSERT_EQ(d.lines.size(), 1u);
+  EXPECT_LE(d.lines[0].box.y0, 200 + 0.3);   // within the top 10% of its tops
+  EXPECT_GE(d.lines[0].box.y1, 223 - 0.3);   // and of its bottoms
+  EXPECT_NEAR(d.lines[0].box.x0, 100 - 0.15 * (d.lines[0].box.y1 - d.lines[0].box.y0), 1e-6);
+}
+
+TEST(Detect, PicturesAndNoise) {
+  const std::vector<LineBox> lines = {{100, 600, 500, 620}};
+  const std::vector<LineBox> pictures = {{200, 100, 600, 400}};
+  std::vector<float> m = ideal_maps(lines, pictures);
+  m[static_cast<size_t>(10) * kW + 10] = 8.0f;  // one stray core pixel: noise
+  const Detection d = decode_det(m.data(), kH, kW);
+  ASSERT_EQ(d.lines.size(), 1u);
+  ASSERT_EQ(d.pictures.size(), 1u);
+  const LineBox& p = d.pictures[0].box;
+  EXPECT_LE(std::abs(p.x0 - 200), 1.0);
+  EXPECT_LE(std::abs(p.y0 - 100), 1.0);
+  EXPECT_LE(std::abs(p.x1 - 600), 1.0);
+  EXPECT_LE(std::abs(p.y1 - 400), 1.0);
+  EXPECT_EQ(d.pictures[0].pixels, 200 * 150);
+}
+
+// Every line gets a band, even one too small to hold a pixel centre.
+TEST(Detect, TinyLinesStillGetABand) {
+  std::vector<float> m(4 * kPlane);
+  const std::vector<LineBox> lines = {{100, 100, 103, 104}};
+  det_targets(lines, {}, kH, kW, m.data());
+  float sum = 0;
+  for (size_t i = 0; i < kPlane; ++i) sum += m[i];
+  EXPECT_EQ(sum, 1.0f);
+}
+
+TEST(Detect, TheMasksHoldTheSetPixelsAndTheirValues) {
+  // A few set pixels across word boundaries; their values in row-major order.
+  const int h = 3, w = 70;
+  const size_t plane = static_cast<size_t>(h) * w;
+  std::vector<float> m(4 * plane, -8.0f);
+  const int core[] = {0 * w + 0, 0 * w + 31, 0 * w + 32, 1 * w + 69, 2 * w + 40};
+  for (int i : core) {
+    m[i] = 3.0f + i;
+    m[plane + i] = 1.0f + i;
+    m[2 * plane + i] = 2.0f + i;
+  }
+  m[3 * plane + 2 * w + 5] = 4.0f;
+  const DetMasks k = threshold_det(m.data(), h, w);
+  ASSERT_EQ(k.words, 3);
+  EXPECT_EQ(k.core[0], 0x80000001u);  // pixels 0 and 31
+  EXPECT_EQ(k.core[1], 1u);           // pixel 32
+  EXPECT_EQ(k.core[1 * 3 + 2], 1u << 5);  // pixel 69 = 64 + 5
+  EXPECT_EQ(k.core[2 * 3 + 1], 1u << 8);  // pixel 40
+  EXPECT_EQ(k.picture[2 * 3 + 0], 1u << 5);
+  ASSERT_EQ(k.core_values.size(), 15u);
+  for (size_t j = 0; j < 5; ++j) {
+    EXPECT_EQ(k.core_values[3 * j], 3.0f + core[j]);
+    EXPECT_EQ(k.core_values[3 * j + 1], 1.0f + core[j]);
+    EXPECT_EQ(k.core_values[3 * j + 2], 2.0f + core[j]);
+  }
+  EXPECT_EQ(k.picture_values, std::vector<float>{4.0f});
+}
+
+TEST(Detect, DecodingTheMasksIsDecodingTheMaps) {
+  std::mt19937 rng(11);
+  const std::vector<float> m = ideal_maps(random_page(rng), {{100, 600, 300, 800}});
+  const Detection a = decode_det(m.data(), kH, kW, 1.5), b = decode_det(threshold_det(m.data(), kH, kW), 1.5);
+  ASSERT_EQ(a.lines.size(), b.lines.size());
+  ASSERT_EQ(a.pictures.size(), b.pictures.size());
+  for (size_t i = 0; i < a.lines.size(); ++i) {
+    EXPECT_EQ(a.lines[i].box.x0, b.lines[i].box.x0);
+    EXPECT_EQ(a.lines[i].box.y1, b.lines[i].box.y1);
+    EXPECT_EQ(a.lines[i].score, b.lines[i].score);
+  }
+}
+
+TEST(Detect, NothingToFind) {
+  std::vector<float> m(4 * kPlane, -8.0f);
+  const Detection d = decode_det(m.data(), kH, kW);
+  EXPECT_TRUE(d.lines.empty());
+  EXPECT_TRUE(d.pictures.empty());
+  EXPECT_EQ(d.median_line_height(), 0);
+}
+
+}  // namespace
+}  // namespace carbon

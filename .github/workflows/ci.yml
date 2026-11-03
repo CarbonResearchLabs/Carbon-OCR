@@ -1,0 +1,114 @@
+# Build and test the CPU build (ONNX Runtime) on Linux and Windows, and on Arm64 Linux; the
+# Python module; the OCRmyPDF plugin. The TensorRT backend needs a GPU and NVIDIA's SDK, so
+# it is built and tested on a GPU machine (presets ninja-trt, vs2022-trt), not here.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # The pinned downloads, keyed by the file that pins them.
+      - uses: actions/cache@v4
+        with:
+          path: .deps
+          key: deps-${{ runner.os }}-${{ hashFiles('cmake/CarbonDependencies.cmake') }}
+
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y ninja-build
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DFETCHCONTENT_BASE_DIR="${{ github.workspace }}/.deps"
+
+      # No -G: CMake picks the newest Visual Studio on the runner.
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: cmake -S . -B build -A x64 -DFETCHCONTENT_BASE_DIR="${{ github.workspace }}/.deps"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      # The instruction sets this runner's CPU has (the kernels it runs).
+      - name: CPU
+        shell: bash
+        run: $(find build -type f \( -name carbon-ocr -o -name carbon-ocr.exe \) | head -1) cpus
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      # The OCRmyPDF plugin on the carbon-ocr just built; on Linux, whole OCRmyPDF runs.
+      # OCRmyPDF checks for tesseract on every run, so it is installed, though it reads nothing.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tools/ocrmypdf/requirements.txt
+      - name: Tesseract (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y tesseract-ocr
+      - name: OCRmyPDF plugin
+        shell: bash
+        run: |
+          python -m pip install -r tools/ocrmypdf/requirements.txt
+          export CARBON_OCR=$(find build -type f \( -name carbon-ocr -o -name carbon-ocr.exe \) | head -1)
+          python -m pytest tests/python/test_ocrmypdf_plugin.py -q -rs
+
+  # Arm64 (Neoverse N2): the NEON dot-product kernels, built and held to the scalar reference,
+  # and everything else built for Arm. No ONNX Runtime package is pinned for Linux on Arm, so
+  # that backend is off.
+  build-arm:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v4
+        with:
+          path: .deps
+          key: deps-${{ runner.os }}-arm64-${{ hashFiles('cmake/CarbonDependencies.cmake') }}
+      - name: Configure
+        run: |
+          sudo apt-get update && sudo apt-get install -y ninja-build
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCARBON_WITH_ONNXRUNTIME=OFF \
+            -DFETCHCONTENT_BASE_DIR="${{ github.workspace }}/.deps"
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: |
+          build/cli/carbon-ocr cpus
+          ctest --test-dir build --output-on-failure
+
+  # The Python module: the crop rule byte for byte against Pillow, the decoders, Session,
+  # Engine and Pipeline on the tests' small models.
+  python:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: python/pyproject.toml
+      - name: Install
+        run: |
+          python -m pip install numpy==2.5.4 pillow==13.0.0 pytest==8.4.2
+          python -m pip install ./python
+      - name: Test
+        run: python -m pytest tests/python/test_carbon_ocr.py -q

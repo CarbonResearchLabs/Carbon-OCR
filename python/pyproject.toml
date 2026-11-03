@@ -1,0 +1,26 @@
+[build-system]
+requires = ["scikit-build-core==0.11.6", "nanobind==2.15.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "carbon-ocr"
+version = "0.1.0"
+description = "Carbon-OCR's C++ for Python: crop rule, decoders, detector targets, model sessions and the engine"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.12"
+dependencies = ["numpy"]
+
+[tool.scikit-build]
+# The repository's CMake project, with what the module needs: ONNX Runtime (for
+# Session and Engine), no CLI, no C++ tests.
+cmake.source-dir = ".."
+cmake.build-type = "Release"
+wheel.packages = []
+build-dir = "../build/python/{wheel_tag}"
+
+[tool.scikit-build.cmake.define]
+CARBON_BUILD_PYTHON = "ON"
+CARBON_WITH_ONNXRUNTIME = "ON"
+CARBON_BUILD_CLI = "OFF"
+CARBON_BUILD_TESTS = "OFF"
