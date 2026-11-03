@@ -8,14 +8,14 @@
   <img alt="C++20" src="https://img.shields.io/badge/C%2B%2B-20-74f2d6?style=flat-square&labelColor=1a1a1a">
   <img alt="GPU: TensorRT 11" src="https://img.shields.io/badge/GPU-TensorRT%2011-79ee5f?style=flat-square&labelColor=1a1a1a">
   <img alt="CPU: ONNX Runtime 1.31" src="https://img.shields.io/badge/CPU-ONNX%20Runtime%201.31-f2b43c?style=flat-square&labelColor=1a1a1a">
-  <img alt="models: Fullerene, weights not released yet" src="https://img.shields.io/badge/models-Fullerene%2C%20weights%20not%20released%20yet-d6352a?style=flat-square&labelColor=1a1a1a">
+  <img alt="models: fullerene-3M on Hugging Face" src="https://img.shields.io/badge/models-fullerene--3M%20on%20Hugging%20Face-d6352a?style=flat-square&labelColor=1a1a1a">
   <img alt="code: Apache 2.0" src="https://img.shields.io/badge/code-Apache%202.0-5bbff4?style=flat-square&labelColor=1a1a1a">
   <img alt="weights: OpenRAIL-AMS" src="https://img.shields.io/badge/weights-OpenRAIL--AMS-74f2d6?style=flat-square&labelColor=1a1a1a">
 </p>
 
 **Carbon-OCR is an OCR engine in C++ and CUDA, and Fullerene is its family of small models.** It reads scans, photos of documents and PDFs, and gives text, markdown, HTML and JSON with boxes. It runs on CPUs with its own int8 kernels or ONNX Runtime, one worker per core, and on NVIDIA GPUs through TensorRT, with many pages in flight.
 
-The goal is to be far more accurate than Tesseract and faster than every open engine of its class. Every number here is measured, never estimated. The engine is complete and tested. The Fullerene weights are not released yet, so until they are the engine has no models to read with. Their sets, files and metadata are specified ([docs/MODELS.md](docs/MODELS.md)), so the engine reads them as soon as they ship.
+The goal is to be far more accurate than Tesseract and faster than every open engine of its class. Every number here is measured, never estimated. The engine is complete and tested. The first Fullerene set, `fullerene-3M` (Latin), is out on [Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M) under the Carbon-OCR OpenRAIL-AMS license; the other script groups follow. Every set's files and metadata are specified ([docs/MODELS.md](docs/MODELS.md)), so the engine reads each one as it ships.
 
 ## <img src="docs/assets/chip-01.svg" height="22" alt=""> At a glance
 
@@ -80,6 +80,13 @@ The trained `fullerene-3M` ([on Hugging Face](https://huggingface.co/CarbonResea
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/fig-bench-speed-dark.svg">
   <img src="docs/assets/fig-bench-speed-light.svg" alt="Pages a second: 3.79 against Tesseract's 0.76 on one core, 12.26 against 2.97 in six processes." width="100%">
+</picture>
+
+**Pages, read** (3 November): `fullerene-3M` on three invented pages, a report page, a page of two tables and a rough photo of the first, every picture drawn from the engine's own output. On the report page it found every line, read 253 of 255 words right, ordered 18 blocks and wrote HTML, in 152 ms on one core; it turned the photo 180° and levelled it; it put all 73 table cells in their row and column. Every fault found is listed with where it comes from ([docs/DEMO.md](docs/DEMO.md), [PDF](docs/Carbon-OCR-Demo.pdf), [dark](docs/Carbon-OCR-Demo-Dark.pdf); the scripts in [docs/demo/](docs/demo/)).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/demo-read-dark.png">
+  <img src="docs/assets/demo-read-light.png" alt="The report page with every line boxed in its block's colour and every block numbered in reading order, beside the HTML the engine wrote for it." width="100%">
 </picture>
 
 The rows below were measured on the same laptop (and its RTX 4060 Laptop GPU) between 27 and 30 October 2026, using random weights, since speed does not depend on them.
@@ -157,9 +164,10 @@ ocrmypdf --plugin tools/ocrmypdf/carbon_ocrmypdf.py \
 
 ## <img src="docs/assets/chip-08.svg" height="22" alt=""> Documentation
 
-Two of them are also typeset as PDFs, each in a light and a dark edition:
+Three of them are also typeset as PDFs, each in a light and a dark edition:
 - **The engine guide**: the engine, building it and using it, in one document ([PDF](docs/Carbon-OCR-Engine-Guide.pdf), [dark](docs/Carbon-OCR-Engine-Guide-Dark.pdf)).
 - **The models** ([PDF](docs/Carbon-OCR-Models.pdf), [dark](docs/Carbon-OCR-Models-Dark.pdf)).
+- **Pages, read**: `fullerene-3M` at work on three pages ([PDF](docs/Carbon-OCR-Demo.pdf), [dark](docs/Carbon-OCR-Demo-Dark.pdf)).
 
 | document | what it covers |
 |---|---|
@@ -167,6 +175,7 @@ Two of them are also typeset as PDFs, each in a light and a dark edition:
 | [docs/MODELS.md](docs/MODELS.md) | the Fullerene models: each one's job, inputs and outputs, layers, parameters and compute; the files of a set and their metadata |
 | [docs/BUILD.md](docs/BUILD.md) | building on Windows, Linux and macOS, CPU and GPU; the CMake options; the Python module |
 | [docs/USAGE.md](docs/USAGE.md) | the `carbon-ocr` commands, the output formats, the Python API, the OCRmyPDF plugin |
+| [docs/DEMO.md](docs/DEMO.md) | `fullerene-3M` on three pages: turned and levelled, lines, blocks and order, tables, the HTML, the numbers, every fault and where it comes from; its scripts and their output in [docs/demo/](docs/demo/) |
 
 ## <img src="docs/assets/chip-09.svg" height="22" alt=""> License
 

@@ -1,6 +1,6 @@
 # Using Carbon-OCR
 
-This guide covers the `carbon-ocr` command line, the output formats, the Python module and the OCRmyPDF plugin. Every command that reads pages takes a Fullerene model set with `--set DIR`. A set is a folder holding its models and their metadata, laid out as described in [models/README.md](../models/README.md). The weights are not released yet.
+This guide covers the `carbon-ocr` command line, the output formats, the Python module and the OCRmyPDF plugin. Every command that reads pages takes a Fullerene model set with `--set DIR`. A set is a folder holding its models and their metadata, laid out as described in [models/README.md](../models/README.md). The first set, `fullerene-3M`, is on [Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M): `huggingface-cli download CarbonResearchLabs/fullerene-3M --local-dir models/fullerene-3M`.
 
 **Contents**
 1. Reading pages

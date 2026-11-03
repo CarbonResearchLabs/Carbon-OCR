@@ -2,7 +2,7 @@
 
 **Carbon-OCR reads page images and PDFs with the Fullerene models and gives each page's lines, words, blocks and tables in reading order, with their boxes and confidences.** It is a C++20 library (`carbon/`), a command line (`carbon-ocr`), a Python module (`carbon_ocr`) and an OCRmyPDF plugin. On a CPU it runs the models on its own int8 kernels or on ONNX Runtime, with a pinned worker per physical core. On an NVIDIA GPU it runs them through TensorRT, with many pages in flight and every model batched across them.
 
-This document follows a page through the engine, step by step, then covers how the engine spreads its work over CPU cores, the backends it runs models on, the batched GPU pipeline and the options that matter. The models themselves are described in [MODELS.md](MODELS.md). The Fullerene weights are not released yet. The speed figures here come from sets with random weights, since speed does not depend on the weights.
+This document follows a page through the engine, step by step, then covers how the engine spreads its work over CPU cores, the backends it runs models on, the batched GPU pipeline and the options that matter. The models themselves are described in [MODELS.md](MODELS.md). The first Fullerene set, `fullerene-3M`, is out on [Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M). The speed figures here come from sets with random weights, since speed does not depend on the weights; the engine at work on real pages with the trained set is [DEMO.md](DEMO.md).
 
 **Contents**
 

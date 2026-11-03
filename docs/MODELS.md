@@ -2,7 +2,7 @@
 
 **Fullerene is the family of small networks Carbon-OCR reads with: eight of them, 10.3 M parameters in all.** One finds a page's orientation, one finds its lines, one tells which script each line is in, four read the lines (one per script group), and one puts the lines in reading order and labels the page's blocks. They ship in two sets: `fullerene-3M` for Latin script and `fullerene-10M` for every script.
 
-This document is a reference for running them: each model's job, its input and output tensors, its layers, parameters and compute, the files of a set, the metadata the engine reads from them, and which precision runs on which backend. **The weights are not released yet.** Every parameter and MAC count here is the design's, counted from the layer shapes with each RepVGG block folded, as in the shipped files. How the engine runs the models is in [ENGINE.md](ENGINE.md).
+This document is a reference for running them: each model's job, its input and output tensors, its layers, parameters and compute, the files of a set, the metadata the engine reads from them, and which precision runs on which backend. **The Latin set, `fullerene-3M`, is out on [Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M)**, under the Carbon-OCR OpenRAIL-AMS license; the other script groups follow. Every parameter and MAC count here is the design's, counted from the layer shapes with each RepVGG block folded, as in the shipped files. How the engine runs the models is in [ENGINE.md](ENGINE.md).
 
 **Contents**
 

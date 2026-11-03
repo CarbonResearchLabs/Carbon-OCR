@@ -1,0 +1,3 @@
+# The inputs and pictures run.py and render.py make; the JSON they read and wrote is kept.
+*.png
+*.jpg
