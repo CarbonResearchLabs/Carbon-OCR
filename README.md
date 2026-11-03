@@ -171,3 +171,27 @@ Two of them are also typeset as PDFs, each in a light and a dark edition:
 ## <img src="docs/assets/chip-09.svg" height="22" alt=""> License
 
 The code is licensed under [Apache 2.0](LICENSE). The Fullerene weights, once released, are licensed under [OpenRAIL-AMS](LICENSE-WEIGHTS.md).
+
+## <img src="docs/assets/chip-10.svg" height="22" alt=""> Citation and credits
+
+If you use Carbon-OCR or the Fullerene models, please cite them (also in [CITATION.cff](CITATION.cff), which GitHub offers as "Cite this repository"):
+
+```bibtex
+@software{vora2026carbonocr,
+  author       = {Karan Vora},
+  title        = {Carbon-OCR and Fullerene: OCR in C++ and CUDA, with the Fullerene models},
+  organization = {Carbon Research Labs},
+  year         = {2026},
+  url          = {https://github.com/karanvora2599/Carbon-OCR}
+}
+
+@misc{vora2026fullerene3m,
+  author       = {Karan Vora},
+  title        = {Fullerene 3M: the Latin model set of Carbon-OCR},
+  organization = {Carbon Research Labs},
+  year         = {2026},
+  howpublished = {\url{https://huggingface.co/CarbonResearchLabs/fullerene-3M}}
+}
+```
+
+**Credits.** Carbon-OCR and Fullerene are built by Karan Vora at Carbon Research Labs ([getcarbonresearch.com](https://getcarbonresearch.com)), with [David Delaurier](https://www.linkedin.com/in/david-delaurier/), lead MLOps, and [Karthik Kumar Viswanathan](https://www.linkedin.com/in/vkaku/), technical advisor.

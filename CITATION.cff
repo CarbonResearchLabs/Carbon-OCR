@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use Carbon-OCR or the Fullerene models, please cite them as below."
+title: "Carbon-OCR and Fullerene: OCR in C++ and CUDA, with the Fullerene models"
+type: software
+authors:
+  - family-names: Vora
+    given-names: Karan
+    affiliation: Carbon Research Labs
+repository-code: "https://github.com/karanvora2599/Carbon-OCR"
+url: "https://getcarbonresearch.com"
+license: Apache-2.0
+version: 0.1.0
+date-released: 2026-11-03
+abstract: >-
+  An OCR engine in C++ and CUDA, and Fullerene, its family of small models. It reads
+  scans, photos of documents and PDFs into text, HTML, markdown and JSON with boxes, in reading order with
+  labeled blocks and table cells, on CPUs and NVIDIA GPUs.
+keywords: [ocr, document-understanding, onnx, cuda, tensorrt]
+references:
+  - type: software
+    title: "Fullerene 3M: the Latin model set of Carbon-OCR"
+    authors:
+      - family-names: Vora
+        given-names: Karan
+        affiliation: Carbon Research Labs
+    url: "https://huggingface.co/CarbonResearchLabs/fullerene-3M"
+    date-released: 2026-11-03
