@@ -3,19 +3,19 @@
 This guide covers the `carbon-ocr` command line, the output formats, the Python module and the OCRmyPDF plugin. Every command that reads pages takes a Fullerene model set with `--set DIR`. A set is a folder holding its models and their metadata, laid out as described in [models/README.md](../models/README.md). The weights are not released yet.
 
 **Contents**
-1. Reading pages: `carbon-ocr ocr`
+1. Reading pages
 2. Output formats
 3. Timing and inspecting: `cpus`, `pages`, `bench`, `info`, `compare`
 4. Python
 5. OCRmyPDF
 
-## <img src="assets/chip-01.svg" height="22" alt=""> 1. Reading pages: `carbon-ocr ocr`
+## <img src="assets/chip-01.svg" height="22" alt=""> Reading pages
 
 ```shell
 carbon-ocr ocr page.png scan.jpg --set models/fullerene-3M          # plain text
-carbon-ocr ocr page.png --set models/fullerene-3M --backend ort     # every model on ONNX Runtime
+carbon-ocr ocr page.png --set models/fullerene-3M --backend ort     # all on ONNX Runtime
 carbon-ocr ocr report.pdf --set models/fullerene-3M --dpi 300       # each page of a PDF
-carbon-ocr ocr page.png --set models/fullerene-3M --format json     # boxes, text, words, timings
+carbon-ocr ocr page.png --set models/fullerene-3M --format json     # boxes, words, timings
 carbon-ocr ocr scan.pdf --set models/fullerene-3M --format pdf --output searchable.pdf
 carbon-ocr ocr scans/*.png --set models/fullerene-3M --device cuda --engine-cache .engines
 ```
@@ -50,7 +50,7 @@ By default the pages run in parallel on the CPU, one worker per physical core. `
 
 The reading order comes from the set's `order.onnx` when the set has one; otherwise the engine orders lines by the XY-cut. The order model is also used only where it is sure of its result, and the XY-cut takes over elsewhere. The JSON output records which of the two ordered each page.
 
-## <img src="assets/chip-02.svg" height="22" alt=""> 2. Output formats
+## <img src="assets/chip-02.svg" height="22" alt=""> Output formats
 
 | format | what |
 |---|---|
@@ -64,7 +64,7 @@ The reading order comes from the set's `order.onnx` when the set has one; otherw
 
 Boxes are in the page image's pixels. For a PDF page they are in the pixels of the page as rendered at `--dpi`.
 
-## <img src="assets/chip-03.svg" height="22" alt=""> 3. Timing and inspecting
+## <img src="assets/chip-03.svg" height="22" alt=""> Timing and inspecting
 
 ```shell
 carbon-ocr version
@@ -85,7 +85,7 @@ carbon-ocr compare model.onnx --shape x=8x1x32x512               # native agains
 - **`bench`** times one model with fixed inputs and reports the median, p90 and fastest run. On TensorRT it times two runs: from host memory with the copies included, and on device buffers, the way the GPU pipeline runs a model. `--opt-level 0-5` sets TensorRT's builder optimization level (default 3), and `--no-graphs` turns off CUDA graphs. `--isa NAME` holds the native backend to one instruction set. `--workers` runs a pool of pinned workers, each with its own session, and reports their scaling.
 - **`compare`** runs a model on the native backend and on ONNX Runtime and reports how far apart their outputs are. `--against FILE` gives ONNX Runtime a different file, such as the FP32 model for an int8 one.
 
-## <img src="assets/chip-04.svg" height="22" alt=""> 4. Python
+## <img src="assets/chip-04.svg" height="22" alt=""> Python
 
 ```shell
 pip install ./python
@@ -112,13 +112,14 @@ logits, = session.run([np.zeros((1, 1, 32, 512), np.float32)])     # [1, 800, 12
 
 The module also exposes the engine's building blocks: the crop rule (`crop`, `crop_lines`, `crop_region`), the CTC decoders (`ctc_greedy`, `ctc_collapse`), the detector's decoder (`decode_det`), the order model's features and decoder (`order_features`, `decode_order`, `reading_order`), and text scoring (`text_errors`, `char_confusions`). [python/README.md](../python/README.md) lists all of them.
 
-## <img src="assets/chip-05.svg" height="22" alt=""> 5. OCRmyPDF
+## <img src="assets/chip-05.svg" height="22" alt=""> OCRmyPDF
 
 `tools/ocrmypdf/carbon_ocrmypdf.py` plugs Carbon-OCR into OCRmyPDF 17 as its OCR engine. OCRmyPDF prepares each page itself, turning and deskewing it, and the plugin runs `carbon-ocr ocr --as-given` on the page. With OCRmyPDF's default renderer, the plugin returns hOCR. With `--pdf-renderer sandwich`, it returns a text-only PDF at the image's own dpi.
 
 ```shell
 pip install -r tools/ocrmypdf/requirements.txt
-ocrmypdf --plugin tools/ocrmypdf/carbon_ocrmypdf.py --carbon-set models/fullerene-3M in.pdf out.pdf
+ocrmypdf --plugin tools/ocrmypdf/carbon_ocrmypdf.py \
+    --carbon-set models/fullerene-3M in.pdf out.pdf
 ```
 
 The plugin's options:

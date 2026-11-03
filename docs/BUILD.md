@@ -10,7 +10,7 @@ Carbon-OCR builds with CMake on Windows, Linux and macOS. The CPU build needs on
 5. The Python module
 6. Tests
 
-## <img src="assets/chip-01.svg" height="22" alt=""> 1. Requirements
+## <img src="assets/chip-01.svg" height="22" alt=""> Requirements
 
 | what | version |
 |---|---|
@@ -33,7 +33,7 @@ CMake downloads these and checks each one's SHA-256:
 
 ONNX Runtime downloads exist for Windows x64, Linux x64 and macOS arm64. On any other platform, set `ONNXRUNTIME_ROOT` to an unpacked release, or build with `-DCARBON_WITH_ONNXRUNTIME=OFF`; the engine's own int8 backend still runs. PDFium downloads exist for Windows x64, Linux x64 and arm64, and macOS arm64. Elsewhere, set `PDFIUM_ROOT` to an unpacked build, or turn PDFs off with `-DCARBON_WITH_PDFIUM=OFF`.
 
-## <img src="assets/chip-02.svg" height="22" alt=""> 2. The CPU build
+## <img src="assets/chip-02.svg" height="22" alt=""> The CPU build
 
 ```shell
 # Linux, macOS, or a Visual Studio developer shell
@@ -55,7 +55,7 @@ On Windows, the DLLs both programs need are copied next to them.
 
 The CPU kernels are compiled once for each instruction set the compiler supports, and the engine picks one at run time: AVX2, AVX-VNNI and AVX-512 on x86-64; NEON and the dot product on Arm. The rest of the library stays at the baseline (x86-64 or Armv8-A), so one binary runs on any CPU of its architecture. To see the kernels a machine runs, use `carbon-ocr cpus`.
 
-## <img src="assets/chip-03.svg" height="22" alt=""> 3. The GPU build
+## <img src="assets/chip-03.svg" height="22" alt=""> The GPU build
 
 1. Install or unpack CUDA 12.9 or 13.x.
 2. Unpack a TensorRT 11 release that matches the CUDA, and set `TensorRT_ROOT` to that folder, either as an environment variable or as a CMake cache variable.
@@ -72,7 +72,7 @@ ctest --preset ninja-trt
 
 TensorRT 11 builds strongly typed networks, so a model runs in FP16 only when its ONNX file is FP16. That is why a model set ships `<model>.fp16.onnx` beside each FP32 file. Building a TensorRT engine takes time; `--engine-cache DIR` keeps the built engines, so later runs reuse them. A cached engine belongs to its GPU and its TensorRT version.
 
-## <img src="assets/chip-04.svg" height="22" alt=""> 4. Options
+## <img src="assets/chip-04.svg" height="22" alt=""> Options
 
 | option | default | what |
 |---|---|---|
@@ -96,7 +96,7 @@ TensorRT 11 builds strongly typed networks, so a model runs in FP16 only when it
 
 To use the library from another CMake project, add this repository with `add_subdirectory` (or FetchContent) and link `carbon::carbon`. Its public headers are in `carbon/include/carbon/`, and `carbon/carbon.h` includes them all.
 
-## <img src="assets/chip-05.svg" height="22" alt=""> 5. The Python module
+## <img src="assets/chip-05.svg" height="22" alt=""> The Python module
 
 ```shell
 pip install ./python                                        # ONNX Runtime, the CPU
@@ -105,7 +105,7 @@ pip install ./python -C cmake.define.CARBON_WITH_CUDA=ON    # and the CUDA kerne
 
 scikit-build-core builds the module `carbon_ocr` from this CMake project, with ONNX Runtime and without the CLI or the C++ tests. ONNX Runtime's library is installed next to the module, which finds it there. TensorRT is not in the module yet, so `Pipeline(device="cuda")` needs a build of `carbon-ocr` instead (`carbon-ocr ocr --device cuda`). [python/README.md](../python/README.md) lists the module's API.
 
-## <img src="assets/chip-06.svg" height="22" alt=""> 6. Tests
+## <img src="assets/chip-06.svg" height="22" alt=""> Tests
 
 `ctest --preset <preset>` runs the C++ tests: the tensors, the crop rule, the CPU kernels against their scalar reference, the native backend against ONNX Runtime, the detector's and order model's decoders, the engine and the batched pipeline on small fake models, PDFs, the output formats and the command line. The tests that need a GPU are built with CUDA or TensorRT and run on a machine with one.
 

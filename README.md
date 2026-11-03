@@ -123,7 +123,8 @@ for line in page["lines"]:
 Carbon-OCR also runs as OCRmyPDF's OCR engine:
 
 ```shell
-ocrmypdf --plugin tools/ocrmypdf/carbon_ocrmypdf.py --carbon-set models/fullerene-3M in.pdf out.pdf
+ocrmypdf --plugin tools/ocrmypdf/carbon_ocrmypdf.py \
+    --carbon-set models/fullerene-3M in.pdf out.pdf
 ```
 
 [docs/USAGE.md](docs/USAGE.md) covers every command and option, the output formats, the Python module and the plugin.
@@ -141,6 +142,10 @@ ocrmypdf --plugin tools/ocrmypdf/carbon_ocrmypdf.py --carbon-set models/fulleren
 | [`docs/`](docs) | the documentation below |
 
 ## <img src="docs/assets/chip-08.svg" height="22" alt=""> Documentation
+
+Two of them are also typeset as PDFs, each in a light and a dark edition:
+- **The engine guide**: the engine, building it and using it, in one document ([PDF](docs/Carbon-OCR-Engine-Guide.pdf), [dark](docs/Carbon-OCR-Engine-Guide-Dark.pdf)).
+- **The models** ([PDF](docs/Carbon-OCR-Models.pdf), [dark](docs/Carbon-OCR-Models-Dark.pdf)).
 
 | document | what it covers |
 |---|---|
