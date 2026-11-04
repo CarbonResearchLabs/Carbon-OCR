@@ -201,7 +201,7 @@ nb::list infos(const std::vector<carbon::TensorInfo>& v) {
 
 // ---------------------------------------------------------------- pages
 
-nb::dict page_dict(const carbon::OcrPage& p, bool html = false) {
+nb::dict page_dict(const carbon::OcrPage& p, bool html = false, bool markdown = false) {
   nb::dict d;
   d["width"] = p.width;
   d["height"] = p.height;
@@ -245,6 +245,7 @@ nb::dict page_dict(const carbon::OcrPage& p, bool html = false) {
   d["ms"] = ms;
   d["text"] = p.text();
   if (html) d["html"] = carbon::to_html_body(p);
+  if (markdown) d["markdown"] = carbon::to_markdown(std::span<const carbon::OcrPage>(&p, 1));
   return d;
 }
 
@@ -329,7 +330,7 @@ NB_MODULE(carbon_ocr, m) {
       .def_prop_ro("workers", &carbon::Engine::workers)
       .def(
           "ocr",
-          [](carbon::Engine& e, std::vector<Gray> pages, bool html) {
+          [](carbon::Engine& e, std::vector<Gray> pages, bool html, bool markdown) {
             std::vector<carbon::GrayView> views;
             for (const Gray& g : pages) views.push_back(view(g));
             std::vector<carbon::OcrPage> out;
@@ -338,15 +339,16 @@ NB_MODULE(carbon_ocr, m) {
               out = e.ocr(views);
             }
             nb::list result;
-            for (const auto& p : out) result.append(page_dict(p, html));
+            for (const auto& p : out) result.append(page_dict(p, html, markdown));
             return result;
           },
-          "pages"_a, "html"_a = false,
+          "pages"_a, "html"_a = false, "markdown"_a = false,
           "Reads grayscale pages (uint8 [h, w], paper 255) in parallel; for each a dict: width, height, rotation, "
           "skew, lines (box, text, confidence, det_score) in reading order, pictures, order (\"model\" or "
           "\"xy-cut\"), blocks (label, confidence, lines, cells), second_pass (detected again at a larger scale: tiny "
           "text), ms (per stage), text; with html, the page as carbon-ocr's --format html writes it, its blocks as "
-          "headings, paragraphs, lists and tables (carbon/output.h).")
+          "headings, paragraphs, lists and tables (carbon/output.h); with markdown, the page as --format markdown "
+          "writes it.")
       .def(
           "submit",
           [](carbon::Engine& e, Gray page) {
@@ -376,16 +378,16 @@ NB_MODULE(carbon_ocr, m) {
           "cannot be read is that page's error, raised by next().")
       .def(
           "next",
-          [](carbon::Engine& e, bool html) -> nb::object {
+          [](carbon::Engine& e, bool html, bool markdown) -> nb::object {
             std::optional<carbon::OcrPage> p;
             {
               nb::gil_scoped_release unlocked;
               p = e.next();
             }
             if (!p) return nb::none();
-            return page_dict(*p, html);
+            return page_dict(*p, html, markdown);
           },
-          "html"_a = false,
+          "html"_a = false, "markdown"_a = false,
           "The next page given to submit(), in the order given, as ocr() returns it; waits for it. Raises the error "
           "that page met (the stream goes on); None once every page given is out.");
 
@@ -426,7 +428,7 @@ NB_MODULE(carbon_ocr, m) {
                    [](const carbon::Pipeline& p) { return p.device() == carbon::Device::kCuda ? "cuda" : "cpu"; })
       .def(
           "ocr",
-          [](carbon::Pipeline& p, std::vector<Gray> pages, bool html) {
+          [](carbon::Pipeline& p, std::vector<Gray> pages, bool html, bool markdown) {
             std::vector<carbon::GrayView> views;
             for (const Gray& g : pages) views.push_back(view(g));
             std::vector<carbon::OcrPage> out;
@@ -435,10 +437,10 @@ NB_MODULE(carbon_ocr, m) {
               out = p.ocr(views);
             }
             nb::list result;
-            for (const auto& page : out) result.append(page_dict(page, html));
+            for (const auto& page : out) result.append(page_dict(page, html, markdown));
             return result;
           },
-          "pages"_a, "html"_a = false,
+          "pages"_a, "html"_a = false, "markdown"_a = false,
           "Reads grayscale pages (uint8 [h, w], paper 255), each a dict as Engine.ocr gives it, in order.")
       .def_prop_ro("stats", [](const carbon::Pipeline& p) {
         const carbon::PipelineStats s = p.stats();

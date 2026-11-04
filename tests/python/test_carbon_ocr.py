@@ -236,6 +236,10 @@ def test_engine_reads_a_page():
     h = ordered.ocr([page], html=True)[0]
     assert h["html"] == "<h2>aaa</h2>\n<h2>aaaaa</h2>\n<h2>aa</h2>\n" and "html" not in o and h["skew"] == 0.0
     assert e.ocr([page], html=True)[0]["html"] == "<p>aaa</p>\n<p>aaaaa</p>\n<p>aa</p>\n"  # no blocks: by their gaps
+    # markdown=True: as carbon-ocr --format markdown writes it; asked only
+    m = ordered.ocr([page], markdown=True)[0]
+    assert "markdown" not in o and "html" not in m
+    assert m["markdown"].split() == ["##", "aaa", "##", "aaaaa", "##", "aa"], m["markdown"]
 
 
 def test_engine_streams_pages_as_ocr_reads_them():
