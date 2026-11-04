@@ -209,10 +209,12 @@ struct Pipeline::Impl {
   bool closed = false, stopping = false;
   std::exception_ptr error;
   std::map<size_t, OcrPage> ready;
+  std::map<size_t, std::exception_ptr> failed;  // the pages that met an error, each with its own
 
   std::atomic<int64_t> pages{0}, lines{0}, orient_runs{0}, detect_runs{0}, recognize_runs{0};
 
-  Impl(const std::filesystem::path& set, PipelineOptions options) : o(std::move(options)), e(o.engine) {
+  Impl(const std::filesystem::path& set, PipelineOptions options, std::unique_ptr<PipelineModels> given = nullptr)
+      : o(std::move(options)), e(o.engine) {
     if (o.page_batch < 1 || o.line_batch < 1 || o.in_flight < 1) {
       throw Error("Pipeline: page_batch, line_batch and in_flight are at least 1");
     }
@@ -220,10 +222,14 @@ struct Pipeline::Impl {
     e.crop = detail::model_crop(set, e.rec, e.crop);
     if (!e.turn_probability) e.turn_probability = detail::model_turn_probability(set);
     const int cores = cpu_topology().default_workers();
-    const Device device = o.device.value_or(cuda_pipeline_available() ? Device::kCuda : Device::kCpu);
-    models = device == Device::kCuda ? cuda_pipeline_models(set, e, o)
-                                     : cpu_pipeline_models(set, e, o.model_threads > 0 ? o.model_threads : cores);
-    if (device == Device::kCpu) check_recognizer(static_cast<const CpuModels&>(*models).rec());
+    if (given) {  // the caller's own (Pipeline's third constructor)
+      models = std::move(given);
+    } else {
+      const Device device = o.device.value_or(cuda_pipeline_available() ? Device::kCuda : Device::kCpu);
+      models = device == Device::kCuda ? cuda_pipeline_models(set, e, o)
+                                       : cpu_pipeline_models(set, e, o.model_threads > 0 ? o.model_threads : cores);
+      if (device == Device::kCpu) check_recognizer(static_cast<const CpuModels&>(*models).rec());
+    }
     order_model = detail::choose_order(set, e);
     const int n = o.threads > 0 ? o.threads : cores;
     order.resize(n);
@@ -268,7 +274,32 @@ struct Pipeline::Impl {
     }
   }
 
-  // ---- failures: the first stage's error ends the pipeline
+  // ---- failures. A page's own (a run of it, or a step of it, met an error): that page comes out with it, next
+  // throws it, and the stream goes on, as the CPU engine's (Engine::next). Anything else, outside a page's work,
+  // ends the pipeline: the first such error, then every call's.
+  void fail_page(Page& p, std::exception_ptr ep) {
+    p.image = GrayImage{};
+    p.small = GrayImage{};
+    p.up = detail::Upright{};
+    {
+      std::lock_guard lk(m);
+      if (ready.count(p.index) || failed.count(p.index)) return;
+      failed.emplace(p.index, std::move(ep));
+      ++delivered;
+    }
+    cv.notify_all();
+  }
+  void fail_pages(std::span<PagePtr> run, const std::exception_ptr& ep) {
+    for (PagePtr& p : run) fail_page(*p, ep);
+  }
+  template <class F>
+  void for_page(Page& p, F&& f) {
+    try {
+      f();
+    } catch (...) {
+      fail_page(p, std::current_exception());
+    }
+  }
   void fail(std::exception_ptr ep) {
     {
       std::lock_guard lk(m);
@@ -320,21 +351,31 @@ struct Pipeline::Impl {
       for (size_t i = 0; i < batch.size(); ++i) {
         std::copy(batch[i]->thumb.begin(), batch[i]->thumb.end(), thumbs.begin() + i * per);
       }
-      const std::vector<float> z = models->orient(thumbs.data(), static_cast<int>(batch.size()), side);
+      std::vector<float> z;
+      try {
+        z = models->orient(thumbs.data(), static_cast<int>(batch.size()), side);
+      } catch (...) {  // the run's pages fail with it; the next run goes on
+        fail_pages(batch, std::current_exception());
+        continue;
+      }
       const size_t classes = z.size() / batch.size();
       ++orient_runs;
       for (size_t i = 0; i < batch.size(); ++i) {
         PagePtr p = std::move(batch[i]);
-        p->out.rotation = detail::rotation_of(std::span<const float>(z.data() + i * classes, classes),
-                                              *e.turn_probability);
-        p->thumb = {};
-        cpu_task([this, page = std::move(p)](int) {
-          detail::make_upright(page->image.view(), page->out.rotation, std::move(page->small), e, page->up);
-          page->out.skew = page->up.skew;
-          const GrayView sv = page->up.small.view();
-          std::tie(page->ph, page->pw) = models->detect_size(sv.width, sv.height);
-          page->out.ms.orient = ms_since(page->start);
-          to_detect.push(page);
+        for_page(*p, [&] {
+          p->out.rotation = detail::rotation_of(std::span<const float>(z.data() + i * classes, classes),
+                                                *e.turn_probability);
+          p->thumb = {};
+          cpu_task([this, page = p](int) {
+            for_page(*page, [&] {
+              detail::make_upright(page->image.view(), page->out.rotation, std::move(page->small), e, page->up);
+              page->out.skew = page->up.skew;
+              const GrayView sv = page->up.small.view();
+              std::tie(page->ph, page->pw) = models->detect_size(sv.width, sv.height);
+              page->out.ms.orient = ms_since(page->start);
+              to_detect.push(page);
+            });
+          });
         });
       }
     }
@@ -379,22 +420,30 @@ struct Pipeline::Impl {
       const auto t = Clock::now();
       std::vector<GrayView> smalls;
       for (const PagePtr& p : batch) smalls.push_back(p->up.small.view());
-      const std::vector<Detection> found = models->detect(smalls, ph, pw, e.det);
+      std::vector<Detection> found;
+      try {
+        found = models->detect(smalls, ph, pw, e.det);
+      } catch (...) {  // the run's pages fail with it; the next run goes on
+        fail_pages(batch, std::current_exception());
+        continue;
+      }
       ++detect_runs;
       const double ms = ms_since(t) / batch.size();
       for (size_t i = 0; i < batch.size(); ++i) {
         PagePtr p = std::move(batch[i]);
-        p->out.ms.detect = ms;
-        const auto t2 = Clock::now();
-        detail::place_detection(found[i], p->up.view, smalls[i].width, smalls[i].height, e, second, p->out);
-        p->up.small = GrayImage{};
-        p->out.ms.decode = ms_since(t2) - p->out.ms.second_pass;
-        p->lines_start = Clock::now();
-        if (p->out.lines.empty()) {
-          cpu_task([this, p](int k) { finish(*p, k); });
-        } else {
-          to_recognize.push(std::move(p));
-        }
+        for_page(*p, [&] {  // its second pass among it: a page's own
+          p->out.ms.detect = ms;
+          const auto t2 = Clock::now();
+          detail::place_detection(found[i], p->up.view, smalls[i].width, smalls[i].height, e, second, p->out);
+          p->up.small = GrayImage{};
+          p->out.ms.decode = ms_since(t2) - p->out.ms.second_pass;
+          p->lines_start = Clock::now();
+          if (p->out.lines.empty()) {
+            cpu_task([this, p](int k) { for_page(*p, [&] { finish(*p, k); }); });
+          } else {
+            to_recognize.push(p);
+          }
+        });
       }
     }
   }
@@ -429,7 +478,15 @@ struct Pipeline::Impl {
         }
       }
       std::stable_sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.bucket < b.bucket; });
-      models->set_pages(views);
+      // A run's error is every page's with a line in it; those pages fail once the group's runs are done (the
+      // runs read the group's pages), and the rest of the group goes on.
+      std::vector<std::exception_ptr> errors(group.size());
+      try {
+        models->set_pages(views);
+      } catch (...) {
+        fail_pages(group, std::current_exception());
+        continue;
+      }
       std::vector<int32_t> page_of, lengths;
       std::vector<LineBox> boxes;
       std::vector<CtcLine> decoded;
@@ -444,16 +501,38 @@ struct Pipeline::Impl {
           page_of.push_back(items[i].page);
           boxes.push_back(group[items[i].page]->out.lines[items[i].line].box);
         }
-        models->recognize(page_of, boxes, items[a].bucket, e.crop, decoded, lengths);
-        ++recognize_runs;
-        lines += static_cast<int64_t>(b - a);
+        try {
+          models->recognize(page_of, boxes, items[a].bucket, e.crop, decoded, lengths);
+          ++recognize_runs;
+          lines += static_cast<int64_t>(b - a);
+        } catch (...) {
+          const std::exception_ptr ep = std::current_exception();
+          for (size_t i = a; i < b; ++i) {
+            if (!errors[items[i].page]) errors[items[i].page] = ep;
+          }
+          a = b;
+          continue;
+        }
         for (size_t i = a; i < b; ++i) {
-          detail::read_line(group[items[i].page]->out.lines[items[i].line], decoded[i - a], lengths[i - a], e.crop,
-                            vocab);
+          std::exception_ptr& err = errors[items[i].page];
+          if (err) continue;
+          try {
+            detail::read_line(group[items[i].page]->out.lines[items[i].line], decoded[i - a], lengths[i - a],
+                              e.crop, vocab);
+          } catch (...) {
+            err = std::current_exception();
+          }
         }
         a = b;
       }
-      for (PagePtr& p : group) cpu_task([this, p](int k) { finish(*p, k); });
+      for (size_t g = 0; g < group.size(); ++g) {
+        PagePtr& p = group[g];
+        if (errors[g]) {
+          fail_page(*p, errors[g]);
+        } else {
+          cpu_task([this, p](int k) { for_page(*p, [&] { finish(*p, k); }); });
+        }
+      }
     }
   }
 
@@ -487,8 +566,10 @@ struct Pipeline::Impl {
     lk.unlock();
     const size_t index = page->index;
     cpu_task([this, page](int) {
-      prepare(*page);
-      to_orient.push(page);
+      for_page(*page, [&] {
+        prepare(*page);
+        to_orient.push(page);
+      });
     });
     return index;
   }
@@ -503,8 +584,16 @@ struct Pipeline::Impl {
 
   std::optional<OcrPage> next() {
     std::unique_lock lk(m);
-    cv.wait(lk, [&] { return error || ready.count(taken) || (closed && taken == submitted) || stopping; });
+    cv.wait(lk, [&] {
+      return error || ready.count(taken) || failed.count(taken) || (closed && taken == submitted) || stopping;
+    });
     if (error) std::rethrow_exception(error);
+    if (const auto f = failed.find(taken); f != failed.end()) {  // this page's error; the next page goes on
+      const std::exception_ptr ep = f->second;
+      failed.erase(f);
+      ++taken;
+      std::rethrow_exception(ep);
+    }
     auto it = ready.find(taken);
     if (it == ready.end()) return std::nullopt;
     OcrPage out = std::move(it->second);
@@ -516,6 +605,11 @@ struct Pipeline::Impl {
 
 Pipeline::Pipeline(const std::filesystem::path& set, PipelineOptions options)
     : impl_(std::make_unique<Impl>(set, std::move(options))) {}
+
+Pipeline::Pipeline(const std::filesystem::path& set, PipelineOptions options, std::unique_ptr<PipelineModels> models)
+    : impl_(std::make_unique<Impl>(set, std::move(options), std::move(models))) {
+  if (!impl_->models) throw Error("Pipeline: no models");
+}
 
 Pipeline::~Pipeline() = default;
 
@@ -533,6 +627,15 @@ std::vector<OcrPage> Pipeline::ocr(std::span<const GrayView> pages) {
     return impl_->submitted;
   }();
   if (base != impl_->taken) throw Error("Pipeline::ocr: pages given by submit are still in it");
+  std::exception_ptr first_error;
+  auto take = [&] {
+    try {
+      out.push_back(*impl_->next());
+    } catch (...) {
+      if (!first_error) first_error = std::current_exception();
+      out.emplace_back();
+    }
+  };
   for (const GrayView& p : pages) {
     if (!p.data || p.width <= 0 || p.height <= 0) throw Error("Pipeline::ocr: an empty page");
     GrayImage copy{p.width, p.height, std::vector<uint8_t>(static_cast<size_t>(p.width) * p.height)};
@@ -543,13 +646,14 @@ std::vector<OcrPage> Pipeline::ocr(std::span<const GrayView> pages) {
     impl_->submit(std::move(copy));
     // take what is out as it comes, so the pages in flight stay few
     std::unique_lock lk(impl_->m);
-    while (impl_->ready.count(impl_->taken)) {
+    while (impl_->ready.count(impl_->taken) || impl_->failed.count(impl_->taken)) {
       lk.unlock();
-      out.push_back(*impl_->next());
+      take();
       lk.lock();
     }
   }
-  while (out.size() < pages.size()) out.push_back(*impl_->next());
+  while (out.size() < pages.size()) take();
+  if (first_error) std::rethrow_exception(first_error);  // every page through first: the pipeline goes on
   return out;
 }
 

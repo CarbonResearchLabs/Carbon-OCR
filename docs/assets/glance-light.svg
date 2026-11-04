@@ -20,7 +20,7 @@
 <text x="412.0" y="287.0" font-family="Plex" font-weight="400" font-size="16" fill="#3d3d3d">MAC/s for rec-latin in FP16 on a laptop RTX 4060,</text>
 <text x="412.0" y="310.0" font-family="Plex" font-weight="400" font-size="16" fill="#3d3d3d">measured: TensorRT 11.4</text>
 <rect x="824.0" y="195.0" width="376.0" height="5.0" rx="0" fill="#1a1a1a"/>
-<text x="824.0" y="251.0" font-family="PlexMono" font-weight="500" font-size="42" letter-spacing="-0.84" fill="#1a1a1a">201</text>
-<text x="824.0" y="287.0" font-family="Plex" font-weight="400" font-size="16" fill="#3d3d3d">tests: 185 in CI on Windows and Linux, and 16 more</text>
+<text x="824.0" y="251.0" font-family="PlexMono" font-weight="500" font-size="42" letter-spacing="-0.84" fill="#1a1a1a">202</text>
+<text x="824.0" y="287.0" font-family="Plex" font-weight="400" font-size="16" fill="#3d3d3d">tests: 186 in CI on Windows and Linux, and 16 more</text>
 <text x="824.0" y="310.0" font-family="Plex" font-weight="400" font-size="16" fill="#3d3d3d">on a GPU</text>
 </svg>

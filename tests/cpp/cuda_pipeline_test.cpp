@@ -6,15 +6,19 @@
 //   int8   the .int8-sym.onnx files, built by TensorRT as INT8 networks
 //   fp16   with fused_head off: the FP16 files, the recognizer whole in float32
 // and fp16 with the fused head on refused, the fake set having no trunk and head.
+// A page of tiny text among them takes the second detection pass on both devices, and a
+// page's line wider than every recognizer bucket is read as the CPU device reads it.
 // Skipped without a GPU.
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <vector>
 
 #include "carbon/deskew.h"
 #include "carbon/error.h"
 #include "carbon/image.h"
+#include "carbon/lines.h"
 #include "carbon/pipeline.h"
 
 namespace carbon {
@@ -32,16 +36,48 @@ PipelineOptions gpu_options(Precision precision, bool fused_head) {
   return gpu;
 }
 
+// A page of tiny text at the detector's scale: bars 5 px high, every other one starting on an odd row, which
+// the fake detector finds only at twice the scale (batch_pipeline_test.cpp's tiny_page).
+GrayImage tiny_page() {
+  GrayImage p{800, 1024, std::vector<uint8_t>(800 * 1024, 255)};
+  const int dashes[] = {3, 4, 2, 3, 4, 2};
+  for (int i = 0; i < 6; ++i) {
+    const int y = 200 + 41 * i;
+    for (int d = 0; d < dashes[i]; ++d) {
+      for (int r = y; r < y + 5; ++r) std::fill_n(p.pixels.begin() + r * 800 + 100 + 32 * d, 24, uint8_t{20});
+    }
+  }
+  return p;
+}
+
+// A page with one line far wider than it is high (a bar 760 px long and 6 px high): its crop is wider than the
+// GPU recognizer's widest bucket, 2048 px, so the GPU gives it to the CPU device's recognizer.
+GrayImage wide_line_page() {
+  GrayImage p{800, 1024, std::vector<uint8_t>(800 * 1024, 255)};
+  for (int r = 500; r < 506; ++r) std::fill_n(p.pixels.begin() + r * 800 + 20, 760, uint8_t{20});
+  return p;
+}
+
 TEST(CudaPipeline, ReadsPagesAsTheCpuDeviceDoesAtEveryPrecision) {
   if (!cuda_pipeline_available()) GTEST_SKIP() << "no GPU, or no TensorRT in this build";
   const GrayImage page = load_image(kSet / "page.png");
   const GrayImage skewed = rotate_page(page.view(), 2.5);
   const GrayImage blank{400, 300, std::vector<uint8_t>(400 * 300, 255)};
+  const GrayImage tiny = tiny_page();
+  const GrayImage wide = wide_line_page();
+  const GrayView kinds[] = {page.view(), blank.view(), skewed.view(), tiny.view(), wide.view()};
   std::vector<GrayView> pages;
-  for (int i = 0; i < 12; ++i) pages.push_back(i % 3 == 0 ? page.view() : i % 3 == 1 ? blank.view() : skewed.view());
+  for (int i = 0; i < 15; ++i) pages.push_back(kinds[i % 5]);
   PipelineOptions cpu;
   cpu.device = Device::kCpu;
   const std::vector<OcrPage> want = Pipeline(kSet, cpu).ocr(pages);
+  ASSERT_TRUE(want[3].second_pass);
+  ASSERT_EQ(want[3].lines.size(), 6u);
+  ASSERT_EQ(want[4].lines.size(), 1u);
+  {
+    const Pipeline crop_of(kSet, cpu);
+    ASSERT_GT(width_bucket(crop_region(want[4].lines[0].box, crop_of.crop()).width), 2048);
+  }
   struct Case {
     Precision precision;
     bool fused_head;
@@ -55,6 +91,7 @@ TEST(CudaPipeline, ReadsPagesAsTheCpuDeviceDoesAtEveryPrecision) {
     ASSERT_EQ(got.size(), want.size());
     for (size_t p = 0; p < got.size(); ++p) {
       EXPECT_EQ(got[p].rotation, want[p].rotation) << "page " << p;
+      EXPECT_EQ(got[p].second_pass, want[p].second_pass) << "page " << p;
       ASSERT_EQ(got[p].lines.size(), want[p].lines.size()) << "page " << p;
       for (size_t i = 0; i < got[p].lines.size(); ++i) {
         EXPECT_EQ(got[p].lines[i].text, want[p].lines[i].text) << "page " << p << " line " << i;

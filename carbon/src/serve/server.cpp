@@ -237,7 +237,7 @@ struct Server::Impl {
     uint64_t conn = 0;
     std::shared_ptr<const std::string> body;
     std::string format, name;
-    bool text_only = false, keep_alive = true;
+    bool text_only = false, html = false, keep_alive = true;
     Clock::time_point t0;
     std::shared_ptr<GrayImage> image;  // on a GPU with format=pdf: the decoded page, for the PDF's image
   };
@@ -355,14 +355,23 @@ struct Server::Impl {
         const std::span<const OcrPage> pages(page, 1);
         const std::vector<std::string> names = {w.name};
         type = formats().find(w.format)->second;
-        if (w.format == "json") body = page->json() + "\n";
-        else if (w.format == "text") body = page->text();
-        else if (w.format == "hocr") body = to_hocr(pages, names);
-        else if (w.format == "alto") body = to_alto(pages, names);
-        else if (w.format == "page") body = to_page_xml(*page, w.name);
-        else if (w.format == "markdown") body = to_markdown(pages);
-        else if (w.format == "html") body = to_html(pages);
-        else {  // pdf: the page's image under its words
+        if (w.format == "json") {  // html=1: the page's html body inside it, as carbon_ocr's html=True gives it
+          body = page->json();
+          if (w.html) body.insert(body.size() - 1, ", \"html\": " + json_string(to_html_body(*page)));
+          body += "\n";
+        } else if (w.format == "text") {
+          body = page->text();
+        } else if (w.format == "hocr") {
+          body = to_hocr(pages, names);
+        } else if (w.format == "alto") {
+          body = to_alto(pages, names);
+        } else if (w.format == "page") {
+          body = to_page_xml(*page, w.name);
+        } else if (w.format == "markdown") {
+          body = to_markdown(pages);
+        } else if (w.format == "html") {
+          body = to_html(pages);
+        } else {  // pdf: the page's image under its words
           const GrayImage img = w.image ? std::move(*w.image)
                                         : decode_image(std::span<const uint8_t>(
                                               reinterpret_cast<const uint8_t*>(w.body->data()), w.body->size()));
@@ -606,6 +615,8 @@ struct Server::Impl {
     w.name = std::string(req.param("name").value_or("page"));
     const std::string_view to = req.param("text_only").value_or("0");
     w.text_only = to == "1" || to == "true";
+    const std::string_view html = req.param("html").value_or("0");
+    w.html = html == "1" || html == "true";
     const Kind kind = sniff(body);
     if (body.empty() || kind != Kind::kImage) {
       error_reply(c, 415,

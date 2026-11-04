@@ -14,7 +14,11 @@
 //   detect     the pages at the detector's scale, uint8, padded with paper into a
 //              pinned buffer at one of the fixed sizes, uploaded, made an ink map
 //              (cuda::ink_map), det's file, and cuda::threshold_det: only the
-//              masks come back for carbon::decode_det
+//              masks come back for carbon::decode_det.  The second pass (a page of
+//              tiny text, as the CPU runs it: carbon/detect.h) gives detect_one each
+//              strip's ink map, any size up to second_pass_long_side square: det's
+//              file again, at one profile that holds them all, its maps back as
+//              float32, decoded and merged on the CPU as the CPU's are
 //   recognize  the upright pages uploaded once a group (the same views across the
 //              group's runs), every line cropped by cuda::crop_lines, made an ink
 //              map; at fp16 and auto the trunk (<rec>.features.fp16.onnx) and the
@@ -22,7 +26,8 @@
 //              probabilities back, collapsed by carbon::ctc_collapse; else (no trunk
 //              and head files, fused_head off, fp32, int8) the recognizer whole,
 //              <rec>.onnx or <rec>.int8-sym.onnx, its float32 logits through
-//              cuda::ctc_greedy.
+//              cuda::ctc_greedy.  A line wider than every bucket (past 2048 px) is
+//              read on the CPU, by the CPU device's models, as the CPU reads it.
 //
 // Every buffer a model reads or writes is allocated at open at its largest, so
 // its address stays fixed and the CUDA graphs replay.
@@ -40,6 +45,7 @@
 #include "carbon/cuda.h"
 #include "carbon/engine.h"
 #include "carbon/error.h"
+#include "carbon/parallel.h"
 #include "carbon/pipeline.h"
 #include "carbon/session.h"
 
@@ -164,6 +170,24 @@ class CudaModels final : public PipelineModels {
     det_ = open_session(Backend::kTensorRT, det_file, det_o);
     det_half_in_ = is_half(det_->inputs().at(0), det_file);
     det_half_out_ = is_half(det_->outputs().at(0), det_file);
+    // The second detection pass: the upright page again at twice the detector's scale, its long side at most
+    // second_pass_long_side, whole or in strips of about a first pass's pixels (engine_steps.h second_pass), so
+    // any size of multiples of 32 up to that side square. A session of det's file of its own, so the first
+    // pass's exact profiles (and their cached engines) stay as they are. None where the pass is off.
+    if (o.det.second_pass_below > 0) {
+      second_side_ = round_up(o.second_pass_long_side, 32);
+      const int first = round_up(long_, 32);
+      SessionOptions det2_o = so;
+      det2_o.profiles.push_back({{"x", {1, 1, 32, 32}, {1, 1, first, first}, {1, 1, second_side_, second_side_}}});
+      det2_ = open_session(Backend::kTensorRT, det_file, det2_o);
+      det2_half_in_ = is_half(det2_->inputs().at(0), det_file);
+      det2_half_out_ = is_half(det2_->outputs().at(0), det_file);
+      const size_t px = static_cast<size_t>(second_side_) * second_side_;
+      det2_f32_.reserve(px * sizeof(float));
+      if (det2_half_in_) det2_in_.reserve(px * sizeof(uint16_t));
+      det2_maps_.reserve(px / 4 * 4 * (det2_half_out_ ? 2 : 4));  // [1][4][h/2][w/2]
+      det2_host_.reserve(det2_maps_.bytes);
+    }
 
     // the recognizer: a profile for each width bucket, batches of 1 to line_batch
     const int h = crop_.height;
@@ -206,6 +230,11 @@ class CudaModels final : public PipelineModels {
       throw Error(o.rec + " has " + std::to_string(classes_) + " classes but its vocabulary " +
                   std::to_string(classes_vocab));
     }
+    // A line wider than every bucket (a crop past 2048 px, which carbon::width_bucket gives its own width rounded
+    // up to 8) has no profile here: recognize gives such lines to the CPU device's models, opened at the first.
+    set_ = set;
+    cpu_o_ = o;
+    cpu_o_.precision = Precision::kAuto;  // the CPU's own files (the GPU's int8-sym file is not the CPU's int8)
 
     // every buffer at its largest, once
     const size_t thumbs = static_cast<size_t>(maxb) * side_ * side_;
@@ -305,12 +334,57 @@ class CudaModels final : public PipelineModels {
     return found;
   }
 
+  bool second_pass() const override { return det2_ != nullptr; }
+
+  // A second pass's run (the detect stage's thread, on its stream): the page's or strip's ink map, [1, 1, h, w]
+  // float32 from the CPU, uploaded (made float16 for a float16 input), det's file, and the maps back as float32,
+  // [1, 4, h/2, w/2], which the CPU decodes as it decodes its own.
+  Tensor detect_one(const Tensor& input) override {
+    check(cudaSetDevice(gpu_), "cudaSetDevice");
+    const Shape& s = input.shape();
+    if (s.size() != 4 || s[0] != 1 || s[1] != 1 || s[2] < 32 || s[3] < 32 || s[2] > second_side_ ||
+        s[3] > second_side_ || s[2] % 32 || s[3] % 32 || input.dtype() != DType::kFloat32) {
+      throw Error("the second detection pass on the GPU takes [1, 1, h, w] float32, h and w multiples of 32 to " +
+                  std::to_string(second_side_) + ", not " + shape_string(s) + " " +
+                  std::string(dtype_name(input.dtype())));
+    }
+    const size_t px = static_cast<size_t>(s[2]) * s[3];
+    const cudaStream_t st = det_s_.s;
+    check(cudaMemcpyAsync(det2_f32_.p, input.data<float>().data(), px * sizeof(float), cudaMemcpyHostToDevice, st),
+          "second pass input");
+    void* x_in = det2_f32_.p;
+    if (det2_half_in_) {
+      cuda::to_half(det2_f32_.as<float>(), det2_in_.p, static_cast<int64_t>(px), st);
+      x_in = det2_in_.p;
+    }
+    const Shape in{1, 1, s[2], s[3]};
+    const Shape out_shape = det2_->output_shapes({&in, 1})[0];
+    const std::vector<DeviceTensor> x = {{x_in, dtype(det2_half_in_), in}};
+    const std::vector<DeviceTensor> y = {{det2_maps_.p, dtype(det2_half_out_), out_shape}};
+    det2_->enqueue(x, y, st);
+    size_t n = 1;
+    for (const int64_t d : out_shape) n *= static_cast<size_t>(d);
+    check(cudaMemcpyAsync(det2_host_.p, det2_maps_.p, n * (det2_half_out_ ? 2 : 4), cudaMemcpyDeviceToHost, st),
+          "second pass maps");
+    det_s_.sync();
+    Tensor out = Tensor::empty(DType::kFloat32, out_shape);
+    float* to = out.data<float>().data();
+    if (det2_half_out_) {
+      const uint16_t* z = det2_host_.as<uint16_t>();
+      for (size_t i = 0; i < n; ++i) to[i] = half_to_float(z[i]);
+    } else {
+      std::memcpy(to, det2_host_.p, n * sizeof(float));
+    }
+    return out;
+  }
+
   // The group's upright pages on the device, once for all its runs.
   void set_pages(std::span<const GrayView> pages) override {
     check(cudaSetDevice(gpu_), "cudaSetDevice");
     size_t total = 0;
     for (const GrayView& g : pages) total += static_cast<size_t>(g.width) * g.height;
     rec_s_.sync();  // the last group's crops are done with the buffer
+    host_pages_.assign(pages.begin(), pages.end());  // for lines wider than every bucket, read on the CPU
     pages_.reserve(total);
     device_pages_.clear();
     size_t at = 0;
@@ -325,6 +399,12 @@ class CudaModels final : public PipelineModels {
 
   void recognize(std::span<const int32_t> page_of, std::span<const LineBox> boxes, int bw, const CropRule& crop,
                  std::vector<CtcLine>& lines, std::vector<int32_t>& lengths) override {
+    if (bw > widths_.back()) {  // wider than every bucket: the CPU device's crop, recognizer and decoding
+      if (!cpu_) cpu_ = cpu_pipeline_models(set_, cpu_o_, std::clamp(cpu_topology().default_workers(), 1, 4));
+      cpu_->set_pages(host_pages_);
+      cpu_->recognize(page_of, boxes, bw, crop, lines, lengths);
+      return;
+    }
     check(cudaSetDevice(gpu_), "cudaSetDevice");
     const cudaStream_t s = rec_s_.s;
     const int m = static_cast<int>(boxes.size()), h = crop.height, frames = bw / crop.frame_px;
@@ -377,6 +457,15 @@ class CudaModels final : public PipelineModels {
   std::vector<int> batches_, widths_;
   std::vector<std::pair<int, int>> sizes_;
   std::unique_ptr<Session> orient_, det_, rec_;
+  std::filesystem::path set_;
+  EngineOptions cpu_o_;                  // lines wider than every bucket: the CPU device's models,
+  std::unique_ptr<PipelineModels> cpu_;  // opened at the first such line
+  std::vector<GrayView> host_pages_;     // set_pages', for them
+  std::unique_ptr<Session> det2_;  // the second detection pass; none where it is off
+  int second_side_ = 0;            // its input's largest side
+  bool det2_half_in_ = true, det2_half_out_ = true;
+  DeviceMem det2_f32_, det2_in_, det2_maps_;
+  Pinned det2_host_;
   bool fused_ = false;
   // each model's input and output: float16, else float32
   bool orient_half_in_ = true, orient_half_out_ = true, det_half_in_ = true, det_half_out_ = true;

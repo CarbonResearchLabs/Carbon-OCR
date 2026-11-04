@@ -24,6 +24,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -212,6 +213,25 @@ TEST(Server, AnswersAPageAsTheEngineAndTheWritersRead) {
   EXPECT_TRUE(j.has("Content-Type: application/json"));
   EXPECT_TRUE(j.has("X-Carbon-Lines: 3"));
   EXPECT_EQ(without_ms(j.body), without_ms(want.json())) << j.body;
+  // html=1: the same object with the page's html body in it, as carbon_ocr's html=True gives it
+  const Reply jh = c.ask(post("/ocr?format=json&html=1", png));
+  const size_t at = jh.body.rfind(", \"html\": \"");
+  ASSERT_NE(at, std::string::npos) << jh.body;
+  EXPECT_EQ(without_ms(jh.body.substr(0, at)), without_ms(want.json()));
+  std::string html = "\"";
+  for (const char ch : carbon::to_html_body(want)) {
+    if (ch == '"' || ch == '\\') {
+      html += '\\';
+      html += ch;
+    } else if (static_cast<unsigned char>(ch) < 0x20) {  // a control character as \u00XX, as the server writes it
+      char u[8];
+      std::snprintf(u, sizeof u, "\\u%04x", static_cast<unsigned>(static_cast<unsigned char>(ch)));
+      html += u;
+    } else {
+      html += ch;
+    }
+  }
+  EXPECT_EQ(jh.body.substr(at + 10), html + "\"}\n");
   EXPECT_EQ(c.ask(post("/ocr?format=text", png)).body, want.text());
   EXPECT_EQ(c.ask(post("/ocr?format=hocr", png)).body, carbon::to_hocr(pages, std::vector<std::string>{"page"}));
   EXPECT_EQ(c.ask(post("/ocr?format=alto&name=scan%201.png", png)).body,

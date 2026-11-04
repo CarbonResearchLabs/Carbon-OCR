@@ -11,7 +11,8 @@
 //               thresholded (on the GPU: cuda::threshold_det, only the masks come
 //               back) and decoded into lines on the upright page; a page of tiny
 //               text detected again at a larger scale, in strips, and the passes
-//               merged (on the CPU; on a GPU not yet)
+//               merged, as the CPU engine does it (on a GPU the strips run on
+//               TensorRT too, at a profile of their own)
 //   recognize   the lines of every page waiting, from any of them, by width bucket,
 //               up to line_batch a run: cropped (on the GPU: cuda::crop_lines, every
 //               line of every page in one set of launches), read, CTC-decoded (on the
@@ -32,8 +33,9 @@
 // INT8), detection padded to a few fixed sizes (1024 x 800, 800 x 1024,
 // 1024 x 1024 at a long side of 1024) and batched in powers of two up to
 // page_batch, each an exact profile (a CUDA graph).  The second detection pass's
-// larger page fits none of those sizes, so on a GPU a page of tiny text takes no
-// second pass yet (OcrPage::second_pass false).
+// larger page fits none of those sizes: its strips run on a session of det's file
+// of their own, at one profile that holds every size they come in (to
+// second_pass_long_side square), and a page takes the pass where the CPU's would.
 #pragma once
 
 #include <cstddef>
@@ -94,9 +96,9 @@ class PipelineModels {
   virtual std::vector<Detection> detect(std::span<const GrayView> pages, int ph, int pw, const DetRule& rule) = 0;
   // Whether the device runs the second detection pass (carbon/detect.h), and its
   // runs: one page's input, [1, 1, h, w] float32 (an ink map, h and w multiples of
-  // 32, any size), its maps; the detect stage calls it.  The CPU's does; a GPU's,
-  // whose detection runs only at its fixed sizes, not yet, and its pages take no
-  // second pass.
+  // 32, any size), its maps as float32; the detect stage calls it.  Both devices'
+  // do (a GPU's unless the pass is off, DetRule::second_pass_below 0); a device's
+  // that does not, its pages take no second pass.
   virtual bool second_pass() const { return false; }
   virtual Tensor detect_one(const Tensor& input);
   // The pages the recognize runs that follow crop from (a group of upright pages,
@@ -112,6 +114,10 @@ class PipelineModels {
 class Pipeline {
  public:
   explicit Pipeline(const std::filesystem::path& set, PipelineOptions options = {});
+  // With models of the caller's own in place of a device's (a device of its own, or a
+  // wrapper of cpu_pipeline_models' or cuda_pipeline_models'): options.device is not
+  // used; the set gives the vocabulary, the crop rule and the order model as above.
+  Pipeline(const std::filesystem::path& set, PipelineOptions options, std::unique_ptr<PipelineModels> models);
   ~Pipeline();
   Pipeline(const Pipeline&) = delete;
   Pipeline& operator=(const Pipeline&) = delete;
@@ -121,10 +127,14 @@ class Pipeline {
   size_t submit(GrayImage page);
   // No more pages: next() returns nullopt once every page given is out.
   void close();
-  // The next page's result, in the order given; waits for it.  Throws the first
-  // stage's error.
+  // The next page's result, in the order given; waits for it.  A page that met an
+  // error (in any step of its own, or in a model run that held it: every page of a
+  // failed run fails with it) throws that error, and the stream goes on, as
+  // Engine::next does; an error outside every page's work ends the pipeline, and
+  // every call throws it.
   std::optional<OcrPage> next();
-  // Every page through, and their results in their order (copies the pages).
+  // Every page through, and their results in their order (copies the pages).  Throws
+  // the first page's error, once every page is through, so the pipeline goes on.
   std::vector<OcrPage> ocr(std::span<const GrayView> pages);
 
   Device device() const;

@@ -21,7 +21,7 @@ The goal is to be far more accurate than Tesseract and faster than every open en
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/glance-dark.svg">
-  <img src="docs/assets/glance-light.svg" alt="Designed: 2.83 M parameters in fullerene-3M; 10.8 GMAC per Latin page; OmniParseBench headline 43.5 against Tesseract's 5.9. Measured: rec-latin at 62 GMAC/s on one CPU core and 12.8 TMAC/s in FP16 on a laptop RTX 4060; 201 tests, 185 of them in CI" width="100%">
+  <img src="docs/assets/glance-light.svg" alt="Designed: 2.83 M parameters in fullerene-3M; 10.8 GMAC per Latin page; OmniParseBench headline 43.5 against Tesseract's 5.9. Measured: rec-latin at 62 GMAC/s on one CPU core and 12.8 TMAC/s in FP16 on a laptop RTX 4060; 202 tests, 186 of them in CI" width="100%">
 </picture>
 
 The top row is the design budget, counted from the models' layer shapes. The bottom row is measured on random weights, since speed does not depend on the weights (see Measured so far, below).
@@ -70,7 +70,7 @@ A Latin page is 10.8 GMAC, and 77% of that is recognition. That is why the recog
 
 ## <img src="docs/assets/chip-04.svg" height="22" alt=""> Measured so far
 
-The trained `fullerene-3M` ([on Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M)), read by the engine on all 2,937 pages of OmniParseBench and graded by the benchmark's own grader, against Tesseract 5.5 with its defaults, on the same laptop (3 November 2026): a headline of **43.5** against 5.9 (text 26.2 against 17.8; tables 23.5 and layout 80.6, which Tesseract, writing text alone, scores 0), and **4.06 pages a second on one core** against 0.76 (a median page of 208 ms against 976), 13.6 against 3.2 in six processes. One process of 10 workers with 20 pages in flight reads **15.0 pages a second** over the whole set; one page at a time on 6 workers, the median page takes 79 ms. Its FP16 files on the CPU score 43.6. Served over HTTP (`carbon-ocr serve`, 4 November), 48 of the pages sent by 16 to 32 clients at once came back at 18.5 pages a second, the images' decoding included; `ocr` reads the same pages at 19.0, its count without the decoding.
+The trained `fullerene-3M` ([on Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M)), read by the engine on all 2,937 pages of OmniParseBench and graded by the benchmark's own grader, against Tesseract 5.5 with its defaults, on the same laptop (3 November 2026): a headline of **43.5** against 5.9 (text 26.2 against 17.8; tables 23.5 and layout 80.6, which Tesseract, writing text alone, scores 0), and **4.06 pages a second on one core** against 0.76 (a median page of 208 ms against 976), 13.6 against 3.2 in six processes. One process of 10 workers with 20 pages in flight reads **15.0 pages a second** over the whole set; one page at a time on 6 workers, the median page takes 79 ms. Its FP16 files on the CPU score 43.6. Served over HTTP (`carbon-ocr serve`, 4 November), 48 of the pages sent by 16 to 32 clients at once came back at 18.5 pages a second, the images' decoding included; `ocr` reads the same pages at 19.0, its count without the decoding. On the laptop's RTX 4060 (`carbon-ocr serve --device cuda`, its FP16 files on TensorRT, 32 pages in flight), all 2,937 pages run at **103.7 pages a second** with a headline of 43.4, every page read.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/fig-bench-dark.svg">

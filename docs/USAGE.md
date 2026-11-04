@@ -70,7 +70,7 @@ curl http://127.0.0.1:8080/info
 
 | request | answer |
 |---|---|
-| `POST /ocr` | the body is a page's image (PNG, JPEG, BMP or PNM), and the answer that page as `ocr` writes it, in `?format=`: `json` (the default: the page's object), `text`, `hocr`, `alto`, `page`, `markdown`, `html` or `pdf`. `?name=` names the image in hOCR, ALTO and PAGE XML (`page` by default), and `?text_only=1` makes the `pdf` its invisible text alone. The headers `X-Carbon-Ms` and `X-Carbon-Lines` give the page's time in the engine and its number of lines |
+| `POST /ocr` | the body is a page's image (PNG, JPEG, BMP or PNM), and the answer that page as `ocr` writes it, in `?format=`: `json` (the default: the page's object), `text`, `hocr`, `alto`, `page`, `markdown`, `html` or `pdf`. `?name=` names the image in hOCR, ALTO and PAGE XML (`page` by default), and `?text_only=1` makes the `pdf` its invisible text alone. `?html=1` adds `html` to the `json` object: the page's body as `html` writes it. The headers `X-Carbon-Ms` and `X-Carbon-Lines` give the page's time in the engine and its number of lines |
 | `GET /health` | `ok` |
 | `GET /info` | JSON: the version, the set, the device, the precision, the workers, the pages in flight and the queue |
 
@@ -84,7 +84,7 @@ curl http://127.0.0.1:8080/info
 | 417, 505 | an `Expect` other than `100-continue`; an HTTP version other than 1.0 and 1.1 |
 | 422 | an image that does not decode |
 | 431 | a request's head past 16 KB |
-| 500 | the engine's error |
+| 500 | the engine's error for that page; the pages after it are read as ever |
 | 503 | the queue full, with `Retry-After: 1` |
 
 An error's body is its reason, as text.

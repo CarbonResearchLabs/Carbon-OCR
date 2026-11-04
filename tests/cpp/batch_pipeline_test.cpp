@@ -6,9 +6,12 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "carbon/deskew.h"
@@ -155,6 +158,113 @@ TEST(BatchPipeline, AnEmptyPageIsAnError) {
   bad.page_batch = 0;
   EXPECT_THROW(Pipeline(kSet, bad), Error);
   EXPECT_THROW(Pipeline(std::filesystem::path(CARBON_TEST_DATA) / "no-such-set", cpu_options()), Error);
+}
+
+// The CPU device's models, failing where a test asks: every orientation run, a detection run of pages padded to
+// one width, every second pass, every recognition run. What any device's runs may meet (a model, the memory,
+// the device itself), so the pipeline's handling of it can be seen.
+class FaultyModels final : public PipelineModels {
+ public:
+  explicit FaultyModels(std::unique_ptr<PipelineModels> m) : m_(std::move(m)) {}
+  std::atomic<bool> orient_fails{false}, second_fails{false}, recognize_fails{false};
+  std::atomic<int> detect_fails_at_width{0};
+
+  Device device() const override { return m_->device(); }
+  std::vector<float> orient(const float* thumbs, int n, int side) override {
+    if (orient_fails) throw Error("orient failed");
+    return m_->orient(thumbs, n, side);
+  }
+  std::pair<int, int> detect_size(int width, int height) const override { return m_->detect_size(width, height); }
+  std::vector<Detection> detect(std::span<const GrayView> pages, int ph, int pw, const DetRule& rule) override {
+    if (pw == detect_fails_at_width) throw Error("detect failed");
+    return m_->detect(pages, ph, pw, rule);
+  }
+  bool second_pass() const override { return m_->second_pass(); }
+  Tensor detect_one(const Tensor& input) override {
+    if (second_fails) throw Error("second pass failed");
+    return m_->detect_one(input);
+  }
+  void set_pages(std::span<const GrayView> pages) override { m_->set_pages(pages); }
+  void recognize(std::span<const int32_t> page_of, std::span<const LineBox> boxes, int bw, const CropRule& crop,
+                 std::vector<CtcLine>& lines, std::vector<int32_t>& lengths) override {
+    if (recognize_fails) throw Error("recognize failed");
+    m_->recognize(page_of, boxes, bw, crop, lines, lengths);
+  }
+
+ private:
+  std::unique_ptr<PipelineModels> m_;
+};
+
+// The next page's error, or "" where it came out.
+std::string error_of_next(Pipeline& pipe, std::optional<OcrPage>* page = nullptr) {
+  try {
+    std::optional<OcrPage> p = pipe.next();
+    if (page) *page = std::move(p);
+    return "";
+  } catch (const Error& e) {
+    return e.what();
+  }
+}
+
+// A run that fails fails the pages it held, each with that error, and no other: the rest come out as the
+// engine reads them, in the order given, and the pipeline goes on taking pages.
+TEST(BatchPipeline, AFailedRunFailsItsPagesAndTheRestGoOn) {
+  const GrayImage page = load_image(kSet / "page.png");
+  const GrayImage skewed = rotate_page(page.view(), 2.5);
+  const GrayImage blank = paper(400, 300);  // landscape: at the detector's scale padded 1024 wide, alone
+  const GrayImage tiny = tiny_page();       // its second pass
+  const GrayView kinds[] = {page.view(), blank.view(), skewed.view(), tiny.view()};
+  std::vector<GrayView> pages;
+  for (int i = 0; i < 8; ++i) pages.push_back(kinds[i % 4]);
+  EngineOptions eo;
+  eo.pool.workers = 2;
+  const std::vector<OcrPage> want = Engine(kSet, eo).ocr(pages);
+
+  auto models = std::make_unique<FaultyModels>(cpu_pipeline_models(kSet, EngineOptions{}, 2));
+  FaultyModels& f = *models;
+  Pipeline pipe(kSet, cpu_options(), std::move(models));
+  f.detect_fails_at_width = 1024;
+  f.second_fails = true;
+  for (const GrayView& p : pages) {
+    pipe.submit(GrayImage{p.width, p.height, std::vector<uint8_t>(p.data, p.data + p.width * p.height)});
+  }
+  for (int i = 0; i < 8; ++i) {
+    std::optional<OcrPage> got;
+    const std::string error = error_of_next(pipe, &got);
+    if (i % 4 == 1) {
+      EXPECT_EQ(error, "detect failed") << "page " << i;
+    } else if (i % 4 == 3) {
+      EXPECT_EQ(error, "second pass failed") << "page " << i;
+    } else {
+      ASSERT_EQ(error, "") << "page " << i;
+      ASSERT_TRUE(got.has_value());
+      expect_same(*got, want[i], i);
+    }
+  }
+
+  // every page with lines in a failed recognition run fails; a page without lines takes none, and comes out
+  f.detect_fails_at_width = 0;
+  f.second_fails = false;
+  f.recognize_fails = true;
+  for (const GrayView& p : {page.view(), blank.view(), page.view()}) {
+    pipe.submit(GrayImage{p.width, p.height, std::vector<uint8_t>(p.data, p.data + p.width * p.height)});
+  }
+  EXPECT_EQ(error_of_next(pipe), "recognize failed");
+  std::optional<OcrPage> empty;
+  EXPECT_EQ(error_of_next(pipe, &empty), "");
+  ASSERT_TRUE(empty.has_value());
+  EXPECT_TRUE(empty->lines.empty());
+  EXPECT_EQ(error_of_next(pipe), "recognize failed");
+
+  // ocr() takes every page through before it throws the first error, so the next call reads as before
+  f.recognize_fails = false;
+  f.orient_fails = true;
+  const GrayView two[] = {page.view(), page.view()};
+  EXPECT_THROW(pipe.ocr(two), Error);
+  f.orient_fails = false;
+  const std::vector<OcrPage> again = pipe.ocr(two);
+  ASSERT_EQ(again.size(), 2u);
+  EXPECT_EQ(again[1].text(), "aaa\naaaaa\naa\n");
 }
 
 }  // namespace

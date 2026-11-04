@@ -6,10 +6,12 @@
 // FP16, FP32 and symmetric INT8 on TensorRT (gpu_set_model). A page's answer is what carbon-ocr ocr writes
 // for that page, by the same writers (carbon/output.h).
 //
-//   POST /ocr[?format=json|text|hocr|alto|page|markdown|html|pdf][&name=NAME][&text_only=1]
+//   POST /ocr[?format=json|text|hocr|alto|page|markdown|html|pdf][&name=NAME][&text_only=1][&html=1]
 //        the body a page's image: PNG, JPEG, BMP or PNM. json (the default) is the page's object
-//        (OcrPage::json), text its lines (OcrPage::text); hocr, alto and page (PAGE XML) name its image NAME
-//        ("page" by default); pdf is a searchable PDF of it at image_dpi (text_only=1: its words alone).
+//        (OcrPage::json; html=1 adds "html", its body as format=html writes it, to_html_body, as
+//        carbon_ocr's html=True does), text its lines (OcrPage::text); hocr, alto and page (PAGE XML)
+//        name its image NAME ("page" by default); pdf is a searchable PDF of it at image_dpi
+//        (text_only=1: its words alone).
 //   GET  /health   200, "ok"
 //   GET  /info     {"version", "set", "device", "precision", "workers", "in_flight", "queue"}
 //
