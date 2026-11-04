@@ -8,8 +8,11 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <numeric>
+#include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -223,6 +226,59 @@ TEST(Engine, StreamsPagesInOrderAsOcrReadsThem) {
   ASSERT_TRUE(c.has_value());
   EXPECT_EQ(c->lines.size(), 3u);
   EXPECT_FALSE(engine.next().has_value());
+  EXPECT_EQ(engine.ocr(page.view()).lines.size(), 3u);  // ocr() still reads after a stream
+}
+
+// The stream taken as pages finish (a server's): images as their encoded bytes, decoded by the workers, each
+// result with its number, the same lines as ocr() reads; bytes that are no image, and a file not there, their
+// own pages' errors, marked unreadable, the others read; next() refused once next_finished has taken a page.
+TEST(Engine, StreamsEncodedPagesAsTheyFinish) {
+  const GrayImage page = load_image(kSet / "page.png");
+  std::ifstream f(kSet / "page.png", std::ios::binary);
+  const auto png = std::make_shared<const std::string>(std::istreambuf_iterator<char>(f),
+                                                       std::istreambuf_iterator<char>());
+  auto bytes = [](const std::shared_ptr<const std::string>& b) {
+    return std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(b->data()), b->size());
+  };
+  EngineOptions o;
+  o.pool.workers = 3;
+  o.in_flight = 2;
+  Engine engine(kSet, o);
+  const OcrPage want = engine.ocr(page.view());
+  EXPECT_FALSE(engine.next_finished().has_value());  // nothing given
+  const auto junk = std::make_shared<const std::string>("not an image at all");
+  std::vector<size_t> numbers;
+  for (int i = 0; i < 7; ++i) {
+    if (i == 2) numbers.push_back(engine.submit_encoded(bytes(junk), junk));
+    else if (i == 5) numbers.push_back(engine.submit(kSet / "no-such-page.png"));
+    else numbers.push_back(engine.submit_encoded(bytes(png), png));
+  }
+  for (int i = 0; i < 7; ++i) EXPECT_EQ(numbers[i], static_cast<size_t>(i));
+  std::vector<int> seen(7, 0);
+  for (int i = 0; i < 7; ++i) {
+    std::optional<Engine::Finished> r = engine.next_finished();
+    ASSERT_TRUE(r.has_value());
+    ASSERT_LT(r->number, 7u);
+    ++seen[r->number];
+    if (r->number == 2 || r->number == 5) {
+      EXPECT_TRUE(r->error) << r->number;
+      EXPECT_TRUE(r->unreadable) << r->number;
+      continue;
+    }
+    EXPECT_FALSE(r->error);
+    EXPECT_FALSE(r->unreadable);
+    EXPECT_GT(r->page.ms.load, 0.0);
+    ASSERT_EQ(r->page.lines.size(), want.lines.size());
+    for (size_t k = 0; k < want.lines.size(); ++k) {
+      EXPECT_EQ(r->page.lines[k].text, want.lines[k].text);
+      EXPECT_EQ(r->page.lines[k].box.x0, want.lines[k].box.x0);
+      EXPECT_EQ(r->page.lines[k].confidence, want.lines[k].confidence);
+    }
+  }
+  for (int v : seen) EXPECT_EQ(v, 1);
+  EXPECT_FALSE(engine.next_finished().has_value());  // every page out
+  EXPECT_THROW(engine.next(), Error);                  // a stream taken one way only
+  EXPECT_THROW(engine.submit_encoded({}, nullptr), Error);
   EXPECT_EQ(engine.ocr(page.view()).lines.size(), 3u);  // ocr() still reads after a stream
 }
 

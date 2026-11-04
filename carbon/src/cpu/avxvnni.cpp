@@ -1,7 +1,7 @@
 // The int8 GEMM on AVX-VNNI (carbon/src/cpu/kernels.h): vpdpbusd on 256 bits, 6 rows
 // x 16 columns of int32 sums in 12 registers, B streamed 64 bytes per 4 k, A read
-// in place through its rows' pointers.  Built with -mavx2 -mfma -mavxvnni
-// (/arch:AVX2 with MSVC).
+// in place through its rows' pointers.  Built with -mavx2 -mfma -mf16c
+// -mavxvnni (/arch:AVX2 with MSVC).
 
 #include <immintrin.h>
 

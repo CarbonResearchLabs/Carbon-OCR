@@ -8,6 +8,7 @@
 #include "carbon/engine.h"
 #include "carbon/error.h"
 #include "carbon/image.h"
+#include "carbon/pipeline.h"
 
 namespace carbon {
 namespace {
@@ -29,6 +30,26 @@ TEST(Pipeline, WidthBucketsAreTheTrainers) {
 }
 
 // A title, then two columns: the title, the left column down, the right column down.
+// A model's file on the GPU at each precision (gpu_set_model): TensorRT takes the precision from the file, FP16 by
+// default where the set has it, FP32 where it does not; a precision whose file the set lacks is an error.
+TEST(Pipeline, GpuFilesByPrecision) {
+  const std::filesystem::path dir = std::filesystem::temp_directory_path() / "carbon_gpu_files";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  for (const char* f : {"det.onnx", "det.fp16.onnx", "det.int8-sym.onnx", "det.int8.onnx", "orient.onnx"}) {
+    std::ofstream(dir / f) << "x";
+  }
+  EXPECT_EQ(gpu_set_model(dir, "det", Precision::kFp32), dir / "det.onnx");
+  EXPECT_EQ(gpu_set_model(dir, "det", Precision::kFp16), dir / "det.fp16.onnx");
+  EXPECT_EQ(gpu_set_model(dir, "det", Precision::kInt8), dir / "det.int8-sym.onnx");  // not the CPU's .int8.onnx
+  EXPECT_EQ(gpu_set_model(dir, "det", Precision::kAuto), dir / "det.fp16.onnx");
+  EXPECT_EQ(gpu_set_model(dir, "orient", Precision::kAuto), dir / "orient.onnx");  // no FP16 file: FP32
+  EXPECT_THROW(gpu_set_model(dir, "orient", Precision::kFp16), Error);
+  EXPECT_THROW(gpu_set_model(dir, "orient", Precision::kInt8), Error);
+  EXPECT_THROW(gpu_set_model(dir, "rec-latin", Precision::kAuto), Error);
+  std::filesystem::remove_all(dir);
+}
+
 TEST(Pipeline, ReadingOrderTakesColumnsWhole) {
   const std::vector<LineBox> boxes = {
       {420, 100, 760, 120},  // 0 right column, first line

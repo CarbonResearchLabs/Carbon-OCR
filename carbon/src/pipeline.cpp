@@ -567,6 +567,26 @@ PipelineStats Pipeline::stats() const {
 
 const CropRule& Pipeline::crop() const { return impl_->e.crop; }
 
+std::filesystem::path gpu_set_model(const std::filesystem::path& set, const std::string& name, Precision precision) {
+  auto file = [&](const char* kind) { return set / (name + kind + ".onnx"); };
+  std::filesystem::path f;
+  switch (precision) {
+    case Precision::kFp32: f = file(""); break;
+    case Precision::kFp16: f = file(".fp16"); break;
+    case Precision::kInt8: f = file(".int8-sym"); break;
+    case Precision::kAuto:
+      f = file(".fp16");
+      if (!std::filesystem::is_regular_file(f)) f = file("");
+      break;
+  }
+  if (!std::filesystem::is_regular_file(f)) {
+    throw Error(f.string() + ": the set has no " +
+                (precision == Precision::kAuto ? std::string("fp16 or fp32") : std::string(precision_name(precision))) +
+                " file for " + name + " on the GPU");
+  }
+  return f;
+}
+
 #if !(defined(CARBON_WITH_CUDA) && defined(CARBON_WITH_TENSORRT))
 bool cuda_pipeline_available() { return false; }
 

@@ -13,7 +13,7 @@
   <img alt="weights: OpenRAIL-AMS" src="https://img.shields.io/badge/weights-OpenRAIL--AMS-74f2d6?style=flat-square&labelColor=1a1a1a">
 </p>
 
-**Carbon-OCR is an OCR engine in C++ and CUDA, and Fullerene is its family of small models.** It reads scans, photos of documents and PDFs, and gives text, markdown, HTML and JSON with boxes. It runs on CPUs with its own int8 kernels or ONNX Runtime, one worker per core, and on NVIDIA GPUs through TensorRT, with many pages in flight.
+**Carbon-OCR is an OCR engine in C++ and CUDA, and Fullerene is its family of small models.** It reads scans, photos of documents and PDFs, and gives text, markdown, HTML and JSON with boxes. It runs on CPUs with its own int8 kernels or ONNX Runtime, one worker per core, and on NVIDIA GPUs through TensorRT, with many pages in flight. On either, a model runs in FP32, FP16 or INT8, from the set's file of that precision. You can call it from the command line, C++ or Python, or over HTTP.
 
 The goal is to be far more accurate than Tesseract and faster than every open engine of its class. Every number here is measured, never estimated. The engine is complete and tested. The first Fullerene set, `fullerene-3M` (Latin), is out on [Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M) under the Carbon-OCR OpenRAIL-AMS license; the other script groups follow. Every set's files and metadata are specified ([docs/MODELS.md](docs/MODELS.md)), so the engine reads each one as it ships.
 
@@ -21,7 +21,7 @@ The goal is to be far more accurate than Tesseract and faster than every open en
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/glance-dark.svg">
-  <img src="docs/assets/glance-light.svg" alt="Designed: 2.83 M parameters in fullerene-3M; 10.8 GMAC per Latin page; OmniParseBench headline 43.5 against Tesseract's 5.9. Measured: rec-latin at 62 GMAC/s on one CPU core and 12.8 TMAC/s in FP16 on a laptop RTX 4060; 188 tests, 174 of them in CI" width="100%">
+  <img src="docs/assets/glance-light.svg" alt="Designed: 2.83 M parameters in fullerene-3M; 10.8 GMAC per Latin page; OmniParseBench headline 43.5 against Tesseract's 5.9. Measured: rec-latin at 62 GMAC/s on one CPU core and 12.8 TMAC/s in FP16 on a laptop RTX 4060; 201 tests, 185 of them in CI" width="100%">
 </picture>
 
 The top row is the design budget, counted from the models' layer shapes. The bottom row is measured on random weights, since speed does not depend on the weights (see Measured so far, below).
@@ -38,7 +38,7 @@ The top row is the design budget, counted from the models' layer shapes. The bot
 - **Detect and recognize.** A small line detector, then CTC recognizers per script, read every line of every page in flight in a few batched calls. A page of tiny text is detected again at twice the scale and the two passes merged line by line. On the GPU, the recognizer's last layer runs fused with greedy CTC decoding, so the logits never leave the chip: only ids, confidences and frame positions come back.
 - **Order and output.** A reading-order and layout model orders the lines, groups them into labeled blocks and finds tables' cells. Where it is unsure, an XY-cut does the ordering. The result goes out as text, markdown, HTML, JSON, hOCR, ALTO, PAGE XML or a searchable PDF.
 
-On the CPU, a pinned worker per physical core reads pages in parallel, from a list or a stream (`submit` and `next`) that keeps every core busy. Work is cut smaller than a page, so a single page also uses every core. The int8 kernels are picked at run time for the CPU: AVX2, AVX-VNNI, AVX-512, NEON or the Arm dot product. On the GPU, `carbon::Pipeline` batches each model across all the pages in flight. [docs/ENGINE.md](docs/ENGINE.md) covers the engine in full.
+On the CPU, a pinned worker per physical core reads pages in parallel, from a list or a stream (`submit` and `next`) that keeps every core busy. Work is cut smaller than a page, so a single page also uses every core. The int8 kernels are picked at run time for the CPU: AVX2, AVX-VNNI, AVX-512, NEON or the Arm dot product. On the GPU, `carbon::Pipeline` batches each model across all the pages in flight. `carbon-ocr serve` keeps a set loaded and reads pages sent over HTTP/1.1, with every client's pages sharing the CPU's workers or the GPU's batches. [docs/ENGINE.md](docs/ENGINE.md) covers the engine in full.
 
 ## <img src="docs/assets/chip-03.svg" height="22" alt=""> The models
 
@@ -59,7 +59,7 @@ Fullerene is eight small networks, shipped in two sets named by their parameter 
 | `rec-cjk` | read Chinese, Japanese and Korean | a 32 × W crop → 12,000 classes per 4 px | 4.37 M | 565 MMAC a line |
 | `order` | reading order, block labels, tables | 16 features per line → an order, 13 labels, table cells | 0.48 M | 22 MMAC a 40-line page |
 
-All the models use ReLU and channels in multiples of 16. Their RepVGG blocks are folded into plain 3×3 convolutions in the shipped files. Each model ships as ONNX in three forms: FP32 for CPUs, FP16 for TensorRT, and INT8 (Q/DQ) for the engine's own CPU kernels. The recognizers read a 32-px band of the line and give a CTC frame per 4 px of width.
+All the models use ReLU and channels in multiples of 16. Their RepVGG blocks are folded into plain 3×3 convolutions in the shipped files. Each model ships as ONNX in FP32, FP16 and INT8 (Q/DQ), and the engine runs each precision on the CPU and, through TensorRT, on the GPU (`--precision`); the GPU's INT8 is a symmetric file of its own. The recognizers read a 32-px band of the line and give a CTC frame per 4 px of width.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/fig-page-compute-dark.svg">
@@ -70,7 +70,7 @@ A Latin page is 10.8 GMAC, and 77% of that is recognition. That is why the recog
 
 ## <img src="docs/assets/chip-04.svg" height="22" alt=""> Measured so far
 
-The trained `fullerene-3M` ([on Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M)), read by the engine on all 2,937 pages of OmniParseBench and graded by the benchmark's own grader, against Tesseract 5.5 with its defaults, on the same laptop (3 November 2026): a headline of **43.5** against 5.9 (text 26.2 against 17.8; tables 23.5 and layout 80.6, which Tesseract, writing text alone, scores 0), and **4.06 pages a second on one core** against 0.76 (a median page of 208 ms against 976), 13.6 against 3.2 in six processes. One process of 10 workers with 20 pages in flight reads **15.0 pages a second** over the whole set; one page at a time on 6 workers, the median page takes 79 ms. Its FP16 files on the CPU score 43.6.
+The trained `fullerene-3M` ([on Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M)), read by the engine on all 2,937 pages of OmniParseBench and graded by the benchmark's own grader, against Tesseract 5.5 with its defaults, on the same laptop (3 November 2026): a headline of **43.5** against 5.9 (text 26.2 against 17.8; tables 23.5 and layout 80.6, which Tesseract, writing text alone, scores 0), and **4.06 pages a second on one core** against 0.76 (a median page of 208 ms against 976), 13.6 against 3.2 in six processes. One process of 10 workers with 20 pages in flight reads **15.0 pages a second** over the whole set; one page at a time on 6 workers, the median page takes 79 ms. Its FP16 files on the CPU score 43.6. Served over HTTP (`carbon-ocr serve`, 4 November), 48 of the pages sent by 16 to 32 clients at once came back at 18.5 pages a second, the images' decoding included; `ocr` reads the same pages at 19.0, its count without the decoding.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/fig-bench-dark.svg">
@@ -128,8 +128,13 @@ carbon-ocr ocr page.png --set models/fullerene-3M --format json     # boxes, wor
 carbon-ocr ocr scan.png --set models/fullerene-3M --format hocr     # or alto, page, markdown, html
 carbon-ocr ocr scan.pdf --set models/fullerene-3M --format pdf --output searchable.pdf
 carbon-ocr ocr scans/*.png --set models/fullerene-3M --device cuda --engine-cache .engines
+carbon-ocr ocr scans/*.png --set models/fullerene-3M --device cuda --precision fp32  # FP16 by default
+carbon-ocr serve --set models/fullerene-3M                          # HTTP on 127.0.0.1:8080
+curl --data-binary @page.png "http://127.0.0.1:8080/ocr?format=text"
 carbon-ocr cpus --gemm                                              # the CPU's kernels, timed
 ```
+
+`serve` keeps the models loaded and answers each page sent to `POST /ocr` in any of `ocr`'s formats (JSON by default), with every client's pages sharing the CPU's workers or, with `--device cuda`, the GPU's batches.
 
 ```python
 import carbon_ocr
@@ -154,8 +159,8 @@ ocrmypdf --plugin tools/ocrmypdf/carbon_ocrmypdf.py \
 
 | path | what |
 |---|---|
-| [`carbon/`](carbon) | the engine library: [`include/carbon/`](carbon/include/carbon) is the public API (`carbon.h` includes it all); `src/` holds the CPU kernels, the CUDA kernels, the backends and the PDF helpers |
-| [`cli/`](cli) | `carbon-ocr`, and `carbon-pdf`, the helper process PDFs are rendered in |
+| [`carbon/`](carbon) | the engine library: [`include/carbon/`](carbon/include/carbon) is the public API (`carbon.h` includes all of it but the server, `server.h`); `src/` holds the CPU kernels, the CUDA kernels, the backends, the PDF helpers and the HTTP server |
+| [`cli/`](cli) | `carbon-ocr` (and its HTTP server, `carbon-ocr serve`), and `carbon-pdf`, the helper process PDFs are rendered in |
 | [`python/`](python) | `carbon_ocr`, the engine for Python ([python/README.md](python/README.md)) |
 | [`models/`](models) | where model sets go, and how a set is laid out ([models/README.md](models/README.md)) |
 | [`tests/`](tests) | the C++ tests (GoogleTest), the Python tests and their fixtures: small ONNX models and PDFs |
@@ -171,10 +176,10 @@ Three of them are also typeset as PDFs, each in a light and a dark edition:
 
 | document | what it covers |
 |---|---|
-| [docs/ENGINE.md](docs/ENGINE.md) | how the engine reads a page and a batch of pages: inputs, each stage, the CPU layout, the backends, the GPU pipeline, the options |
+| [docs/ENGINE.md](docs/ENGINE.md) | how the engine reads a page and a batch of pages: inputs, each stage, the CPU layout and the HTTP server, the backends and the precisions, the GPU pipeline, the options |
 | [docs/MODELS.md](docs/MODELS.md) | the Fullerene models: each one's job, inputs and outputs, layers, parameters and compute; the files of a set and their metadata |
 | [docs/BUILD.md](docs/BUILD.md) | building on Windows, Linux and macOS, CPU and GPU; the CMake options; the Python module |
-| [docs/USAGE.md](docs/USAGE.md) | the `carbon-ocr` commands, the output formats, the Python API, the OCRmyPDF plugin |
+| [docs/USAGE.md](docs/USAGE.md) | the `carbon-ocr` commands, the HTTP server, the output formats, the Python API, the OCRmyPDF plugin |
 | [docs/DEMO.md](docs/DEMO.md) | `fullerene-3M` on three pages: turned and levelled, lines, blocks and order, tables, the HTML, the numbers, every fault and where it comes from; its scripts and their output in [docs/demo/](docs/demo/) |
 
 ## <img src="docs/assets/chip-09.svg" height="22" alt=""> License

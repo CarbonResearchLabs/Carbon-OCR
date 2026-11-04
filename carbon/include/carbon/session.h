@@ -2,7 +2,8 @@
 //
 // Every model in the pipeline (orientation, detector, script classifier,
 // recognizers, order model) runs through this interface, so a stage does not
-// know whether it runs on ONNX Runtime (CPU) or TensorRT (GPU).
+// know whether it runs on ONNX Runtime or the native backend (CPU) or on
+// TensorRT (GPU).
 #pragma once
 
 #include <cstddef>

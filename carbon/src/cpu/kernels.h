@@ -21,8 +21,9 @@
 // whole vector of columns is there, epilogue_scalar for the rest, the same float
 // operations in the same order, so the bits are the reference's.  (The FP16
 // arithmetic kernels' sums are their own; their output stage is still these.)
-// After them, the depthwise convolutions, CTC's argmax and the crop rule's
-// resampling, one version a set too.
+// After them, the depthwise convolutions, CTC's argmax, a crop's counts, a
+// threshold's bits and the crop rule's resampling, one version a set too, and the
+// detector's head on AVX2.
 //
 // The page turns (turns.cpp has the references): rotate_bilinear's kernels run
 // the reference's double arithmetic on a vector of pixels whose four taps are all

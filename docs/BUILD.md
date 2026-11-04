@@ -70,7 +70,7 @@ ctest --preset ninja-trt
 
 `CMAKE_CUDA_ARCHITECTURES` defaults to `native`, which builds for the GPU in the machine you build on. Set it to build for others: 89 for Ada (an L4, an RTX 40-series card), 86 or 80 for Ampere. With a CUDA that is unpacked rather than installed, also pass `-DCMAKE_CUDA_COMPILER=<cuda>/bin/nvcc` and `-DCUDAToolkit_ROOT=<cuda>`. The `ninja-cuda` preset builds the CUDA kernels without TensorRT.
 
-TensorRT 11 builds strongly typed networks, so a model runs in FP16 only when its ONNX file is FP16. That is why a model set ships `<model>.fp16.onnx` beside each FP32 file. Building a TensorRT engine takes time; `--engine-cache DIR` keeps the built engines, so later runs reuse them. A cached engine belongs to its GPU and its TensorRT version.
+TensorRT 11 builds strongly typed networks, so the ONNX file is the precision: a set ships `<model>.fp16.onnx`, and can ship `<model>.int8-sym.onnx`, beside each FP32 file, and `--precision` picks among them ([ENGINE.md](ENGINE.md), section 9). Building a TensorRT engine takes time; `--engine-cache DIR` keeps the built engines, so later runs reuse them. A cached engine belongs to its GPU and its TensorRT version.
 
 ## <img src="assets/chip-04.svg" height="22" alt=""> Options
 
@@ -94,7 +94,7 @@ TensorRT 11 builds strongly typed networks, so a model runs in FP16 only when it
 | `ninja-trt`, `vs2022-trt` | CPU and GPU (TensorRT) |
 | `ninja-cuda` | CPU and the CUDA kernels, without TensorRT |
 
-To use the library from another CMake project, add this repository with `add_subdirectory` (or FetchContent) and link `carbon::carbon`. Its public headers are in `carbon/include/carbon/`, and `carbon/carbon.h` includes them all.
+To use the library from another CMake project, add this repository with `add_subdirectory` (or FetchContent) and link `carbon::carbon`. Its public headers are in `carbon/include/carbon/`, and `carbon/carbon.h` includes them all but the server's: for `carbon::Server` (`carbon/server.h`), link `carbon::serve` too.
 
 ## <img src="assets/chip-05.svg" height="22" alt=""> The Python module
 
@@ -107,7 +107,7 @@ scikit-build-core builds the module `carbon_ocr` from this CMake project, with O
 
 ## <img src="assets/chip-06.svg" height="22" alt=""> Tests
 
-`ctest --preset <preset>` runs the C++ tests: the tensors, the crop rule, the CPU kernels against their scalar reference, the native backend against ONNX Runtime, the detector's and order model's decoders, the detector's two passes merged, the engine and the batched pipeline on small fake models, PDFs, the output formats and the command line. The tests that need a GPU are built with CUDA or TensorRT and run on a machine with one.
+`ctest --preset <preset>` runs the C++ tests: the tensors, the crop rule, the CPU kernels against their scalar reference, the native backend against ONNX Runtime, the detector's and order model's decoders, the detector's two passes merged, the engine and the batched pipeline on small fake models, the HTTP parser and the server, PDFs, the output formats and the command line. The tests that need a GPU are built with CUDA or TensorRT and run on a machine with one.
 
 ```shell
 pip install ./python pytest==8.4.2 pillow==13.0.0

@@ -3,17 +3,19 @@ include(GoogleTest)
 add_executable(carbon_tests cpp/tensor_test.cpp cpp/lines_test.cpp cpp/parallel_test.cpp cpp/strips_test.cpp cpp/detect_test.cpp
   cpp/pipeline_test.cpp cpp/cpu_test.cpp cpp/net_test.cpp cpp/textlayer_test.cpp cpp/output_test.cpp cpp/deskew_test.cpp cpp/order_test.cpp
   cpp/score_test.cpp cpp/order_net_test.cpp cpp/image_test.cpp
-  cpp/png_test.cpp)
+  cpp/png_test.cpp cpp/http_test.cpp)
 # png_test writes PNGs with libdeflate and holds the decoder to stb_image, whose
 # functions carbon carries (src/image.cpp)
-target_link_libraries(carbon_tests PRIVATE carbon::carbon GTest::gtest_main libdeflate::libdeflate_static)
+target_link_libraries(carbon_tests PRIVATE carbon::carbon carbon::serve GTest::gtest_main
+                      libdeflate::libdeflate_static)
 target_include_directories(carbon_tests SYSTEM PRIVATE ${CARBON_STB_INCLUDE_DIR})
 target_compile_definitions(carbon_tests PRIVATE
   CARBON_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/data")
 carbon_warnings(carbon_tests)
 
 if(CARBON_WITH_ONNXRUNTIME)
-  target_sources(carbon_tests PRIVATE cpp/ort_session_test.cpp cpp/engine_test.cpp cpp/batch_pipeline_test.cpp)
+  target_sources(carbon_tests PRIVATE cpp/ort_session_test.cpp cpp/engine_test.cpp cpp/batch_pipeline_test.cpp
+                 cpp/server_test.cpp)
 endif()
 # PDFium in a test executable of its own (carbon_pdf), as in the engine's processes.
 if(CARBON_WITH_PDFIUM)

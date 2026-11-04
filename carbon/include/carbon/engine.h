@@ -11,8 +11,9 @@
 // twice the scale and the two passes merged, its lines cropped by the crop rule
 // (carbon/lines.h), read by one recognizer and CTC decoding, split at wide gaps,
 // and put in reading order, with blocks and tables, by the set's order
-// model (order.onnx, on ONNX Runtime; carbon/order.h), or by an XY-cut where the
-// set has none or the model is not sure.  Pages run on a WorkerPool (carbon/parallel.h):
+// model (order.native.bin on the native backend, or order.onnx on ONNX Runtime;
+// carbon/order.h), or by an XY-cut where the set has none or the model is not
+// sure.  Pages run on a WorkerPool (carbon/parallel.h):
 // each worker has its own sessions, and each page is planned for the cores
 // free when it gets to them (detection on threads when fast cores are idle,
 // its lines split over them), as `carbon-ocr pages` measures.  Not yet: the
@@ -20,6 +21,7 @@
 #pragma once
 
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -91,8 +93,9 @@ struct EngineOptions {
   // The stream (Engine::submit): pages being read at once, past which submit waits. 0: two a worker, so a
   // worker that finishes a page always finds the next one queued.
   int in_flight = 0;
-  // Reading order: <set>/order.onnx where the set has one and ONNX Runtime is built in,
-  // or order_model; with none (or use_order false) the XY-cut.
+  // Reading order: <set>/order.native.bin on the native backend (unless backend is ONNX Runtime),
+  // else <set>/order.onnx where ONNX Runtime is built in, or order_model; with none (or use_order
+  // false) the XY-cut.
   bool use_order = true;
   std::filesystem::path order_model;
   OrderRule order;
@@ -218,7 +221,25 @@ class Engine {
   // A page's image file (as load_image reads it), read and decoded by the worker that takes the page, so the
   // decode runs beside the other pages' work; a file that cannot be read is that page's error, from next.
   size_t submit(const std::filesystem::path& file);
+  // A page's encoded image (PNG, JPEG, BMP or PNM, as decode_image reads it), decoded by the worker that
+  // takes the page, as a file is; `keep` holds the bytes until they are decoded. Bytes that do not decode are
+  // that page's error (Finished::unreadable).
+  size_t submit_encoded(std::span<const uint8_t> bytes, std::shared_ptr<const void> keep);
   std::optional<OcrPage> next();
+
+  // A page of the stream as it finished: its number (submit's), and its result or the error it met;
+  // unreadable where that error was its file's or bytes' (not found, or not an image decode_image reads).
+  struct Finished {
+    size_t number = 0;
+    OcrPage page;
+    std::exception_ptr error;
+    bool unreadable = false;
+  };
+  // The next page to finish, the first given among those done, waiting for one; nullopt once every page given
+  // is out. For a caller with many pages from many sources at once (a server): a slow page holds back no
+  // other. A stream takes its results by next or by next_finished, not both (next throws once
+  // next_finished has taken one).
+  std::optional<Finished> next_finished();
 
   // Puts pages read otherwise (from a text layer) in reading order as ocr does: the
   // order model's, with blocks, or the XY-cut's.

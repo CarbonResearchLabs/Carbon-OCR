@@ -631,6 +631,8 @@ struct Engine::Impl {
     std::shared_ptr<const void> keep;  // what holds the page's pixels, for a page of the stream
     GrayImage own;                     // or its own pixels
     std::filesystem::path file;        // or its file, decoded by the worker that takes the page
+    std::span<const uint8_t> bytes;    // or its encoded image (held by keep), decoded so too
+    bool unreadable = false;           // its file or bytes did not give an image
     detail::Upright up;  // the page turned upright and levelled, and its copy at the detector's scale
     OcrPage out;
     std::atomic<int> left{0};
@@ -651,6 +653,7 @@ struct Engine::Impl {
     std::condition_variable cv;
     std::map<size_t, std::unique_ptr<Job>> jobs;
     size_t submitted = 0, completed = 0, taken = 0;
+    bool unordered = false;  // a page taken by next_finished: next would skip pages
   };
 
   EngineOptions o;
@@ -739,9 +742,18 @@ struct Engine::Impl {
   // the last of its line tasks instead).
   void start(Job& j, int k) {
     try {
-      if (!j.file.empty()) {
+      if (!j.file.empty() || !j.bytes.empty()) {
         const auto t = Clock::now();
-        j.own = load_image(j.file);
+        try {
+          j.own = j.file.empty() ? decode_image(j.bytes) : load_image(j.file);
+        } catch (...) {
+          j.unreadable = true;
+          throw;
+        }
+        if (!j.bytes.empty()) {
+          j.bytes = {};
+          j.keep.reset();  // the bytes, decoded
+        }
         j.page = j.own.view();
         j.out.ms.load = ms_since(t);
       }
@@ -1295,11 +1307,20 @@ size_t Engine::submit(const std::filesystem::path& file) {
   return impl_->give(std::move(job));
 }
 
+size_t Engine::submit_encoded(std::span<const uint8_t> bytes, std::shared_ptr<const void> keep) {
+  if (bytes.empty()) throw Error("Engine::submit_encoded: no bytes");
+  auto job = std::make_unique<Impl::Job>();
+  job->bytes = bytes;
+  job->keep = std::move(keep);
+  return impl_->give(std::move(job));
+}
+
 std::optional<OcrPage> Engine::next() {
   Impl::Stream& s = impl_->stream;
   std::unique_ptr<Impl::Job> job;
   {
     std::unique_lock lk(s.m);
+    if (s.unordered) throw Error("Engine::next: this stream's pages are taken by next_finished");
     if (s.taken == s.submitted) return std::nullopt;
     s.cv.wait(lk, [&] { return s.jobs.at(s.taken)->complete; });
     auto it = s.jobs.find(s.taken);
@@ -1309,6 +1330,32 @@ std::optional<OcrPage> Engine::next() {
   }
   if (job->error) std::rethrow_exception(job->error);
   return std::move(job->out);
+}
+
+std::optional<Engine::Finished> Engine::next_finished() {
+  Impl::Stream& s = impl_->stream;
+  std::unique_ptr<Impl::Job> job;
+  Finished f;
+  {
+    std::unique_lock lk(s.m);
+    s.unordered = true;
+    if (s.taken == s.submitted) return std::nullopt;
+    auto it = s.jobs.begin();
+    s.cv.wait(lk, [&] {  // the pages not taken: at most in_flight being read, and those done
+      for (it = s.jobs.begin(); it != s.jobs.end(); ++it) {
+        if (it->second->complete) return true;
+      }
+      return false;
+    });
+    f.number = it->first;
+    job = std::move(it->second);
+    s.jobs.erase(it);
+    ++s.taken;
+  }
+  f.error = job->error;
+  f.unreadable = job->unreadable;
+  if (!f.error) f.page = std::move(job->out);
+  return f;
 }
 
 OcrPage Engine::ocr(const GrayView& page) { return std::move(ocr(std::span<const GrayView>(&page, 1))[0]); }

@@ -8,6 +8,10 @@
 //                           [--output FILE] [--text-out FILE] [--text-only] [--image-dpi 300] [--as-given]
 //                           [--workers N] [--no-pin] [--device cpu|cuda] [--batch 8] [--in-flight N]
 //                           [--engine-cache DIR]
+//   carbon-ocr serve --set DIR [--host 127.0.0.1] [--port 8080] [--max-body-mb 64] [--queue 64] [--quiet]
+//                           [--decoders N] [--image-dpi 300] [and ocr's --rec --backend --precision
+//                           --second-pass --as-given --workers --no-pin --device --batch --in-flight
+//                           --engine-cache]
 //   carbon-ocr version
 //   carbon-ocr cpus [--gemm]
 //   carbon-ocr info  MODEL [--backend ort|trt|native] [--shape NAME=1x1x32x256 ...]
@@ -40,7 +44,9 @@
 //
 // ocr and pages run each model of a set on the native backend where the set has
 // its int8 file (<model>.int8.onnx), else on ONNX Runtime (carbon::open_set_model);
-// --backend runs every model on one (order stays on ONNX Runtime).  --precision
+// --backend runs every model on one (ocr's order model: order.native.bin natively
+// unless --backend ort, else order.onnx on ONNX Runtime; pages', order.onnx on ONNX
+// Runtime).  --precision
 // picks the files instead (carbon::Precision): fp32 <model>.onnx (on ONNX Runtime
 // unless --backend native), fp16 <model>.fp16.onnx on the native backend's FP16
 // kernels, int8 <model>.int8.onnx (native unless --backend ort); a set without
@@ -61,13 +67,22 @@
 // lines join the layer's (source "hybrid"), unless --hybrid off.  A page whose lines are
 // tiny (the first pass's median under 9 px at the detector's scale) is detected again at
 // twice the scale and the passes merged (carbon/detect.h), unless --second-pass off
-// (carbon::Engine, the pipeline v0 on the CPU; reading order by the set's
-// order.onnx where it has one, every page's, else by the XY-cut): text prints each page's lines,
+// (carbon::Engine, the pipeline v0 on the CPU; reading order by the set's order
+// model, order.native.bin or order.onnx, where it has one, every page's, else by the
+// XY-cut): text prints each page's lines,
 // pages apart by a form feed; json one object with every page.  The pages run
 // in parallel, a worker per physical core.  --device cuda reads them through the
-// batched pipeline on the GPU instead (carbon/pipeline.h: TensorRT from the set's
-// FP16 files, --batch pages a detection run, --in-flight pages at once, the built
-// engines kept in --engine-cache).
+// batched pipeline on the GPU instead (carbon/pipeline.h: TensorRT, from the set's
+// files at --precision, carbon::gpu_set_model: auto and fp16 <model>.fp16.onnx and
+// the recognizer's trunk and fused head, auto falling back to FP32 where a file is
+// missing; fp32 <model>.onnx; int8 <model>.int8-sym.onnx; --batch pages a detection
+// run, --in-flight pages at once, the built engines kept in --engine-cache).
+//
+// serve keeps the set's models loaded and reads pages sent over HTTP/1.1 (carbon/server.h): POST /ocr with a
+// page's image as the body (PNG, JPEG, BMP or PNM; ?format= as ocr's, json by default: the page's object), GET
+// /health and GET /info. Every client's pages share the engine's workers (on the GPU, the pipeline's batches),
+// each answered as soon as it is read; --queue requests wait past the pages in flight, more are answered 503.
+// It listens on --host (127.0.0.1: this machine only; 0.0.0.0 every interface) and --port, until Ctrl+C.
 //
 // pages times a model set's ONNX files (SETDIR/orient.onnx, det.onnx,
 // script.onnx where the set has it, <rec>.onnx, order.onnx) the way the CPU
@@ -76,7 +91,7 @@
 // classifier and the recognizer), then the order model when the last is done, each step planned
 // for the cores free at the time (see pages() below).  The inputs are
 // constant, at the budget's sizes: a 512 x 512 thumbnail, a 1024 x 800 page,
-// 32 x 512 crops, 16 features a line; random weights detect noise, so the
+// 32 x 512 crops, 16 features a line; a constant page has no lines to find, so the
 // decoder reads the maps of a rendered page of --lines lines.  --in-flight N keeps N pages going at a time (1: one
 // page on every core, its latency); by default every page is queued at once
 // (throughput).
@@ -86,9 +101,11 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -106,6 +123,7 @@
 
 #include "carbon/carbon.h"
 #include "carbon/pipeline.h"
+#include "carbon/server.h"
 #include "carbon/textlayer.h"
 
 #if defined(_WIN32)
@@ -154,6 +172,9 @@ struct Args {
   std::string against;  // compare: ONNX Runtime runs this file
   bool backend_given = false;  // ocr and pages choose per model otherwise
   carbon::Precision precision = carbon::Precision::kAuto;  // ocr and pages: the set's files
+  std::string host = "127.0.0.1";    // serve
+  int port = 8080, queue = 64, max_body_mb = 64, decoders = 0;
+  bool quiet = false;                // serve: no line a request
 };
 
 [[noreturn]] void usage(const std::string& why) {
@@ -167,6 +188,8 @@ struct Args {
                "                        [--output FILE] [--text-out FILE] [--text-only] [--image-dpi N]\n"
                "                        [--as-given] [--device cpu|cuda] [--batch N] [--in-flight N]\n"
                "                        [--engine-cache DIR]\n"
+               "       carbon-ocr serve --set DIR [--host ADDR] [--port N] [--max-body-mb N] [--queue N] [--quiet]\n"
+               "                        [--decoders N] [--image-dpi N] [ocr's model, worker and device options]\n"
                "       carbon-ocr version\n"
                "       carbon-ocr cpus [--gemm]\n"
                "       carbon-ocr info  MODEL [--backend ort|trt|native] [--shape NAME=AxBxC ...]\n"
@@ -238,7 +261,7 @@ Args parse(int argc, char** argv) {
     return a;
   }
   if (a.command != "info" && a.command != "bench" && a.command != "pages" && a.command != "ocr" &&
-      a.command != "compare") {
+      a.command != "compare" && a.command != "serve") {
     usage("unknown command '" + a.command + "'");
   }
   for (int i = 2; i < argc; ++i) {
@@ -330,10 +353,25 @@ Args parse(int argc, char** argv) {
       if (a.det != "auto" && a.det != "one" && a.det != "wide" && a.det != "strips") {
         usage("--det takes auto, one, wide or strips");
       }
+    } else if (a.command == "serve" && arg == "--host") {
+      a.host = value();
+    } else if (a.command == "serve" && arg == "--port") {
+      a.port = to_int(arg, value(), 0);
+      if (a.port > 65535) usage("--port takes 0 to 65535");
+    } else if (a.command == "serve" && arg == "--queue") {
+      a.queue = to_int(arg, value(), 1);
+    } else if (a.command == "serve" && arg == "--max-body-mb") {
+      a.max_body_mb = to_int(arg, value(), 1);
+    } else if (a.command == "serve" && arg == "--decoders") {
+      a.decoders = to_int(arg, value(), 1);
+    } else if (a.command == "serve" && arg == "--quiet") {
+      a.quiet = true;
     } else if (arg.starts_with("--")) {
       usage("unknown option " + arg);
     } else if (a.command == "ocr") {
       a.images.push_back(arg);
+    } else if (a.command == "serve") {
+      usage("serve takes no files: clients send their pages ('" + arg + "')");
     } else if (a.model.empty()) {
       a.model = arg;
     } else {
@@ -345,6 +383,10 @@ Args parse(int argc, char** argv) {
     if (a.format == "page" && a.out_dir.empty()) usage("--format page writes a file a page: give --out-dir DIR");
     if (a.format == "pdf" && a.output.empty()) usage("--format pdf writes a file: give --output FILE");
     if (a.set.empty()) usage("ocr needs --set DIR, a Fullerene set");
+    return a;
+  }
+  if (a.command == "serve") {
+    if (a.set.empty()) usage("serve needs --set DIR, a Fullerene set");
     return a;
   }
   if (a.model.empty()) usage(a.command + (a.command == "pages" ? " needs a model set's directory" : " needs a model file"));
@@ -1044,7 +1086,8 @@ std::string quoted(const std::string& v) {
   return q + "\"";
 }
 
-int ocr(const Args& a) {
+// The engine's options as ocr and serve take them.
+carbon::EngineOptions engine_options(const Args& a) {
   carbon::EngineOptions o;
   o.rec = a.rec;
   if (a.backend_given) o.backend = a.backend;
@@ -1056,6 +1099,11 @@ int ocr(const Args& a) {
     o.turn_probability = 2.0f;
     o.deskew = false;
   }
+  return o;
+}
+
+int ocr(const Args& a) {
+  const carbon::EngineOptions o = engine_options(a);
   carbon::Engine engine(a.set, o);
   // Each image a page; each page of a PDF rendered at --dpi (carbon/pdf.h) in the
   // helper processes (carbon-pdf, beside this program), many at once.
@@ -1265,6 +1313,50 @@ int ocr(const Args& a) {
   return 0;
 }
 
+carbon::Server* serving = nullptr;  // for Ctrl+C
+
+int serve(const Args& a) {
+  carbon::ServerOptions so;
+  so.host = a.host;
+  so.port = a.port;
+  so.queue = a.queue;
+  so.max_body = static_cast<size_t>(a.max_body_mb) << 20;
+  so.decoders = a.decoders;
+  so.image_dpi = a.image_dpi;
+  so.engine = engine_options(a);
+  if (a.in_flight) so.engine.in_flight = a.in_flight;
+  so.cuda = a.device == "cuda";
+  so.pipeline.page_batch = a.batch;
+  if (a.in_flight) so.pipeline.in_flight = a.in_flight;
+  so.pipeline.engine_cache = a.engine_cache;
+  if (!a.quiet) {
+    so.log = [](const std::string& line) {
+      const std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+      std::tm tm{};  // called on several threads: the reentrant forms
+#if defined(_WIN32)
+      localtime_s(&tm, &now);
+#else
+      localtime_r(&now, &tm);
+#endif
+      char t[16];
+      std::strftime(t, sizeof t, "%H:%M:%S", &tm);
+      std::fprintf(stderr, "[%s] %s\n", t, line.c_str());
+    };
+  }
+  carbon::Server server(a.set, so);
+  serving = &server;
+  std::signal(SIGINT, [](int) { serving->stop(); });
+  std::signal(SIGTERM, [](int) { serving->stop(); });
+  std::fprintf(stderr, "carbon-ocr %s serving %s on http://%s:%d (%s): POST /ocr, GET /health, GET /info; "
+                       "Ctrl+C stops it\n",
+               std::string(carbon::kVersion).c_str(), a.set.c_str(), a.host.c_str(), server.port(),
+               so.cuda ? "the GPU" : "the CPU");
+  server.run();
+  serving = nullptr;
+  std::fprintf(stderr, "carbon-ocr: stopped\n");
+  return 0;
+}
+
 int bench(const Args& a, carbon::Session& s) {
   std::vector<carbon::Tensor> inputs = make_inputs(a, s);
   std::vector<carbon::Tensor> out;
@@ -1301,6 +1393,7 @@ int main(int argc, char** argv) {
   if (a.command == "cpus") return cpus(a);
   try {
     if (a.command == "ocr") return ocr(a);
+    if (a.command == "serve") return serve(a);
     if (a.command == "bench" && !a.workers.empty()) return bench_workers(a);
     if (a.command == "pages") return pages(a);
     if (a.command == "compare") return compare(a);

@@ -1,9 +1,9 @@
 // The FP32 GEMM on Arm64 NEON (carbon/src/cpu/kernels.h), every Armv8-A CPU: fmla
 // with A broadcast from memory (ld1r), 6 rows x 16 columns of sums in 24
 // registers, A read in place through its rows' pointers.  Also the depthwise
-// convolutions, CTC greedy decoding, the crop rule's resampling and the page
-// turns.  FP16 without FP16 arithmetic: widened by fcvtl (Armv8-A's) and summed
-// as FP32.  No flags beyond the baseline.
+// convolutions, CTC greedy decoding, a crop's counts, a threshold's bits, the
+// crop rule's resampling and the page turns.  FP16 without FP16 arithmetic:
+// widened by fcvtl (Armv8-A's) and summed as FP32.  No flags beyond the baseline.
 
 #include <arm_neon.h>
 

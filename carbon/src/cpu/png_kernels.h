@@ -36,8 +36,8 @@ struct PngRows {
   int bpp;
 };
 
-// Unfilters the first rows of `r`, as many as the kernel takes at once (1, or a run of
-// Paeth rows), and returns how many.
+// Unfilters the first rows of `r`, as many as the kernel takes at once (1, a pair of
+// Paeth rows, or a block of 16), and returns how many.
 size_t png_unfilter_avx2(const PngRows& r);
 size_t png_unfilter_neon(const PngRows& r);
 

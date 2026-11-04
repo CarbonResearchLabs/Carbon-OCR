@@ -1,12 +1,12 @@
 cmake_minimum_required(VERSION 3.24)
 project(carbon
   VERSION 0.1.0
-  DESCRIPTION "Fast line-based OCR on CPU (ONNX Runtime) and GPU (TensorRT)"
+  DESCRIPTION "Fast line-based OCR on CPU (its own kernels and ONNX Runtime) and GPU (TensorRT)"
   LANGUAGES CXX)
 
 option(CARBON_WITH_ONNXRUNTIME "Build the ONNX Runtime (CPU) backend" ON)
 option(CARBON_WITH_TENSORRT "Build the TensorRT (CUDA) backend; needs TensorRT_ROOT" OFF)
-option(CARBON_WITH_CUDA "Build the CUDA kernels: the crop rule and CTC decoding on the GPU" OFF)
+option(CARBON_WITH_CUDA "Build the CUDA kernels (carbon/cuda.h): the crop rule, CTC decoding and the detector's threshold on the GPU" OFF)
 option(CARBON_BUILD_CLI "Build the carbon-ocr command line" ON)
 option(CARBON_WITH_PDFIUM "Read PDFs: their pages and text layers, through a prebuilt PDFium" ON)
 option(CARBON_BUILD_TESTS "Build the tests" ${PROJECT_IS_TOP_LEVEL})

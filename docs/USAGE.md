@@ -1,13 +1,14 @@
 # Using Carbon-OCR
 
-This guide covers the `carbon-ocr` command line, the output formats, the Python module and the OCRmyPDF plugin. Every command that reads pages takes a Fullerene model set with `--set DIR`. A set is a folder holding its models and their metadata, laid out as described in [models/README.md](../models/README.md). The first set, `fullerene-3M`, is on [Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M): `huggingface-cli download CarbonResearchLabs/fullerene-3M --local-dir models/fullerene-3M`.
+This guide covers the `carbon-ocr` command line and its HTTP server, the output formats, the Python module and the OCRmyPDF plugin. Every command that reads pages takes a Fullerene model set with `--set DIR`. A set is a folder holding its models and their metadata, laid out as described in [models/README.md](../models/README.md). The first set, `fullerene-3M`, is on [Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M): `huggingface-cli download CarbonResearchLabs/fullerene-3M --local-dir models/fullerene-3M`.
 
 **Contents**
 1. Reading pages
-2. Output formats
-3. Timing and inspecting: `cpus`, `pages`, `bench`, `info`, `compare`
-4. Python
-5. OCRmyPDF
+2. Serving pages over HTTP
+3. Output formats
+4. Timing and inspecting: `cpus`, `pages`, `bench`, `info`, `compare`
+5. Python
+6. OCRmyPDF
 
 ## <img src="assets/chip-01.svg" height="22" alt=""> Reading pages
 
@@ -18,13 +19,14 @@ carbon-ocr ocr report.pdf --set models/fullerene-3M --dpi 300       # each page 
 carbon-ocr ocr page.png --set models/fullerene-3M --format json     # boxes, words, timings
 carbon-ocr ocr scan.pdf --set models/fullerene-3M --format pdf --output searchable.pdf
 carbon-ocr ocr scans/*.png --set models/fullerene-3M --device cuda --engine-cache .engines
+carbon-ocr ocr scans/*.png --set models/fullerene-3M --device cuda --precision fp32
 ```
 
 `ocr` reads PNG, JPEG, BMP and PNM pages, and PDFs. A PDF's pages are rendered by PDFium in `carbon-pdf` helper processes. If a document crashes PDFium, only a helper dies, and your program keeps running.
 
 A born-digital PDF page whose text layer passes the engine's checks is read from that layer instead of by OCR. Its pictures (the page's image objects) are still read by OCR, and their lines join the layer's. The JSON output gives each page's source (`ocr`, `text layer` or `hybrid`). For a PDF page read by OCR, it also says why the page's text layer was not used.
 
-By default the pages run in parallel on the CPU, one worker per physical core. `--device cuda` reads them through the batched pipeline on the GPU instead: TensorRT runs the set's FP16 files, and each model is batched across the pages in flight. This needs a build with TensorRT and CUDA ([BUILD.md](BUILD.md)).
+By default the pages run in parallel on the CPU, one worker per physical core. `--device cuda` reads them through the batched pipeline on the GPU instead: TensorRT runs the set's files at `--precision` (the FP16 files by default), and each model is batched across the pages in flight. This needs a build with TensorRT and CUDA ([BUILD.md](BUILD.md)).
 
 | option | default | what |
 |---|---|---|
@@ -41,7 +43,7 @@ By default the pages run in parallel on the CPU, one worker per physical core. `
 | `--hybrid auto\|off` | `auto` | read the pictures of a page that was read from its text layer by OCR |
 | `--second-pass auto\|off` | `auto` | detect a page of tiny text (its median line under 9 px at the detector's scale) again at twice the scale, and merge the two passes |
 | `--as-given` | off | no quarter turns and no deskew: the page as given |
-| `--precision auto\|fp32\|fp16\|int8` | `auto` | the files the models run: `fp16` the set's `.fp16.onnx` on the engine's own kernels, `int8` its `.int8.onnx`, `fp32` its `.onnx`; `auto` as below |
+| `--precision auto\|fp32\|fp16\|int8` | `auto` | the files the models run. On the CPU: `fp16` the set's `.fp16.onnx` on the engine's own kernels, `int8` its `.int8.onnx`, `fp32` its `.onnx`; `auto` as below. On the GPU: `fp16` the `.fp16.onnx` files and the recognizer's trunk and fused CTC head, `fp32` the `.onnx` files, `int8` the `.int8-sym.onnx` files; `auto` the FP16 files, the FP32 one where a set lacks one |
 | `--backend ort\|native` | per model | run every model on one backend; by default a model runs on the native int8 backend where the set has its `.int8.onnx`, else on ONNX Runtime |
 | `--workers N` | one per physical core | CPU workers |
 | `--no-pin` | pinned | do not pin workers to cores |
@@ -52,7 +54,54 @@ By default the pages run in parallel on the CPU, one worker per physical core. `
 
 The reading order comes from the set's `order.onnx` when the set has one; otherwise the engine orders lines by the XY-cut. The order model is also used only where it is sure of its result, and the XY-cut takes over elsewhere. The JSON output records which of the two ordered each page.
 
-## <img src="assets/chip-02.svg" height="22" alt=""> Output formats
+## <img src="assets/chip-02.svg" height="22" alt=""> Serving pages over HTTP
+
+```shell
+carbon-ocr serve --set models/fullerene-3M                              # http://127.0.0.1:8080
+carbon-ocr serve --set models/fullerene-3M --host 0.0.0.0 --port 9000   # every interface
+carbon-ocr serve --set models/fullerene-3M --device cuda --engine-cache .engines
+curl --data-binary @page.png http://127.0.0.1:8080/ocr                  # the page as JSON
+curl --data-binary @page.png "http://127.0.0.1:8080/ocr?format=text"
+curl --data-binary @scan.jpg "http://127.0.0.1:8080/ocr?format=pdf" -o searchable.pdf
+curl http://127.0.0.1:8080/info
+```
+
+`serve` loads a set's models once and reads the pages clients send over HTTP/1.1, until Ctrl+C. Every client's pages share the engine. On the CPU each page goes to the next free worker, is decoded there and is answered as soon as it is read, so a slow page holds back no other. On the GPU (`--device cuda`) the batched pipeline puts every client's pages in its batches. `serve` takes `ocr`'s model, worker and device options (`--rec`, `--backend`, `--precision`, `--second-pass`, `--as-given`, `--workers`, `--no-pin`, `--device`, `--batch`, `--in-flight`, `--engine-cache`), so it runs every model file the engine does. Connections are kept alive, and a client may send `Expect: 100-continue`.
+
+| request | answer |
+|---|---|
+| `POST /ocr` | the body is a page's image (PNG, JPEG, BMP or PNM), and the answer that page as `ocr` writes it, in `?format=`: `json` (the default: the page's object), `text`, `hocr`, `alto`, `page`, `markdown`, `html` or `pdf`. `?name=` names the image in hOCR, ALTO and PAGE XML (`page` by default), and `?text_only=1` makes the `pdf` its invisible text alone. The headers `X-Carbon-Ms` and `X-Carbon-Lines` give the page's time in the engine and its number of lines |
+| `GET /health` | `ok` |
+| `GET /info` | JSON: the version, the set, the device, the precision, the workers, the pages in flight and the queue |
+
+| status | when |
+|---|---|
+| 400 | a request it cannot read, or an unknown format |
+| 404, 405 | an unknown path, or a method the path does not take |
+| 411 | a body without a `Content-Length` (chunked bodies are not taken) |
+| 413 | a body past `--max-body-mb` |
+| 415 | a body that is no image it reads; a PDF among them, since PDFs go through `ocr` |
+| 417, 505 | an `Expect` other than `100-continue`; an HTTP version other than 1.0 and 1.1 |
+| 422 | an image that does not decode |
+| 431 | a request's head past 16 KB |
+| 500 | the engine's error |
+| 503 | the queue full, with `Retry-After: 1` |
+
+An error's body is its reason, as text.
+
+| option | default | what |
+|---|---|---|
+| `--host ADDR` | `127.0.0.1` | the address to listen on: this machine only; `0.0.0.0` for every interface |
+| `--port N` | 8080 | the port; 0 picks a free one, which the first line printed gives |
+| `--queue N` | 64 | requests that wait past the pages in flight; more are answered 503 |
+| `--max-body-mb N` | 64 | the largest page a request may send |
+| `--decoders N` | 4, at most the cores | `--device cuda`: the threads that decode the pages |
+| `--image-dpi N` | 300 | `format=pdf`: the dpi the page's image is placed at |
+| `--quiet` | off | no line on standard error for each request |
+
+The server has no TLS and no authentication. To serve beyond the machine, put it behind a proxy that has them.
+
+## <img src="assets/chip-03.svg" height="22" alt=""> Output formats
 
 | format | what |
 |---|---|
@@ -67,7 +116,7 @@ The reading order comes from the set's `order.onnx` when the set has one; otherw
 
 Boxes are in the page image's pixels. For a PDF page they are in the pixels of the page as rendered at `--dpi`.
 
-## <img src="assets/chip-03.svg" height="22" alt=""> Timing and inspecting
+## <img src="assets/chip-04.svg" height="22" alt=""> Timing and inspecting
 
 ```shell
 carbon-ocr version
@@ -88,7 +137,7 @@ carbon-ocr compare model.onnx --shape x=8x1x32x512               # native agains
 - **`bench`** times one model with fixed inputs and reports the median, p90 and fastest run. On TensorRT it times two runs: from host memory with the copies included, and on device buffers, the way the GPU pipeline runs a model. `--opt-level 0-5` sets TensorRT's builder optimization level (default 3), and `--no-graphs` turns off CUDA graphs. `--isa NAME` holds the native backend to one instruction set. `--workers` runs a pool of pinned workers, each with its own session, and reports their scaling.
 - **`compare`** runs a model on the native backend and on ONNX Runtime and reports how far apart their outputs are. `--against FILE` gives ONNX Runtime a different file, such as the FP32 model for an int8 one.
 
-## <img src="assets/chip-04.svg" height="22" alt=""> Python
+## <img src="assets/chip-05.svg" height="22" alt=""> Python
 
 ```shell
 pip install ./python
@@ -120,7 +169,7 @@ logits, = session.run([np.zeros((1, 1, 32, 512), np.float32)])     # [1, 800, 12
 
 The module also exposes the engine's building blocks: the crop rule (`crop`, `crop_lines`, `crop_region`), the CTC decoders (`ctc_greedy`, `ctc_collapse`), the detector's decoder and the merge of its two passes (`decode_det`, `takes_second_pass`, `merge_passes`), the order model's features and decoder (`order_features`, `decode_order`, `reading_order`), and text scoring (`text_errors`, `char_confusions`). [python/README.md](../python/README.md) lists all of them.
 
-## <img src="assets/chip-05.svg" height="22" alt=""> OCRmyPDF
+## <img src="assets/chip-06.svg" height="22" alt=""> OCRmyPDF
 
 `tools/ocrmypdf/carbon_ocrmypdf.py` plugs Carbon-OCR into OCRmyPDF 17 as its OCR engine. OCRmyPDF prepares each page itself, turning and deskewing it, and the plugin runs `carbon-ocr ocr --as-given` on the page. With OCRmyPDF's default renderer, the plugin returns hOCR. With `--pdf-renderer sandwich`, it returns a text-only PDF at the image's own dpi.
 

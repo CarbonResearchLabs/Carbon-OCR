@@ -1,6 +1,6 @@
 # models/
 
-Fullerene model sets: `meta.json` and vocabularies in git; the ONNX weights are release assets (`*.onnx` here is ignored).
+Fullerene model sets: `meta.json` and vocabularies in git; the ONNX weights are on Hugging Face (`CarbonResearchLabs/fullerene-3M`; `*.onnx` here is ignored).
 
 A Fullerene model is one complete set: detector, recognizers, classifiers and order model, shipped and versioned together. When there is more than one, each is named `fullerene-<N>M`, where N is the set's total parameter count rounded to the nearest million, halves up (a 7.3 M set is `fullerene-7M`, a 7.5 M set `fullerene-8M`). Inside a set, files are named by role:
 

@@ -311,7 +311,7 @@ Which files each path opens:
 | path | files |
 |---|---|
 | the CPU engine (`carbon::Engine`, `Pipeline` on the CPU) | `orient`, `det` and the recognizer as `.int8.onnx` where the set has it, else `.onnx`; `det.onnx` too, for detection on several threads; `<rec>.vocab.json`; `order.native.bin`, else `order.onnx` (without either, the XY-cut) |
-| the GPU pipeline (`Pipeline` on CUDA) | `orient.fp16.onnx`, `det.fp16.onnx`, `<rec>.features.fp16.onnx` and `<rec>.head.bin` (else `<rec>.onnx`), `<rec>.vocab.json`; the order model as on the CPU |
+| the GPU pipeline (`Pipeline` on CUDA) | at `--precision auto`, the default: `orient.fp16.onnx` and `det.fp16.onnx` (else their `.onnx`), `<rec>.features.fp16.onnx` and `<rec>.head.bin` (else `<rec>.onnx`); at `fp32` the `.onnx` files, at `int8` the `.int8-sym.onnx` files; `<rec>.vocab.json`; the order model as on the CPU |
 
 ## <img src="assets/chip-10.svg" height="22" alt=""> The metadata and checks the engine reads
 
@@ -337,15 +337,15 @@ When it orders a page, it checks that the order model gives six outputs.
 
 ## <img src="assets/chip-11.svg" height="22" alt=""> Precisions and backends
 
-Each model ships in several precisions, and each backend runs the one that suits it. TensorRT 11 builds strongly typed networks, so it runs a model in its file's own precision: an FP16 file in FP16, a Q/DQ file in INT8.
+Each model ships in several precisions, and each backend runs the one that suits it. TensorRT 11 builds strongly typed networks, so it runs a model in its file's own precision: an FP16 file in FP16, a Q/DQ file in INT8. The engine's precision picks the file on the CPU and on the GPU alike ([ENGINE.md](ENGINE.md), section 9).
 
 | file | precision | format | run by |
 |---|---|---|---|
-| `<m>.onnx` | FP32 | plain ONNX | ONNX Runtime on the CPU; the native backend where a set has no int8 file; TensorRT for a recognizer without its trunk and head files |
+| `<m>.onnx` | FP32 | plain ONNX | ONNX Runtime on the CPU; the native backend where a set has no int8 file; TensorRT at `fp32`, for a model without its FP16 file, and for a recognizer without its trunk and head files |
 | `<m>.int8.onnx` | INT8 | Q/DQ: int8 weights per output channel, uint8 activations with zero points | the native CPU backend, the engine's default on the CPU for the convolutional networks |
-| `<m>.fp16.onnx` | FP16 | float16 inputs, weights and outputs | TensorRT: `orient` and `det` in the GPU pipeline |
+| `<m>.fp16.onnx` | FP16 | float16 inputs, weights and outputs | TensorRT: `orient` and `det` in the GPU pipeline; the native CPU backend at `fp16` |
 | `<rec>.features.fp16.onnx`, `<rec>.head.bin` | FP16 | the trunk in float16; the head's weight in float16, its bias in float32 | TensorRT and the fused CTC head, the GPU pipeline's recognizer |
-| `<m>.int8-sym.onnx` | INT8 | Q/DQ: symmetric int8, biases in float | TensorRT, for `carbon-ocr bench --backend trt`; the GPU pipeline does not open it yet |
+| `<m>.int8-sym.onnx` | INT8 | Q/DQ: symmetric int8, biases in float | TensorRT: the GPU pipeline at `--precision int8`, and `carbon-ocr bench --backend trt` |
 | `order.native.bin` | FP32 | `ORDERNT1` | the native CPU backend: `order` on the engine's FP32 GEMM |
 
 `order.onnx` runs on ONNX Runtime where a set has no `order.native.bin` (or where every model is asked to run on ONNX Runtime). `order.int8.onnx`, its matrix products in Q/DQ, and `order.fp16.onnx` are for ONNX Runtime and TensorRT; the engine itself runs `order` on the CPU, from `order.native.bin` or `order.onnx`. A recognizer's whole-model `<rec>.fp16.onnx` is there for tools and other runtimes, since the GPU pipeline runs its trunk and the fused head instead.

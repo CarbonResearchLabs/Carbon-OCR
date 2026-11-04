@@ -4,13 +4,14 @@
 // log steps (each byte plus the one a pixel before it, then two and four pixels before),
 // then the last pixel of the bytes before added to all of them.
 //
-// Paeth, 16 rows at once: 16 rows of 1, 3 or 4 bytes a pixel of which at least 6 are Paeth
-// or Average (the serial filters a row's scalar code makes slowly) go as a wavefront, row k
+// Paeth and Average, 16 rows at once: 16 rows of 1, 3 or 4 bytes a pixel of which at least
+// 6 are Paeth or Average (the serial filters a row's scalar code makes slowly) go as a
+// wavefront, row k
 // a pixel behind row k - 1, the rows in the 16 byte lanes of a vector (a vector a channel);
 // each lane applies its own row's filter (None 0, Sub a, Up b, Average (a + b) / 2, Paeth),
 // chosen by masks made once for the 16 rows.  Each step makes a pixel of every row: its left (a) is the
 // lane's last result, its above (b) the last result moved up a lane (lane 0 from the
-// row above the run), its above left (c) the b of the step before.  The raw bytes come
+// row above the block), its above left (c) the b of the step before.  The raw bytes come
 // into lanes by 16-byte loads from each row, each a pixel further left than the row
 // before, and a 16 x 16 transpose; the results go back the same way.  What the
 // wavefront cannot reach with all 16 rows (a triangle of the first 15 pixels, and the
@@ -19,10 +20,10 @@
 // is a if pa <= pb, else b; and |pa - pb| when not, so it is a if pa <= pb - pa, b if
 // pb <= pa - pb, else c.  (Checked against stb_image's formula for all 2^24 a, b, c.)
 //
-// Average and the other Paeth rows are png_kernels.h's scalar code (Paeth rows of 1 byte
-// a pixel in pairs).  RGB to gray: 8 pixels a 256-bit vector, r and b in 16-bit lanes
-// for one vpmaddwd and g in another.
-// Built with -mavx2 -mfma (/arch:AVX2).
+// The rows no block takes are png_kernels.h's scalar code (Paeth rows of 1 byte a pixel
+// in pairs).  RGB to gray: 8 pixels a 256-bit vector, r and b in 16-bit lanes for one
+// vpmaddwd and g in another.
+// Built with -mavx2 -mfma -mf16c (/arch:AVX2).
 
 #include <immintrin.h>
 

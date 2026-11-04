@@ -3,7 +3,7 @@ if(WIN32)
   # UTF-8 arguments, so a path with any characters opens
   target_sources(carbon-ocr PRIVATE carbon-ocr.manifest)
 endif()
-target_link_libraries(carbon-ocr PRIVATE carbon::carbon)
+target_link_libraries(carbon-ocr PRIVATE carbon::carbon carbon::serve)
 if(CARBON_WITH_TENSORRT)
   # bench also times the run on device buffers
   target_link_libraries(carbon-ocr PRIVATE CUDA::cudart_static)

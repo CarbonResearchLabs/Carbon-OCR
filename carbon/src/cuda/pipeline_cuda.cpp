@@ -1,21 +1,28 @@
 // The batched pipeline's models on a GPU (carbon/pipeline.h, Device::kCuda):
-// TensorRT from the set's FP16 files, a CUDA stream for each stage that calls
-// them, and the cuda:: kernels between, so a page crosses to the device once and
-// only masks, ids and probabilities come back.
+// TensorRT from the set's files at engine.precision (gpu_set_model: FP16, FP32 or
+// symmetric INT8; TensorRT's networks are strongly typed, so the file is the
+// precision), a CUDA stream for each stage that calls them, and the cuda:: kernels
+// between, so a page crosses to the device once and only masks, ids and
+// probabilities come back.  Each model's input and output are float16 or float32 as
+// its file has them (an FP16 file's float16, an FP32 or Q/DQ file's float32), and
+// its buffers and kernels follow.
 //
-//   orient     the thumbnails (float32, from the CPU threads) uploaded and made
-//              float16 on the device; orient.fp16.onnx at an exact profile for
-//              each batch size (1, 2, 4, ... page_batch): a CUDA graph each
+//   orient     the thumbnails (float32, from the CPU threads) uploaded (made
+//              float16 on the device for a float16 input); orient's file at an
+//              exact profile for each batch size (1, 2, 4, ... page_batch): a CUDA
+//              graph each
 //   detect     the pages at the detector's scale, uint8, padded with paper into a
 //              pinned buffer at one of the fixed sizes, uploaded, made an ink map
-//              (cuda::ink_map), det.fp16.onnx, and cuda::threshold_det: only the
+//              (cuda::ink_map), det's file, and cuda::threshold_det: only the
 //              masks come back for carbon::decode_det
 //   recognize  the upright pages uploaded once a group (the same views across the
 //              group's runs), every line cropped by cuda::crop_lines, made an ink
-//              map, the trunk (<rec>.features.fp16.onnx) and the head fused with
-//              greedy decoding (cuda::ctc_head_argmax): ids and probabilities back,
-//              collapsed by carbon::ctc_collapse.  Without the trunk and head files,
-//              <rec>.onnx in float32 and cuda::ctc_greedy.
+//              map; at fp16 and auto the trunk (<rec>.features.fp16.onnx) and the
+//              head fused with greedy decoding (cuda::ctc_head_argmax): ids and
+//              probabilities back, collapsed by carbon::ctc_collapse; else (no trunk
+//              and head files, fused_head off, fp32, int8) the recognizer whole,
+//              <rec>.onnx or <rec>.int8-sym.onnx, its float32 logits through
+//              cuda::ctc_greedy.
 //
 // Every buffer a model reads or writes is allocated at open at its largest, so
 // its address stays fixed and the CUDA graphs replay.
@@ -45,6 +52,16 @@ void check(cudaError_t e, const char* what) {
 }
 
 int round_up(int v, int step) { return (v + step - 1) / step * step; }
+
+// Whether a model's tensor is float16 (else float32, the two the pipeline's buffers and kernels take).
+bool is_half(const TensorInfo& t, const std::filesystem::path& file) {
+  if (t.dtype == DType::kFloat16) return true;
+  if (t.dtype == DType::kFloat32) return false;
+  throw Error(file.string() + ": " + t.name + " is " + std::string(dtype_name(t.dtype)) +
+              ", not float32 or float16");
+}
+
+DType dtype(bool half) { return half ? DType::kFloat16 : DType::kFloat32; }
 
 float half_to_float(uint16_t h) {
   const bool negative = h & 0x8000u;
@@ -132,14 +149,21 @@ class CudaModels final : public PipelineModels {
     SessionOptions so;
     so.device = gpu_;
     so.engine_cache = p.engine_cache;
+    const Precision pr = o.precision;
     SessionOptions orient_o = so;
     for (int b : batches_) orient_o.profiles.push_back({ShapeRange::exact("x", {b, 1, side_, side_})});
-    orient_ = open_session(Backend::kTensorRT, set / "orient.fp16.onnx", orient_o);
+    const std::filesystem::path orient_file = gpu_set_model(set, "orient", pr);
+    orient_ = open_session(Backend::kTensorRT, orient_file, orient_o);
+    orient_half_in_ = is_half(orient_->inputs().at(0), orient_file);
+    orient_half_out_ = is_half(orient_->outputs().at(0), orient_file);
     SessionOptions det_o = so;
     for (const auto& [h, w] : sizes_) {
       for (int b : batches_) det_o.profiles.push_back({ShapeRange::exact("x", {b, 1, h, w})});
     }
-    det_ = open_session(Backend::kTensorRT, set / "det.fp16.onnx", det_o);
+    const std::filesystem::path det_file = gpu_set_model(set, "det", pr);
+    det_ = open_session(Backend::kTensorRT, det_file, det_o);
+    det_half_in_ = is_half(det_->inputs().at(0), det_file);
+    det_half_out_ = is_half(det_->outputs().at(0), det_file);
 
     // the recognizer: a profile for each width bucket, batches of 1 to line_batch
     const int h = crop_.height;
@@ -149,10 +173,16 @@ class CudaModels final : public PipelineModels {
       rec_o.profiles.push_back({{"x", {1, 1, h, bw}, {lines_max_, 1, h, bw}, {lines_max_, 1, h, bw}}});
     }
     const std::filesystem::path trunk = set / (o.rec + ".features.fp16.onnx"), head = set / (o.rec + ".head.bin");
-    fused_ = p.fused_head && std::filesystem::is_regular_file(trunk) && std::filesystem::is_regular_file(head);
+    const bool fused_files = std::filesystem::is_regular_file(trunk) && std::filesystem::is_regular_file(head);
+    if (pr == Precision::kFp16 && p.fused_head && !fused_files) {
+      throw Error(o.rec + ": FP16 on the GPU reads it through its trunk and fused head, " + trunk.string() + " and " +
+                  head.string() + ", which the set does not have");
+    }
+    fused_ = p.fused_head && (pr == Precision::kAuto || pr == Precision::kFp16) && fused_files;
     const size_t classes_vocab = load_vocab(set / (o.rec + ".vocab.json")).size();
     if (fused_) {
       rec_ = open_session(Backend::kTensorRT, trunk, rec_o);
+      rec_half_in_ = is_half(rec_->inputs().at(0), trunk);
       const CtcHead hd = load_ctc_head(head);
       classes_ = hd.classes;
       k_ = hd.k;
@@ -162,8 +192,13 @@ class CudaModels final : public PipelineModels {
             "head weight");
       check(cudaMemcpy(head_b_.p, hd.bias.data(), hd.bias.size() * sizeof(float), cudaMemcpyHostToDevice),
             "head bias");
-    } else {
-      rec_ = open_session(Backend::kTensorRT, set / (o.rec + ".onnx"), rec_o);
+    } else {  // the recognizer whole: INT8's file, or FP32 (fp32; auto and fp16 without the fused head)
+      const std::filesystem::path whole = gpu_set_model(set, o.rec, pr == Precision::kInt8 ? pr : Precision::kFp32);
+      rec_ = open_session(Backend::kTensorRT, whole, rec_o);
+      rec_half_in_ = is_half(rec_->inputs().at(0), whole);
+      if (is_half(rec_->outputs().at(0), whole)) {
+        throw Error(whole.string() + ": its logits are float16; cuda::ctc_greedy reads float32");
+      }
       const Shape& logits = rec_->outputs().at(0).shape;
       classes_ = static_cast<int>(logits.at(1));
     }
@@ -174,20 +209,21 @@ class CudaModels final : public PipelineModels {
 
     // every buffer at its largest, once
     const size_t thumbs = static_cast<size_t>(maxb) * side_ * side_;
+    const size_t orient_out = static_cast<size_t>(maxb) * 13 * (orient_half_out_ ? 2 : 4);
     orient_f32_.reserve(thumbs * sizeof(float));
-    orient_in_.reserve(thumbs * sizeof(uint16_t));
-    orient_out_.reserve(static_cast<size_t>(maxb) * 13 * sizeof(uint16_t));
+    if (orient_half_in_) orient_in_.reserve(thumbs * sizeof(uint16_t));
+    orient_out_.reserve(orient_out);
     orient_host_.reserve(thumbs * sizeof(float));
-    orient_logits_.reserve(static_cast<size_t>(maxb) * 13 * sizeof(uint16_t));
+    orient_logits_.reserve(orient_out);
     size_t page_px = 0;
     for (const auto& [ph, pw] : sizes_) page_px = std::max(page_px, static_cast<size_t>(ph) * pw);
     det_host_.reserve(maxb * page_px);
     det_u8_.reserve(maxb * page_px);
-    det_in_.reserve(maxb * page_px * sizeof(uint16_t));
-    det_maps_.reserve(maxb * page_px / 4 * 4 * sizeof(uint16_t));  // [b][4][h/2][w/2]
+    det_in_.reserve(maxb * page_px * (det_half_in_ ? 2 : 4));
+    det_maps_.reserve(maxb * page_px / 4 * 4 * (det_half_out_ ? 2 : 4));  // [b][4][h/2][w/2]
     const size_t widest = static_cast<size_t>(widths_.back()), frames = widest / crop_.frame_px;
     crops_.reserve(static_cast<size_t>(lines_max_) * h * widest);
-    rec_in_.reserve(static_cast<size_t>(lines_max_) * h * widest * (fused_ ? 2 : 4));
+    rec_in_.reserve(static_cast<size_t>(lines_max_) * h * widest * (rec_half_in_ ? 2 : 4));
     crop_widths_.reserve(static_cast<size_t>(lines_max_) * sizeof(int32_t));
     if (fused_) {
       features_.reserve(static_cast<size_t>(lines_max_) * k_ * frames * sizeof(uint16_t));
@@ -212,18 +248,26 @@ class CudaModels final : public PipelineModels {
     std::fill(host + n * per, host + b * per, 0.0f);  // paper
     const cudaStream_t s = orient_s_.s;
     check(cudaMemcpyAsync(orient_f32_.p, host, b * per * sizeof(float), cudaMemcpyHostToDevice, s), "thumbs");
-    cuda::to_half(orient_f32_.as<float>(), orient_in_.p, static_cast<int64_t>(b * per), s);
+    void* thumbs_in = orient_f32_.p;
+    if (orient_half_in_) {
+      cuda::to_half(orient_f32_.as<float>(), orient_in_.p, static_cast<int64_t>(b * per), s);
+      thumbs_in = orient_in_.p;
+    }
     const Shape in{b, 1, side, side};
-    const std::vector<DeviceTensor> x = {{orient_in_.p, DType::kFloat16, in}};
-    const std::vector<DeviceTensor> y = {{orient_out_.p, DType::kFloat16, orient_->output_shapes({&in, 1})[0]}};
+    const std::vector<DeviceTensor> x = {{thumbs_in, dtype(orient_half_in_), in}};
+    const std::vector<DeviceTensor> y = {{orient_out_.p, dtype(orient_half_out_), orient_->output_shapes({&in, 1})[0]}};
     orient_->enqueue(x, y, s);
-    check(cudaMemcpyAsync(orient_logits_.p, orient_out_.p, static_cast<size_t>(b) * 13 * sizeof(uint16_t),
+    check(cudaMemcpyAsync(orient_logits_.p, orient_out_.p, static_cast<size_t>(b) * 13 * (orient_half_out_ ? 2 : 4),
                           cudaMemcpyDeviceToHost, s),
           "orient logits");
     orient_s_.sync();
     std::vector<float> out(static_cast<size_t>(n) * 13);
-    const uint16_t* z = orient_logits_.as<uint16_t>();
-    for (size_t i = 0; i < out.size(); ++i) out[i] = half_to_float(z[i]);
+    if (orient_half_out_) {
+      const uint16_t* z = orient_logits_.as<uint16_t>();
+      for (size_t i = 0; i < out.size(); ++i) out[i] = half_to_float(z[i]);
+    } else {
+      std::memcpy(out.data(), orient_logits_.p, out.size() * sizeof(float));
+    }
     return out;
   }
 
@@ -247,13 +291,14 @@ class CudaModels final : public PipelineModels {
     }
     const cudaStream_t s = det_s_.s;
     check(cudaMemcpyAsync(det_u8_.p, host, b * per, cudaMemcpyHostToDevice, s), "pages");
-    cuda::ink_map(det_u8_.as<uint8_t>(), static_cast<int64_t>(b * per), det_in_.p, true, s);
+    cuda::ink_map(det_u8_.as<uint8_t>(), static_cast<int64_t>(b * per), det_in_.p, det_half_in_, s);
     const Shape in{b, 1, ph, pw};
     const Shape out_shape = det_->output_shapes({&in, 1})[0];  // [b, 4, ph/2, pw/2]
-    const std::vector<DeviceTensor> x = {{det_in_.p, DType::kFloat16, in}};
-    const std::vector<DeviceTensor> y = {{det_maps_.p, DType::kFloat16, out_shape}};
+    const std::vector<DeviceTensor> x = {{det_in_.p, dtype(det_half_in_), in}};
+    const std::vector<DeviceTensor> y = {{det_maps_.p, dtype(det_half_out_), out_shape}};
     det_->enqueue(x, y, s);
-    const std::vector<DetMasks> masks = cuda::threshold_det(det_maps_.p, true, n, static_cast<int>(out_shape[2]),
+    const std::vector<DetMasks> masks = cuda::threshold_det(det_maps_.p, det_half_out_, n,
+                                                            static_cast<int>(out_shape[2]),
                                                             static_cast<int>(out_shape[3]), rule, s);
     std::vector<Detection> found;
     for (const DetMasks& m : masks) found.push_back(decode_det(m, 1.0, rule));
@@ -285,9 +330,9 @@ class CudaModels final : public PipelineModels {
     const int m = static_cast<int>(boxes.size()), h = crop.height, frames = bw / crop.frame_px;
     cuda::crop_lines(device_pages_, page_of, boxes, bw, crops_.as<uint8_t>(), crop_widths_.as<int32_t>(), crop, s);
     const int64_t px = static_cast<int64_t>(m) * h * bw;
-    cuda::ink_map(crops_.as<uint8_t>(), px, rec_in_.p, fused_, s);
+    cuda::ink_map(crops_.as<uint8_t>(), px, rec_in_.p, rec_half_in_, s);
     const Shape in{m, 1, h, bw};
-    const std::vector<DeviceTensor> x = {{rec_in_.p, fused_ ? DType::kFloat16 : DType::kFloat32, in}};
+    const std::vector<DeviceTensor> x = {{rec_in_.p, dtype(rec_half_in_), in}};
     check(cudaMemcpyAsync(widths_host_.p, crop_widths_.p, m * sizeof(int32_t), cudaMemcpyDeviceToHost, s), "widths");
     if (fused_) {
       const std::vector<DeviceTensor> y = {{features_.p, DType::kFloat16, rec_->output_shapes({&in, 1})[0]}};
@@ -333,6 +378,9 @@ class CudaModels final : public PipelineModels {
   std::vector<std::pair<int, int>> sizes_;
   std::unique_ptr<Session> orient_, det_, rec_;
   bool fused_ = false;
+  // each model's input and output: float16, else float32
+  bool orient_half_in_ = true, orient_half_out_ = true, det_half_in_ = true, det_half_out_ = true;
+  bool rec_half_in_ = true;
   int classes_ = 0, k_ = 0;
   Stream orient_s_, det_s_, rec_s_;
   DeviceMem head_w_, head_b_;

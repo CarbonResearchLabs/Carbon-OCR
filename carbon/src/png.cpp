@@ -13,7 +13,7 @@
 //     word sent as 1, all of which DEFLATE forbids and stb_image rejects: only a file
 //     made so has them and the right Adler-32 too.
 //   - the rows unfiltered by the CPU kernels (carbon/src/cpu/png_kernels.h), a row or a
-//     run of Paeth rows at a time (the row above the first as zeros), then turned to
+//     block of rows at a time (the row above the first as zeros), then turned to
 //     gray from the bytes still in the cache, as stbi__convert_format and
 //     stbi__convert_16_to_8 do it:
 //

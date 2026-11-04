@@ -45,6 +45,16 @@ if(NOT MSVC)
   set_source_files_properties(src/lines.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
 endif()
 
+# carbon-ocr serve (carbon/server.h): HTTP/1.1 over the engine, apart from the library so the library and the
+# Python module carry no sockets.
+add_library(carbon_serve STATIC src/serve/http.cpp src/serve/server.cpp)
+add_library(carbon::serve ALIAS carbon_serve)
+target_link_libraries(carbon_serve PUBLIC carbon)
+if(WIN32)
+  target_link_libraries(carbon_serve PRIVATE ws2_32)
+endif()
+carbon_warnings(carbon_serve)
+
 if(CARBON_WITH_CUDA)
   target_sources(carbon PRIVATE src/cuda/lines.cu src/cuda/ctc_head.cu src/cuda/detect.cu
                  src/cuda/pipeline.cu)

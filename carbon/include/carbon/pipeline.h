@@ -24,10 +24,12 @@
 // by bounded queues, so orientation, detection and recognition of different
 // pages run at once; at most in_flight pages are in the pipeline, and submit
 // waits for room.  On the CPU (Device::kCpu) the models run on the set's files as
-// the CPU engine opens them, multi-threaded, and a page's result is the CPU
-// engine's (carbon/engine.h; the same steps, engine_steps.h).  On a GPU
-// (Device::kCuda: CARBON_WITH_CUDA and TensorRT) they run on TensorRT from the
-// set's FP16 files, detection padded to a few fixed sizes (1024 x 800, 800 x 1024,
+// the CPU engine chooses them, multi-threaded, the detector whole (the engine runs
+// its head itself, det_head.h), and a page's result is the CPU engine's
+// (carbon/engine.h; the same steps, engine_steps.h) but for that head's rounding.
+// On a GPU (Device::kCuda: CARBON_WITH_CUDA and TensorRT) they run on TensorRT from the
+// set's files at engine.precision (gpu_set_model: FP16 by default, or FP32, or symmetric
+// INT8), detection padded to a few fixed sizes (1024 x 800, 800 x 1024,
 // 1024 x 1024 at a long side of 1024) and batched in powers of two up to
 // page_batch, each an exact profile (a CUDA graph).  The second detection pass's
 // larger page fits none of those sizes, so on a GPU a page of tiny text takes no
@@ -40,6 +42,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -133,14 +136,20 @@ class Pipeline {
   std::unique_ptr<Impl> impl_;
 };
 
-// The CPU device's models (Device::kCpu): the set's files as the CPU engine opens
-// them, each run on `threads` threads.
+// The CPU device's models (Device::kCpu): the set's files as the CPU engine chooses
+// them (the detector whole), each run on `threads` threads.
 std::unique_ptr<PipelineModels> cpu_pipeline_models(const std::filesystem::path& set, const EngineOptions& o,
                                                     int threads);
 // The GPU's (Device::kCuda): TensorRT, CUDA streams and the cuda:: kernels; throws
 // Error where CUDA or TensorRT is not built in.
 std::unique_ptr<PipelineModels> cuda_pipeline_models(const std::filesystem::path& set, const EngineOptions& o,
                                                      const PipelineOptions& p);
+// The file a set's model runs on the GPU. TensorRT builds strongly typed networks, so the file is the
+// precision: fp16 <name>.fp16.onnx, fp32 <name>.onnx, int8 <name>.int8-sym.onnx (symmetric Q/DQ,
+// the export's TensorRT file); auto the FP16 file where the set has it, else the FP32 one. Throws Error
+// where the set has no such file. The recognizer at fp16 and auto runs its trunk and fused head instead
+// (<rec>.features.fp16.onnx, <rec>.head.bin) where the set has them and fused_head is on, else whole in FP32.
+std::filesystem::path gpu_set_model(const std::filesystem::path& set, const std::string& name, Precision precision);
 // Whether this build can run the pipeline on a GPU (CUDA and TensorRT in, a device there).
 bool cuda_pipeline_available();
 

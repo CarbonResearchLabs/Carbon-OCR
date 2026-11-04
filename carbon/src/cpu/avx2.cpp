@@ -4,8 +4,9 @@
 // values, A widened to uint16 and B packed as int16 pairs of k, so every product
 // is exact (vpmaddubsw would saturate at 255 * 127 * 2).
 // FP32: vfmadd231ps, the sums in 12 registers.
-// Also the depthwise convolutions, CTC greedy decoding, the crop rule's
-// resampling and the page turns (bilinear in doubles with vpgatherdd for the
+// Also the depthwise convolutions, CTC greedy decoding, a crop's counts, a
+// threshold's bits, the detector's head, the crop rule's resampling and the
+// page turns (bilinear in doubles with vpgatherdd for the
 // taps; 16 x 16 byte transposes, two to a register), which every x86-64 set runs
 // from here.
 // FP16 (F16C, no FP16 arithmetic): the weights stay FP16 and a panel is widened

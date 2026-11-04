@@ -1,6 +1,7 @@
 // carbon_ocr: Carbon-OCR's C++ for Python (nanobind): the crop rule, the decoders of
 // the models' outputs (carbon/lines.h, carbon/detect.h, carbon/order.h), Tensor and
-// Session to run a model from numpy, and Engine and Pipeline to read pages
+// Session to run a model from numpy (ONNX Runtime, TensorRT or the native
+// backend), and Engine and Pipeline to read pages
 // (carbon/engine.h, carbon/pipeline.h).
 
 #include <nanobind/nanobind.h>
@@ -278,7 +279,7 @@ NB_MODULE(carbon_ocr, m) {
   nb::class_<carbon::Session>(m, "Session", "One ONNX model on one backend (carbon::Session).")
       .def(nb::new_([](const std::filesystem::path& model, const std::string& backend, int threads) {
              const auto b = carbon::parse_backend(backend);
-             if (!b) throw carbon::Error("unknown backend '" + backend + "' (ort, trt)");
+             if (!b) throw carbon::Error("unknown backend '" + backend + "' (ort, trt, native)");
              carbon::SessionOptions o;
              o.threads = threads;
              return carbon::open_session(*b, model, o);
@@ -321,9 +322,10 @@ NB_MODULE(carbon_ocr, m) {
           },
           "set"_a, "workers"_a = 0, "pin"_a = true, "rec"_a = "rec-latin", "order_model"_a = nb::none(),
           "precision"_a = "auto",
-          "A Fullerene set's directory (orient.onnx, det.onnx, <rec>.onnx, <rec>.vocab.json, and order.onnx "
-          "where it has one; order_model another); workers 0 is one per physical core. precision: the models' "
-          "files, \"auto\" (the fastest the set has), \"fp32\", \"fp16\" or \"int8\" (carbon::choose_set_model).")
+          "A Fullerene set's directory (orient.onnx, det.onnx, <rec>.onnx, <rec>.vocab.json, and order.native.bin "
+          "or order.onnx where it has one; order_model another); workers 0 is one per physical core. precision: "
+          "the models' files, \"auto\" (the fastest the set has), \"fp32\", \"fp16\" or \"int8\" "
+          "(carbon::choose_set_model).")
       .def_prop_ro("workers", &carbon::Engine::workers)
       .def(
           "ocr",

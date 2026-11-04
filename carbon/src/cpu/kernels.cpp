@@ -1,5 +1,5 @@
-// The GEMMs and the depthwise convolution (carbon/cpu.h): packing, the scalar
-// references, dispatch.
+// The GEMMs, the depthwise convolutions, a threshold's bits, a crop's counts, CTC's
+// argmax and the detector's head (carbon/cpu.h): packing, the scalar references, dispatch.
 
 #include <algorithm>
 #include <array>
