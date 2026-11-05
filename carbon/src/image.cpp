@@ -40,12 +40,14 @@ GrayImage decode_image(std::span<const uint8_t> bytes, cpu::Isa isa) {
     // stb_image reports running out of memory itself
   }
   int w = 0, h = 0, channels = 0;
-  stbi_uc* data = stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()), &w, &h, &channels, 1);
+  // gray and alpha, the gray over white by the alpha, as the PNG decoder above
+  stbi_uc* data = stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()), &w, &h, &channels, 2);
   if (!data) throw Error(std::string("the image could not be read: ") + stbi_failure_reason());
   GrayImage img;
   img.width = w;
   img.height = h;
-  img.pixels.assign(data, data + static_cast<size_t>(w) * h);
+  img.pixels.resize(static_cast<size_t>(w) * h);
+  for (size_t i = 0; i < img.pixels.size(); ++i) img.pixels[i] = over_white(data[2 * i], data[2 * i + 1]);
   stbi_image_free(data);
   return img;
 }

@@ -15,6 +15,7 @@
 
 #include "carbon/error.h"
 #include "carbon/version.h"
+#include "escape_scan.h"
 
 namespace carbon {
 namespace {
@@ -23,16 +24,21 @@ namespace {
 std::string xml(const std::string& s) {
   std::string out;
   out.reserve(s.size());
-  for (char ch : s) {
-    const unsigned char c = static_cast<unsigned char>(ch);
+  for (size_t i = 0; i < s.size();) {
+    const size_t j = detail::special_from(s, i);  // the run written as itself, copied whole
+    out.append(s, i, j - i);
+    if (j == s.size()) break;
+    i = j + 1;
+    const char ch = s[j];
     switch (ch) {
       case '&': out += "&amp;"; break;
       case '<': out += "&lt;"; break;
       case '>': out += "&gt;"; break;
       case '"': out += "&quot;"; break;
       case '\'': out += "&apos;"; break;
+      case '\\': out += ch; break;
       default:
-        if (c >= 0x20 || ch == '\t' || ch == '\n') out += ch;
+        if (ch == '\t' || ch == '\n') out += ch;  // other control bytes are not XML's
     }
   }
   return out;

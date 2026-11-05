@@ -57,6 +57,23 @@ struct PdfStructure {
   std::vector<std::pair<int, int>> runs;  // (element, MCID): the page's marked content in reading order
 };
 
+// What PdfDocument::page and PdfPool::page read of a page: its image, characters, pictures and structure from
+// one load of the page, and from the pool one request.
+enum PdfWant : unsigned {
+  kPdfImage = 1,
+  kPdfChars = 2,
+  kPdfPictures = 4,
+  kPdfStructure = 8,
+};
+
+struct PdfPage {
+  double scale = 0;               // the scale it was read at: the one asked, or auto's
+  GrayImage image;                // kPdfImage: as render gives it
+  std::vector<PdfChar> chars;     // kPdfChars: as chars
+  std::vector<LineBox> pictures;  // kPdfPictures: as pictures
+  PdfStructure structure;         // kPdfStructure: as structure
+};
+
 class PdfDocument {
  public:
   // Throws Error if the file cannot be read as a PDF (or the password is wrong).
@@ -80,6 +97,16 @@ class PdfDocument {
   std::vector<LineBox> pictures(int page, double scale) const;
   // Its structure tree (a tagged PDF's).
   PdfStructure structure(int page) const;
+
+  // The scale a page reads well at: its drawn characters' font sizes' 10th percentile brought to 25 px, from
+  // 200 to 400 dpi; a page of no text, its largest image's own resolution, from 200 to 400 dpi; else 200 dpi.
+  // Pixels a point.
+  double auto_scale(int page) const;
+
+  // What `want` (PdfWant bits) asks, from one load of the page: each part as its own call gives it.  into: where
+  // the image's gray goes when it fits into_bytes (image.pixels then stays empty, its width and height set).
+  // scale 0 (--dpi auto): the page's own, auto_scale's.
+  PdfPage page(int page, double scale, unsigned want, uint8_t* into = nullptr, size_t into_bytes = 0) const;
 
  private:
   struct Impl;
@@ -113,6 +140,8 @@ class PdfPool {
   std::vector<LineBox> pictures(const std::filesystem::path& file, int page, double scale);
   // Its structure tree, as PdfDocument::structure reads it.
   PdfStructure structure(const std::filesystem::path& file, int page);
+  // What `want` (PdfWant bits) asks, in one request and one load of the page, as PdfDocument::page.
+  PdfPage page(const std::filesystem::path& file, int page, double scale, unsigned want);
 
   struct Helper;  // a process and its pipes
 

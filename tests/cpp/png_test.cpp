@@ -9,6 +9,8 @@
 #include <stb_image.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -19,6 +21,7 @@
 #include "carbon/cpu.h"
 #include "carbon/error.h"
 #include "carbon/image.h"
+#include "../../carbon/src/png.h"
 
 namespace carbon {
 namespace {
@@ -190,11 +193,19 @@ std::vector<uint8_t> palette(int n, std::mt19937& rng) {
 
 // ------------------------------------------------------------------ against stb_image
 
-// decode_image with every instruction set against stbi_load_from_memory(..., 1): the same
-// bytes, or the same error.  Whether stb_image read the file.
+// decode_image with every instruction set against stbi_load_from_memory(..., 2), its gray over
+// white by its alpha (over_white): the same bytes, or the same error.  Whether stb_image
+// read the file.
 bool as_stb(const std::vector<uint8_t>& file, const std::string& what) {
   int w = 0, h = 0, n = 0;
-  stbi_uc* ref = stbi_load_from_memory(file.data(), static_cast<int>(file.size()), &w, &h, &n, 1);
+  stbi_uc* ga = stbi_load_from_memory(file.data(), static_cast<int>(file.size()), &w, &h, &n, 2);
+  stbi_uc* ref = nullptr;
+  std::vector<uint8_t> over;
+  if (ga) {
+    over.resize(static_cast<size_t>(w) * h);
+    for (size_t i = 0; i < over.size(); ++i) over[i] = over_white(ga[2 * i], ga[2 * i + 1]);
+    ref = over.data();
+  }
   const std::string reason = ref ? "" : stbi_failure_reason();
   for (cpu::Isa isa : cpu::isas_available()) {
     const std::string at = what + " (" + cpu::isa_name(isa) + ")";
@@ -218,7 +229,7 @@ bool as_stb(const std::vector<uint8_t>& file, const std::string& what) {
                     << int{*miss.second};
     }
   }
-  stbi_image_free(ref);
+  stbi_image_free(ga);
   return ref != nullptr;
 }
 
@@ -235,6 +246,67 @@ const Kind kKinds[] = {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}, {2, 8}, {2, 16},
 
 // Every colour type and bit depth PNG allows, odd widths, the filters in turn, all Paeth,
 // and at random; random and smooth samples.
+// The time: a real page's PNG (CARBON_PNG_TIME, a path) inflated by each decoder, the best of 9 rounds of 20.
+TEST(Png, Time) {
+  const char* path = std::getenv("CARBON_PNG_TIME");
+  if (!path || !detail::zlib_inflate_avx2_built()) GTEST_SKIP() << "set CARBON_PNG_TIME to a PNG to time it";
+  const GrayImage img = load_image(path);
+  // the page's gray as a PNG's filtered rows would hold it (filter byte 0), deflated at level 6
+  std::vector<uint8_t> raw;
+  for (int y = 0; y < img.height; ++y) {
+    raw.push_back(0);
+    raw.insert(raw.end(), img.pixels.begin() + static_cast<size_t>(y) * img.width,
+               img.pixels.begin() + static_cast<size_t>(y + 1) * img.width);
+  }
+  libdeflate_compressor* c = libdeflate_alloc_compressor(6);
+  std::vector<uint8_t> z(libdeflate_zlib_compress_bound(c, raw.size()));
+  z.resize(libdeflate_zlib_compress(c, raw.data(), raw.size(), z.data(), z.size()));
+  libdeflate_free_compressor(c);
+  std::vector<uint8_t> out(raw.size());
+  for (bool avx2 : {false, true}) {
+    double best = 1e30;
+    for (int round = 0; round < 9; ++round) {
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int r = 0; r < 20; ++r) ASSERT_TRUE(detail::zlib_inflate(z.data(), z.size(), out.data(), out.size(), avx2));
+      best = std::min(best, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 20);
+    }
+    std::printf("%s: %.3f ms to inflate %zu bytes from %zu\n", avx2 ? "AVX2 build" : "library", best, raw.size(), z.size());
+  }
+}
+
+// libdeflate's decoder compiled again with /arch:AVX2 (MSVC) inflates what the library does, byte for byte:
+// stored, fixed and dynamic blocks at every level, of random and of page-like bytes, and a bad stream refused.
+TEST(Png, TheAvx2InflateIsTheLibrarys) {
+  if (!detail::zlib_inflate_avx2_built() || !cpu::features().avx2 || !cpu::features().bmi2) {
+    GTEST_SKIP() << "no AVX2 build of the decoder here";
+  }
+  std::mt19937 rng(9);
+  for (int kind = 0; kind < 3; ++kind) {
+    std::vector<uint8_t> raw(300000);
+    for (size_t i = 0; i < raw.size(); ++i) {
+      raw[i] = kind == 0 ? static_cast<uint8_t>(rng())                                     // noise
+               : kind == 1 ? static_cast<uint8_t>(i % 997 < 900 ? 255 : rng() % 64)      // a page: paper and ink
+                           : static_cast<uint8_t>((i / 7) % 13);                           // runs
+    }
+    for (int level : {0, 1, 6, 12}) {
+      libdeflate_compressor* c = libdeflate_alloc_compressor(level);
+      std::vector<uint8_t> z(libdeflate_zlib_compress_bound(c, raw.size()));
+      z.resize(libdeflate_zlib_compress(c, raw.data(), raw.size(), z.data(), z.size()));
+      libdeflate_free_compressor(c);
+      std::vector<uint8_t> a(raw.size()), b(raw.size(), 1);
+      ASSERT_TRUE(detail::zlib_inflate(z.data(), z.size(), a.data(), a.size(), false));
+      ASSERT_TRUE(detail::zlib_inflate(z.data(), z.size(), b.data(), b.size(), true)) << kind << " level " << level;
+      EXPECT_EQ(a, raw);
+      EXPECT_EQ(b, raw) << kind << " level " << level;
+      z[z.size() / 2] ^= 0x5A;  // damaged: both refuse it, or both give the same bytes
+      const bool ra = detail::zlib_inflate(z.data(), z.size(), a.data(), a.size(), false);
+      const bool rb = detail::zlib_inflate(z.data(), z.size(), b.data(), b.size(), true);
+      EXPECT_EQ(ra, rb);
+      if (ra && rb) EXPECT_EQ(a, b);
+    }
+  }
+}
+
 TEST(Png, EveryKindAsStbImage) {
   std::mt19937 rng(7);
   const std::function<int(int)> filters[] = {[](int y) { return y % 5; }, [](int) { return 4; },
@@ -412,6 +484,29 @@ TEST(Png, BuffersKeptBetweenPagesAsStbImage) {
     how.idat_piece = 8192;
     EXPECT_TRUE(as_stb(png(im, how), name(im)));
   }
+}
+
+// A transparent page over white paper. A page of black ink at alpha 0 is white, not black; half alpha is half
+// way, rounded exactly; an opaque one keeps its gray; and RGBA as gray + alpha.
+TEST(Png, TransparencyIsOverWhitePaper) {
+  Samples clear{8, 4, 8, 4, {}};
+  for (int i = 0; i < 32; ++i) clear.s.insert(clear.s.end(), {0u, 0u});  // black, fully transparent
+  const GrayImage white = decode_image(png(clear));
+  EXPECT_EQ(white.pixels, std::vector<uint8_t>(32, 255));
+  EXPECT_EQ(over_white(0, 128), 127);  // round(255 * 127 / 255)
+  EXPECT_EQ(over_white(200, 255), 200);
+  for (uint32_t g = 0; g < 256; ++g) {
+    for (uint32_t a = 0; a < 256; ++a) {
+      const double want = (g * a + 255.0 * (255 - a)) / 255;
+      ASSERT_EQ(over_white(g, a), static_cast<uint8_t>(std::floor(want + 0.5))) << g << ", " << a;
+    }
+  }
+  Samples rgba{4, 2, 8, 6, {}};
+  for (int i = 0; i < 8; ++i) rgba.s.insert(rgba.s.end(), {10u, 10u, 10u, i < 4 ? 0u : 255u});
+  const GrayImage half = decode_image(png(rgba));
+  EXPECT_EQ(half.pixels[0], 255);
+  EXPECT_EQ(half.pixels[7], 10);
+  EXPECT_TRUE(as_stb(png(rgba), "RGBA, half the page transparent"));
 }
 
 TEST(Png, OnlyTheInstructionSetsThisCpuHas) {

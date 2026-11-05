@@ -206,6 +206,7 @@ class CudaModels final : public PipelineModels {
                   head.string() + ", which the set does not have");
     }
     fused_ = p.fused_head && (pr == Precision::kAuto || pr == Precision::kFp16) && fused_files;
+    head_half_ = p.head_fp16_accumulate;
     const size_t classes_vocab = load_vocab(set / (o.rec + ".vocab.json")).size();
     if (fused_) {
       rec_ = open_session(Backend::kTensorRT, trunk, rec_o);
@@ -459,12 +460,13 @@ class CudaModels final : public PipelineModels {
     cuda::ink_map(crops_.as<uint8_t>(), px, rec_in_.p, rec_half_in_, s);
     const Shape in{m, 1, h, bw};
     const std::vector<DeviceTensor> x = {{rec_in_.p, dtype(rec_half_in_), in}};
-    check(cudaMemcpyAsync(widths_host_.p, crop_widths_.p, m * sizeof(int32_t), cudaMemcpyDeviceToHost, s), "widths");
+    // the crops' widths are the host's own (crop_region), not copied back
+    for (int i = 0; i < m; ++i) widths_host_.as<int32_t>()[i] = crop_region(boxes[i], crop).width;
     if (fused_) {
       const std::vector<DeviceTensor> y = {{features_.p, DType::kFloat16, rec_->output_shapes({&in, 1})[0]}};
       rec_->enqueue(x, y, s);
       cuda::ctc_head_argmax(features_.p, head_w_.p, head_b_.as<float>(), m, k_, classes_, frames, ids_.as<int32_t>(),
-                            probs_.as<float>(), s);
+                            probs_.as<float>(), s, head_half_);
       check(cudaMemcpyAsync(ids_host_.p, ids_.p, static_cast<size_t>(m) * frames * sizeof(int32_t),
                             cudaMemcpyDeviceToHost, s),
             "ids");
@@ -618,6 +620,7 @@ class CudaModels final : public PipelineModels {
   DeviceMem det2_f32_, det2_in_, det2_maps_;
   Pinned det2_host_;
   bool fused_ = false;
+  bool head_half_ = false;  // the fused head's products summed in FP16
   // each model's input and output: float16, else float32
   bool orient_half_in_ = true, orient_half_out_ = true, det_half_in_ = true, det_half_out_ = true;
   bool rec_half_in_ = true;

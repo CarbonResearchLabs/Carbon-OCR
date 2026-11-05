@@ -30,6 +30,10 @@ struct CropRule {
   // dark ink on light paper: a crop with more pixels at least flip_margin lighter
   // than its ground than pixels as much darker (carbon::light_on_dark).  0: never.
   int flip_margin = 48;
+  // A crop is flipped only where over half its pixels are at most 127 as well: where both padding rows land
+  // on a table's rules, the ground reads dark though the crop is dark text on paper. On by default; false: the
+  // ground's test alone.
+  bool flip_needs_dark = true;
 };
 
 // A box in page pixels, x right, y down.
@@ -71,6 +75,11 @@ struct GrayView {
 // reference itself (tests, benchmarks).
 void resample_gray(const GrayView& image, double x0, double y0, double x1, double y1, int out_width,
                    int out_height, uint8_t* out, int64_t out_stride, cpu::Isa isa = cpu::best_isa());
+// Its output rows [row0, row1) alone (a band of a page at another scale), out's first row the output's row0:
+// the same bytes as those rows of the whole output.
+void resample_gray_rows(const GrayView& image, double x0, double y0, double x1, double y1, int out_width,
+                        int out_height, int row0, int row1, uint8_t* out, int64_t out_stride,
+                        cpu::Isa isa = cpu::best_isa());
 
 // Crops `boxes` from `page` into out[n][rule.height][out_width] (uint8, paper
 // 255), each finished by finish_crop: flipped if light on dark, then padded past

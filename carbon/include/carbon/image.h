@@ -11,6 +11,12 @@
 
 namespace carbon {
 
+// A gray sample g of alpha a over white paper: round((g a + 255 (255 - a)) / 255), exactly; a = 255 keeps g.
+inline uint8_t over_white(uint32_t g, uint32_t a) {
+  const uint32_t t = g * a + 255 * (255 - a) + 128;
+  return static_cast<uint8_t>((t + (t >> 8)) >> 8);
+}
+
 // A grayscale image that owns its pixels: paper 255, ink 0, rows packed.
 struct GrayImage {
   int width = 0, height = 0;

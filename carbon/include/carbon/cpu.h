@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <new>
 #include <vector>
 
 namespace carbon::cpu {
@@ -38,11 +39,14 @@ namespace carbon::cpu {
 struct Features {
   std::string vendor, brand;
   // x86-64
-  bool sse41 = false, avx2 = false, fma = false, f16c = false, avx_vnni = false;
+  bool sse41 = false, avx2 = false, fma = false, f16c = false, avx_vnni = false, bmi2 = false;
   bool avx512f = false, avx512bw = false, avx512vl = false, avx512dq = false, avx512vnni = false;
-  bool avx512bf16 = false, avx512fp16 = false, amx_int8 = false, amx_bf16 = false;
+  bool avx512bf16 = false, avx512fp16 = false, amx_tile = false, amx_int8 = false, amx_bf16 = false, amx_fp16 = false;
   // arm64
   bool neon = false, dotprod = false, i8mm = false, fp16 = false, bf16 = false, sve = false, sve2 = false;
+  // the L1 data cache's bytes a core (the FP32 GEMM's blocking): x86's CPUID leaf 4, Linux's sysfs, macOS's sysctl,
+  // Windows's processor information; 32 KB where none says
+  int l1d_bytes = 32 << 10;
 };
 
 // Read once from cpuid and xgetbv (x86: the OS must save the wide registers too),
@@ -107,7 +111,8 @@ Rows<T> grid(const T* base, int64_t stride, int taps, const int64_t* offsets) {
 //   v = sum * scale[j]           int8 sums only, the product's scale (A's times B's
 //                                column j); none: 1
 //     + bias[j]
-//     + residual[i][j]           float, or uint8 dequantized: (r - zero) * scale
+//     + residual[i >> shift][j]  float, or uint8 dequantized: (r - zero) * scale (shift: a nearest
+//                                upsampling's columns read in place; 0 otherwise)
 //   v = v > 0 ? v : 0            relu
 //
 // then stored as float, or quantized: round(v * out_inv_scale) + out_zero,
@@ -120,6 +125,7 @@ struct Epilogue {
   const uint8_t* residual_u8 = nullptr;
   const uint16_t* residual_f16 = nullptr;
   int64_t residual_ld = 0;
+  int residual_shift = 0;  // row i's residual is the residual's row i >> residual_shift
   float residual_scale = 1;
   int32_t residual_zero = 0;
   bool relu = false;
@@ -139,12 +145,28 @@ struct Epilogue {
 // k_padded(k / taps) bytes readable (the bytes past the piece are any value: they
 // meet B's zero padding).
 
+// A std::vector's storage on a 64-byte boundary: a cache line and a zmm, so no panel's or row's load splits a
+// line (vectors are 16-byte aligned by default).
+template <class T>
+struct Aligned64 {
+  using value_type = T;
+  Aligned64() = default;
+  template <class U>
+  Aligned64(const Aligned64<U>&) {}
+  T* allocate(size_t n) { return static_cast<T*>(::operator new(n * sizeof(T), std::align_val_t{64})); }
+  void deallocate(T* p, size_t) { ::operator delete(p, std::align_val_t{64}); }
+  template <class U>
+  bool operator==(const Aligned64<U>&) const { return true; }
+};
+template <class T>
+using Vector64 = std::vector<T, Aligned64<T>>;
+
 struct PackedB {
   Isa isa = Isa::kScalar;
   int k = 0, n = 0, taps = 1;  // the logical shape
   int seg = 0, segp = 0;       // a piece's rows, and padded to the ISA's group of k
   int np = 0;                  // n padded to the ISA's panel width
-  std::vector<int8_t> data;
+  Vector64<int8_t> data;
   std::vector<int32_t> col_sums;  // sum over k of B[k][j]: for A's zero point
 };
 
@@ -162,7 +184,7 @@ void gemm_u8s8(Rows<uint8_t> a, int32_t a_zero, const PackedB& b, int m, const E
 struct PackedF32 {
   Isa isa = Isa::kScalar;
   int k = 0, n = 0, np = 0;
-  std::vector<float> data;
+  Vector64<float> data;
 };
 
 PackedF32 pack_f32(const float* b, int k, int n, Isa isa);  // b: [k][n], row-major
@@ -220,7 +242,7 @@ struct PackedF16 {
   Isa isa = Isa::kScalar;
   int k = 0, n = 0, np = 0;
   uint64_t id = 0;
-  std::vector<uint16_t> data;
+  Vector64<uint16_t> data;
 };
 
 PackedF16 pack_f16(const uint16_t* b, int k, int n, Isa isa);  // b: [k][n], FP16, row-major
@@ -250,6 +272,11 @@ struct ByteCounts {  // an aggregate, so no constructor of its is built for an i
 };
 ByteCounts count_beyond(const uint8_t* c, int w, int h, int64_t stride, int lo, int hi, Isa isa = best_isa());
 
+// A BGRx image (PDFium's bitmaps) to gray by BT.601's luma, rounded: (299 r + 587 g + 114 b + 500) / 1000, w x h
+// pixels, rows src_stride and dst_stride bytes apart. Every ISA gives the reference's bytes.
+void bgrx_to_gray(const uint8_t* src, int64_t src_stride, int w, int h, uint8_t* dst, int64_t dst_stride,
+                  Isa isa = best_isa());
+
 // The deskew search's rows (carbon/deskew.h, find_skew): for each of n points (x[i], y[i]), each widened to double,
 // the row r = y c - x s + mid, truncated to an int and kept in [0, last], counted in four interleaved histograms:
 // ++count[4 r + (i & 3)]. The products and sums in that order, no FMA, so every ISA's counts are the reference's.
@@ -269,6 +296,34 @@ void skew_rows(const float* x, const float* y, int64_t n, double c, double s, do
 void ctc_argmax(const float* logits, int classes, int frames, int t_n, int32_t* ids, float* probs,
                 Isa isa = best_isa());
 
+// The order model's softmax and GELU, the same bits on every ISA and OS. softmax_rows: each of n_rows rows of
+// n, scaled, to its softmax: exp_neg (ctc_argmax's) of each less the row's max, summed in 8 partial sums (element j
+// in sum j mod 8) joined as ((s0 + s4) + (s2 + s6)) + ((s1 + s5) + (s3 + s7)), then times 1 / the sum. gelu:
+// 0.5 v (1 + erf(v / sqrt 2)), erf as x P(x^2) / Q(x^2) with x clamped to [-4, 4] (Eigen's float coefficients),
+// within 2e-7 of std::erf, each multiply and add on its own.
+void softmax_rows(float* rows, int n_rows, int n, float scale, Isa isa = best_isa());
+// out[p] = the dot product of a's row ia[p] and b's row ib[p] (rows d floats apart), each an FMA chain in k from
+// 0, as gemm_f32 sums it: the same bits as that product's entry.
+void dot_chains(const float* a, const float* b, const int32_t* ia, const int32_t* ib, int pairs, int d, float* out,
+                Isa isa = best_isa());
+void gelu(float* v, size_t n, Isa isa = best_isa());
+
+// The recognizer's head and CTC's argmax fused: a 1x1 convolution from k channels to `classes`, its logits
+// never written past an L1 tile. The weights packed once, a block of kHeadBlock classes contiguous at each k.
+constexpr int kHeadBlock = 10;
+constexpr int kHeadFrames = 8;  // the frames of a tile: its logits [classes][8] in L1 (25.6 KB for 800 classes)
+struct PackedHead {
+  int k = 0, classes = 0;
+  std::vector<float> w;  // [classes / kHeadBlock, rounded up][k][kHeadBlock], past the classes 0
+  std::vector<float> b;  // [classes]
+};
+PackedHead pack_rec_head(const float* w, const float* b, int k, int classes);  // w: [classes][k]
+// One line: from features[k][frames] (channel-major), its first t_n frames' ids and probabilities, as ctc_argmax
+// gives them for the logits b[c] + sum over j of w[c][j] f[j][t], each an FMA chain from the bias in j's order, so
+// every version gives the reference's bits. Vectors along the frames: avx2 for every x86-64 set; the reference else.
+void ctc_head(const float* features, int k, int frames, int t_n, const PackedHead& head, int32_t* ids, float* probs,
+              Isa isa = best_isa());
+
 // det_head: the line detector's head (fullerene det) in one pass.  From x[in][h4][w4] (the FPN's stride-4 features):
 // a 1x1 convolution to `mid` channels and ReLU, a nearest 2x upsample, a depthwise 3x3 (padding 1) and ReLU, and a
 // 1x1 convolution to the `out` maps; rows row0 to row1 - 1 of maps[out][2 h4][2 w4].  The stride-2 tensors between
@@ -286,6 +341,22 @@ struct DetHeadWeights {
   const float* b3 = nullptr;     // [out]
 };
 void det_head(const float* x, int h4, int w4, const DetHeadWeights& w, float* maps, int row0, int row1,
+              Isa isa = best_isa());
+
+// det_stem: the line detector's front (fullerene det) in one pass. From x[h][w] (the ink map, h and w multiples
+// of 4): a 3x3 stride-2 convolution to c1 channels and ReLU, then a 3x3 stride-2 convolution to c2 channels and ReLU,
+// both padded by 1 (zeros), into out[c2][h/4][w/4], its rows [row0, row1). Each value an FMA chain from its bias:
+// the first's taps row by row; the second's taps row by row, the c1 channels in order within each (padding taps
+// included, as zeros). The stride-2 rows a band needs are made in a ring of three, so the stride-2 tensor (12.5 MB
+// for a Letter page) is never whole. Vectors: avx2 for c1 = 16 and c2 a multiple of 8 up to 24; the reference else.
+struct DetStemWeights {
+  int c1 = 0, c2 = 0;
+  const float* w1 = nullptr;  // [c1][3][3]
+  const float* b1 = nullptr;  // [c1]
+  const float* w2 = nullptr;  // [c2][c1][3][3]
+  const float* b2 = nullptr;  // [c2]
+};
+void det_stem(const float* x, int h, int w, const DetStemWeights& sw, float* out, int row0, int row1,
               Isa isa = best_isa());
 
 // ---------------------------------------------------------------- page turns

@@ -19,8 +19,10 @@
 
 #include <cstring>
 #include <string>
+#include <type_traits>
 #include <vector>
 
+#include "carbon/cpu.h"
 #include "carbon/cuda.h"
 #include "carbon/error.h"
 #include "buffer.h"
@@ -125,12 +127,13 @@ __global__ void __launch_bounds__(kScanThreads) scan(int n, int total, int32_t* 
 }
 
 // Each set pixel's values to its place: a core pixel's logit, top and bottom, a
-// picture pixel's logit, at its offset among every page's set pixels.
+// picture pixel's logit, at its offset among every page's set pixels. In the maps'
+// own type: FP16 maps send half the bytes, widened on the host exactly.
 template <class T>
 __global__ void __launch_bounds__(32 * kWarps) scatter(const T* maps, int h, int w, int words,
                                                        const uint32_t* core_bits,
                                                        const uint32_t* picture_bits, const int32_t* offsets,
-                                                       float* core_values, float* picture_values) {
+                                                       T* core_values, T* picture_values) {
   const int page = blockIdx.y, lane = threadIdx.x & 31;
   const int word = blockIdx.x * kWarps + (threadIdx.x >> 5), total = h * words;
   if (word >= total) return;
@@ -141,13 +144,13 @@ __global__ void __launch_bounds__(32 * kWarps) scatter(const T* maps, int h, int
   const size_t plane = static_cast<size_t>(h) * w, px = static_cast<size_t>(r) * w + c;
   const T* m = maps + static_cast<size_t>(page) * 4 * plane;
   if (cb >> lane & 1u) {
-    float* v = core_values + (static_cast<size_t>(offsets[2 * at]) + __popc(cb & below)) * 3;
-    v[0] = to_float(m[px]);
-    v[1] = to_float(m[plane + px]);
-    v[2] = to_float(m[2 * plane + px]);
+    T* v = core_values + (static_cast<size_t>(offsets[2 * at]) + __popc(cb & below)) * 3;
+    v[0] = m[px];
+    v[1] = m[plane + px];
+    v[2] = m[2 * plane + px];
   }
   if (pb >> lane & 1u) {
-    picture_values[static_cast<size_t>(offsets[2 * at + 1]) + __popc(pb & below)] = to_float(m[3 * plane + px]);
+    picture_values[static_cast<size_t>(offsets[2 * at + 1]) + __popc(pb & below)] = m[3 * plane + px];
   }
 }
 
@@ -172,6 +175,29 @@ uint8_t* pinned(size_t bytes) {
   return h.p;
 }
 
+// Mapped pinned host memory a thread keeps for the values the scatter writes: the device writes them across
+// the bus as it makes them, so their count need not come back first. Grown as it needs; its device address too.
+struct Mapped {
+  uint8_t* host = nullptr;
+  uint8_t* device = nullptr;
+  size_t size = 0;
+  ~Mapped() {
+    if (host) cudaFreeHost(host);  // at exit the runtime may be gone: the error is ignored
+  }
+};
+
+Mapped& mapped(size_t bytes) {
+  thread_local Mapped m;
+  if (bytes > m.size) {
+    if (m.host) check(cudaFreeHost(m.host), "cudaFreeHost");
+    m = Mapped{};
+    check(cudaHostAlloc(reinterpret_cast<void**>(&m.host), bytes, cudaHostAllocMapped), "cudaHostAlloc");
+    check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&m.device), m.host, 0), "cudaHostGetDevicePointer");
+    m.size = bytes;
+  }
+  return m;
+}
+
 template <class T>
 std::vector<DetMasks> threshold(const T* maps, int n, int h, int w, const DetRule& rule, cudaStream_t s) {
   std::vector<DetMasks> out(n);
@@ -180,31 +206,41 @@ std::vector<DetMasks> threshold(const T* maps, int n, int h, int w, const DetRul
   const size_t plane = static_cast<size_t>(h) * w, nw = static_cast<size_t>(n) * total;
   Buffer<uint32_t> core_bits(nw, s), picture_bits(nw, s);
   Buffer<int32_t> counts(2 * nw, s), header(2 * static_cast<size_t>(n) + 2, s);
-  Buffer<float> core_values(static_cast<size_t>(n) * plane * 3, s), picture_values(static_cast<size_t>(n) * plane, s);
+  // the values' room: every pixel a core pixel and a picture pixel at most, in the maps' type
+  const size_t core_room = static_cast<size_t>(n) * plane * 3 * sizeof(T);
+  Mapped& values = mapped(core_room + static_cast<size_t>(n) * plane * sizeof(T));
+  T* core_values = reinterpret_cast<T*>(values.device);
+  T* picture_values = reinterpret_cast<T*>(values.device + core_room);
   const float tc = det_logit(rule.core_threshold), tp = det_logit(rule.picture_threshold);
   const dim3 grid((total + kWarps - 1) / kWarps, n);
   ballot<<<grid, 32 * kWarps, 0, s>>>(maps, h, w, words, tc, tp, core_bits.get(), picture_bits.get(), counts.get());
   scan<<<1, kScanThreads, 0, s>>>(n, total, counts.get(), header.get());
   scatter<<<grid, 32 * kWarps, 0, s>>>(maps, h, w, words, core_bits.get(), picture_bits.get(), counts.get(),
-                                       core_values.get(), picture_values.get());
+                                       core_values, picture_values);
   check(cudaGetLastError(), "threshold kernels");
-  const size_t head = (2 * static_cast<size_t>(n) + 2) * sizeof(int32_t);
+  // the header and the bits copied while the values cross the bus: one sync for all
+  const size_t head = (2 * static_cast<size_t>(n) + 2) * sizeof(int32_t), bits = nw * sizeof(uint32_t);
+  uint8_t* staged = pinned(head + 2 * bits);
+  check(cudaMemcpyAsync(staged, header.get(), head, cudaMemcpyDeviceToHost, s), "copy");
+  check(cudaMemcpyAsync(staged + head, core_bits.get(), bits, cudaMemcpyDeviceToHost, s), "copy");
+  check(cudaMemcpyAsync(staged + head + bits, picture_bits.get(), bits, cudaMemcpyDeviceToHost, s), "copy");
+  check(cudaStreamSynchronize(s), "threshold_det");
   std::vector<int32_t> starts(2 * static_cast<size_t>(n) + 2);
-  check(cudaMemcpyAsync(pinned(head), header.get(), head, cudaMemcpyDeviceToHost, s), "copy");
-  check(cudaStreamSynchronize(s), "threshold_det");
-  std::memcpy(starts.data(), pinned(head), head);
+  std::memcpy(starts.data(), staged, head);
   const size_t nc = static_cast<size_t>(starts[2 * n]), np = static_cast<size_t>(starts[2 * n + 1]);
-  const size_t bits = nw * sizeof(uint32_t), cv = nc * 3 * sizeof(float), pv = np * sizeof(float);
-  uint8_t* staged = pinned(2 * bits + cv + pv);
-  check(cudaMemcpyAsync(staged, core_bits.get(), bits, cudaMemcpyDeviceToHost, s), "copy");
-  check(cudaMemcpyAsync(staged + bits, picture_bits.get(), bits, cudaMemcpyDeviceToHost, s), "copy");
-  if (cv) check(cudaMemcpyAsync(staged + 2 * bits, core_values.get(), cv, cudaMemcpyDeviceToHost, s), "copy");
-  if (pv) check(cudaMemcpyAsync(staged + 2 * bits + cv, picture_values.get(), pv, cudaMemcpyDeviceToHost, s), "copy");
-  check(cudaStreamSynchronize(s), "threshold_det");
-  const auto* cb = reinterpret_cast<const uint32_t*>(staged);
-  const auto* pb = reinterpret_cast<const uint32_t*>(staged + bits);
-  const auto* cf = reinterpret_cast<const float*>(staged + 2 * bits);
-  const auto* pf = reinterpret_cast<const float*>(staged + 2 * bits + cv);
+  const auto* cb = reinterpret_cast<const uint32_t*>(staged + head);
+  const auto* pb = reinterpret_cast<const uint32_t*>(staged + head + bits);
+  const auto* cf = reinterpret_cast<const T*>(values.host);
+  const auto* pf = reinterpret_cast<const T*>(values.host + core_room);
+  // the values as floats: FP16 widened on the host's vectors, the same bits as on the device
+  auto widen = [](const T* from, size_t count, std::vector<float>& to) {
+    if constexpr (std::is_same_v<T, float>) {
+      to.assign(from, from + count);
+    } else {
+      to.resize(count);
+      if (count) cpu::to_f32(reinterpret_cast<const uint16_t*>(from), to.data(), count);
+    }
+  };
   for (int p = 0; p < n; ++p) {
     DetMasks& m = out[p];
     m.height = h;
@@ -214,8 +250,8 @@ std::vector<DetMasks> threshold(const T* maps, int n, int h, int w, const DetRul
     m.picture.assign(pb + static_cast<size_t>(p) * total, pb + static_cast<size_t>(p + 1) * total);
     const size_t c0 = starts[2 * p], c1 = p + 1 < n ? starts[2 * p + 2] : nc;
     const size_t p0 = starts[2 * p + 1], p1 = p + 1 < n ? starts[2 * p + 3] : np;
-    m.core_values.assign(cf + 3 * c0, cf + 3 * c1);
-    m.picture_values.assign(pf + p0, pf + p1);
+    widen(cf + 3 * c0, 3 * (c1 - c0), m.core_values);
+    widen(pf + p0, p1 - p0, m.picture_values);
   }
   return out;
 }

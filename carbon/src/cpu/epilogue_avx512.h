@@ -22,6 +22,7 @@ void epilogue_avx512(const S* s, int ld, int rows, int64_t i0, int j0, int w, co
   const uint8_t* const res_u8 = e.residual_u8;
   const uint16_t* const res_f16 = e.residual_f16;
   const int64_t res_ld = e.residual_ld, out_ld = e.out_ld;
+  const int rshift = e.residual_shift;
   const bool relu = e.relu;
   float* const out_f32 = e.out_f32;
   uint8_t* const out_u8 = e.out_u8;
@@ -45,13 +46,13 @@ void epilogue_avx512(const S* s, int ld, int rows, int64_t i0, int j0, int w, co
       }
       if (scale) v = _mm512_mul_ps(v, sc);
       if (bias) v = _mm512_add_ps(v, bi);
-      if (res_f32) v = _mm512_add_ps(v, _mm512_maskz_loadu_ps(k, res_f32 + i * res_ld + j));
+      if (res_f32) v = _mm512_add_ps(v, _mm512_maskz_loadu_ps(k, res_f32 + (i >> rshift) * res_ld + j));
       if (res_u8) {
-        const __m128i r8 = _mm_maskz_loadu_epi8(k, res_u8 + i * res_ld + j);
+        const __m128i r8 = _mm_maskz_loadu_epi8(k, res_u8 + (i >> rshift) * res_ld + j);
         const __m512i rv = _mm512_sub_epi32(_mm512_cvtepu8_epi32(r8), rzero);
         v = _mm512_add_ps(v, _mm512_mul_ps(_mm512_cvtepi32_ps(rv), rscale));
       }
-      if (res_f16) v = _mm512_add_ps(v, _mm512_cvtph_ps(_mm256_maskz_loadu_epi16(k, res_f16 + i * res_ld + j)));
+      if (res_f16) v = _mm512_add_ps(v, _mm512_cvtph_ps(_mm256_maskz_loadu_epi16(k, res_f16 + (i >> rshift) * res_ld + j)));
       if (relu) v = _mm512_max_ps(v, _mm512_setzero_ps());
       if (out_u8) {
         const __m512 q = _mm512_min_ps(_mm512_max_ps(_mm512_mul_ps(v, inv), lo), hi);

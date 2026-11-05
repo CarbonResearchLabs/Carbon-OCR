@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -203,6 +204,34 @@ TEST(Pdf, ReadsBackTheSearchablePdfItWrites) {
     for (const PdfChar& c : doc.chars(0, 1.0)) text += c.code;
     EXPECT_NE(text.find(U"Hello"), std::u32string::npos);
   }
+  // noise, every row unlike the one above it: the image's Up predictor wraps mod 256 and still reads back
+  {
+    GrayImage noise;
+    noise.width = 256;
+    noise.height = 64;
+    noise.pixels.resize(256 * 64);
+    uint32_t r = 12345;
+    for (uint8_t& v : noise.pixels) {
+      r = r * 1664525u + 1013904223u;
+      v = static_cast<uint8_t>(r >> 24);
+    }
+    OcrPage np;
+    np.width = 256;
+    np.height = 64;
+    const std::vector<OcrPage> nps = {np};
+    const std::vector<GrayView> nvs = {noise.view()};
+    const std::string noisy = to_pdf(nps, nvs, 72);
+    std::ofstream(path, std::ios::binary).write(noisy.data(), static_cast<std::streamsize>(noisy.size()));
+    PdfDocument doc(path);
+    const GrayImage back = doc.render(0, 1.0);
+    ASSERT_EQ(back.width, 256);
+    ASSERT_EQ(back.height, 64);
+    int worst = 0;
+    for (size_t i = 0; i < back.pixels.size(); ++i) {
+      worst = std::max(worst, std::abs(back.pixels[i] - noise.pixels[i]));
+    }
+    EXPECT_LE(worst, 2) << "the noise's pixels, read back through the predictor";
+  }
   // turned: the image embedded upright, as the boxes are
   std::vector<OcrPage> turned_pages = pages;
   turned_pages[0].rotation = 90;
@@ -279,6 +308,85 @@ TEST(PdfPool, RendersThroughSharedMemoryOrThePipe) {
 
 // The text layer through the helpers: their characters are the process's own,
 // and make the page's one line, trusted, upright and turned.
+// A page's parts from one load and one request are what each part's own call gives, byte for byte: in the
+// process, and through the pool by its shared region and by the pipe.
+TEST(PdfPool, APagesPartsInOneRequestAreItsOwnCalls) {
+  std::vector<std::filesystem::path> files = {data("text.pdf"), data("figure.pdf")};
+  if (const char* extra = std::getenv("CARBON_S6_PDF")) files.emplace_back(extra);  // another PDF to hold to it
+  for (const auto& file : files) {
+  const PdfDocument doc(file);
+  const unsigned all = kPdfImage | kPdfChars | kPdfPictures | kPdfStructure;
+  auto same_chars = [](const std::vector<PdfChar>& a, const std::vector<PdfChar>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+      const PdfChar &x = a[i], &y = b[i];
+      if (x.code != y.code || x.x0 != y.x0 || x.y0 != y.y0 || x.x1 != y.x1 || x.y1 != y.y1 || x.lx0 != y.lx0 ||
+          x.ly0 != y.ly0 || x.lx1 != y.lx1 || x.ly1 != y.ly1 || x.size != y.size || x.generated != y.generated ||
+          x.bad_map != y.bad_map || x.invisible != y.invisible || x.mcid != y.mcid) {
+        return false;
+      }
+    }
+    return true;
+  };
+  auto same_boxes = [](const std::vector<LineBox>& a, const std::vector<LineBox>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+      if (a[i].x0 != b[i].x0 || a[i].y0 != b[i].y0 || a[i].x1 != b[i].x1 || a[i].y1 != b[i].y1) return false;
+    }
+    return true;
+  };
+  const double scale = 150.0 / 72;
+  for (int page = 0; page < doc.pages(); ++page) {
+    const GrayImage img = doc.render(page, scale);
+    const std::vector<PdfChar> chars = doc.chars(page, scale);
+    const std::vector<LineBox> pics = doc.pictures(page, scale);
+    const PdfStructure st = doc.structure(page);
+    const PdfPage p = doc.page(page, scale, all);
+    EXPECT_EQ(p.image.width, img.width);
+    EXPECT_EQ(p.image.pixels, img.pixels);
+    EXPECT_TRUE(same_chars(p.chars, chars));
+    EXPECT_TRUE(same_boxes(p.pictures, pics));
+    EXPECT_EQ(p.structure.runs, st.runs);
+    std::vector<uint8_t> region(img.pixels.size());
+    const PdfPage into = doc.page(page, scale, kPdfImage, region.data(), region.size());
+    EXPECT_TRUE(into.image.pixels.empty());
+    EXPECT_EQ(region, img.pixels);
+    for (size_t shared : {PdfPool::kSharedBytes, size_t{0}}) {
+      PdfPool pool(1, CARBON_PDF_HELPER, shared);
+      const PdfPage q = pool.page(file, page, scale, all);
+      EXPECT_EQ(q.image.pixels, img.pixels) << "shared " << shared;
+      EXPECT_TRUE(same_chars(q.chars, chars));
+      EXPECT_TRUE(same_boxes(q.pictures, pics));
+      EXPECT_EQ(q.structure.runs, st.runs);
+      EXPECT_EQ(q.structure.elements.size(), st.elements.size());
+      const PdfPage only = pool.page(file, page, scale, kPdfChars);
+      EXPECT_TRUE(only.image.pixels.empty());
+      EXPECT_TRUE(same_chars(only.chars, chars));
+    }
+  }
+  }
+}
+
+// --dpi auto. A page's own scale is within 200 to 400 dpi, the same from the document and through the pool, and
+// a page asked at its own scale is the page asked at that scale; a scale asked comes back as asked.
+TEST(PdfPool, APageAtItsOwnScale) {
+  for (const char* name : {"text.pdf", "figure.pdf"}) {
+    const auto file = data(name);
+    const PdfDocument doc(file);
+    PdfPool pool(1, CARBON_PDF_HELPER);
+    for (int page = 0; page < doc.pages(); ++page) {
+      const double s = doc.auto_scale(page);
+      EXPECT_GE(s, 200.0 / 72 - 1e-9) << name;
+      EXPECT_LE(s, 400.0 / 72 + 1e-9) << name;
+      const PdfPage own = pool.page(file, page, 0, kPdfImage | kPdfChars);
+      EXPECT_EQ(own.scale, s);
+      const PdfPage at = doc.page(page, s, kPdfImage);
+      EXPECT_EQ(own.image.pixels, at.image.pixels);
+      EXPECT_EQ(pool.page(file, page, 1.5, kPdfChars).scale, 1.5);
+    }
+  }
+}
+
 TEST(PdfPool, ReadsTextLayers) {
   PdfPool pool(1, CARBON_PDF_HELPER);
   PdfDocument doc(data("text.pdf"));

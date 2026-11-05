@@ -1,5 +1,6 @@
 // What the CPU can run (carbon/cpu.h): cpuid and xgetbv on x86-64, the OS on arm64.
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -96,6 +97,7 @@ Features detect() {
     cpuid(7, 0, r);
     const unsigned ebx = r[1], ecx = r[2], edx = r[3];
     f.avx2 = ymm && (ebx >> 5 & 1);
+    f.bmi2 = ebx >> 8 & 1;
     f.avx512f = zmm && (ebx >> 16 & 1);
     f.avx512dq = zmm && (ebx >> 17 & 1);
     f.avx512bw = zmm && (ebx >> 30 & 1);
@@ -104,9 +106,23 @@ Features detect() {
     f.avx512fp16 = zmm && (edx >> 23 & 1);
     f.amx_bf16 = tiles && (edx >> 22 & 1);
     f.amx_int8 = tiles && (edx >> 25 & 1);
+    f.amx_tile = tiles && (edx >> 24 & 1);  // the tiles themselves (CPUID 7.0 EDX[24])
     cpuid(7, 1, r);
     f.avx_vnni = ymm && (r[0] >> 4 & 1);
     f.avx512bf16 = zmm && (r[0] >> 5 & 1);
+    f.amx_fp16 = tiles && (r[0] >> 21 & 1);  // CPUID 7.1 EAX[21]
+  }
+  if (max_leaf >= 4) {  // the L1 data cache, from the deterministic cache parameters
+    for (int sub = 0; sub < 16; ++sub) {
+      cpuid(4, sub, r);
+      const unsigned type = r[0] & 31, level = (r[0] >> 5) & 7;
+      if (type == 0) break;
+      if (type == 1 && level == 1) {  // data, L1
+        const unsigned ways = (r[1] >> 22) + 1, parts = ((r[1] >> 12) & 0x3ff) + 1, line = (r[1] & 0xfff) + 1;
+        f.l1d_bytes = static_cast<int>(ways * parts * line * (r[2] + 1));
+        break;
+      }
+    }
   }
 #elif defined(CARBON_ARM64)
   f.vendor = "arm64";
@@ -119,7 +135,17 @@ Features detect() {
   f.sve2 = hw2 >> 1 & 1;     // HWCAP2_SVE2
   f.i8mm = hw2 >> 13 & 1;    // HWCAP2_I8MM
   f.bf16 = hw2 >> 14 & 1;    // HWCAP2_BF16
+  if (FILE* c = std::fopen("/sys/devices/system/cpu/cpu0/cache/index0/size", "r")) {  // L1D, "48K"
+    int kb = 0;
+    if (std::fscanf(c, "%d", &kb) == 1 && kb > 0) f.l1d_bytes = kb << 10;
+    std::fclose(c);
+  }
 #elif defined(__APPLE__)
+  {
+    int64_t v = 0;
+    size_t n = sizeof v;
+    if (sysctlbyname("hw.perflevel0.l1dcachesize", &v, &n, nullptr, 0) == 0 && v > 0) f.l1d_bytes = static_cast<int>(v);
+  }
   f.dotprod = sysctl_flag("hw.optional.arm.FEAT_DotProd");
   f.i8mm = sysctl_flag("hw.optional.arm.FEAT_I8MM");
   f.fp16 = sysctl_flag("hw.optional.arm.FEAT_FP16");

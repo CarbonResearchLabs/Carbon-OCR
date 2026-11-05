@@ -373,6 +373,89 @@ struct Call {
     }
     h.open = file;
   }
+
+  // The parts of an answer (ops 4 to 7 and 9's).
+  GrayImage image(bool there_word) {  // there_word: the answer says whether the pixels are in the region
+    int32_t wh[2] = {0, 0};
+    get(wh, 8);
+    uint32_t there = 0;
+    if (there_word) get(&there, 4);
+    GrayImage img;
+    img.width = wh[0];
+    img.height = wh[1];
+    const size_t n = static_cast<size_t>(img.width) * img.height;
+    if (there) {
+      img.pixels.assign(h.shared, h.shared + n);  // one copy, no zero fill first
+    } else {
+      img.pixels.resize(n);
+      get(img.pixels.data(), n);
+    }
+    return img;
+  }
+
+  std::vector<PdfChar> chars() {
+    uint32_t n = 0;
+    get(&n, 4);
+    std::vector<WireChar> wire(n);
+    get(wire.data(), wire.size() * sizeof(WireChar));
+    std::vector<PdfChar> out(n);
+    for (uint32_t i = 0; i < n; ++i) {
+      const WireChar& w = wire[i];
+      PdfChar& o = out[i];
+      o.code = static_cast<char32_t>(w.code);
+      o.x0 = w.x0;
+      o.y0 = w.y0;
+      o.x1 = w.x1;
+      o.y1 = w.y1;
+      o.lx0 = w.lx0;
+      o.ly0 = w.ly0;
+      o.lx1 = w.lx1;
+      o.ly1 = w.ly1;
+      o.size = w.size;
+      o.mcid = w.mcid;
+      o.generated = w.flags & 1;
+      o.bad_map = w.flags & 2;
+      o.invisible = w.flags & 4;
+    }
+    return out;
+  }
+
+  std::vector<LineBox> pictures() {
+    uint32_t n = 0;
+    get(&n, 4);
+    std::vector<LineBox> out(n);
+    for (LineBox& b : out) {
+      double v[4];
+      get(v, sizeof v);
+      b = {v[0], v[1], v[2], v[3]};
+    }
+    return out;
+  }
+
+  PdfStructure structure() {
+    PdfStructure out;
+    uint32_t ne = 0;
+    get(&ne, 4);
+    out.elements.resize(ne);
+    for (PdfStructElement& e : out.elements) {
+      int32_t parent = -1;
+      uint32_t len = 0;
+      get(&parent, 4);
+      get(&len, 4);
+      e.parent = parent;
+      e.type.resize(len);
+      if (len) get(e.type.data(), len);
+    }
+    uint32_t nr = 0;
+    get(&nr, 4);
+    out.runs.resize(nr);
+    for (auto& r : out.runs) {
+      int32_t v[2];
+      get(v, sizeof v);
+      r = {v[0], v[1]};
+    }
+    return out;
+  }
 };
 
 }  // namespace
@@ -404,20 +487,21 @@ GrayImage PdfPool::render(const std::filesystem::path& file, int page, double sc
     Call c{h, helper_, file.string() + " page " + std::to_string(page)};
     const bool shared = h.shared_on;
     c.run(page < 0 ? kExit : shared ? kRenderShared : kRender, page, scale, key);  // a negative page: a crash
-    int32_t wh[2] = {0, 0};
-    c.get(wh, 8);
-    uint32_t there = 0;
-    if (shared) c.get(&there, 4);
-    GrayImage img;
-    img.width = wh[0];
-    img.height = wh[1];
-    img.pixels.resize(static_cast<size_t>(img.width) * img.height);
-    if (there) {
-      std::memcpy(img.pixels.data(), h.shared, img.pixels.size());
-    } else {
-      c.get(img.pixels.data(), img.pixels.size());
-    }
-    return img;
+    return c.image(shared);
+  });
+}
+
+PdfPage PdfPool::page(const std::filesystem::path& file, int page, double scale, unsigned want) {
+  return with_helper(file, [&](Helper& h, const std::string& key) {
+    Call c{h, helper_, file.string() + " page " + std::to_string(page)};
+    c.run(page < 0 ? kExit : static_cast<Op>(kPage | (want << 8)), page, scale, key);
+    PdfPage out;
+    c.get(&out.scale, 8);
+    if (want & kPdfImage) out.image = c.image(true);
+    if (want & kPdfChars) out.chars = c.chars();
+    if (want & kPdfPictures) out.pictures = c.pictures();
+    if (want & kPdfStructure) out.structure = c.structure();
+    return out;
   });
 }
 
@@ -425,30 +509,7 @@ std::vector<PdfChar> PdfPool::chars(const std::filesystem::path& file, int page,
   return with_helper(file, [&](Helper& h, const std::string& key) {
     Call c{h, helper_, file.string() + " page " + std::to_string(page)};
     c.run(kChars, page, scale, key);
-    uint32_t n = 0;
-    c.get(&n, 4);
-    std::vector<WireChar> wire(n);
-    c.get(wire.data(), wire.size() * sizeof(WireChar));
-    std::vector<PdfChar> out(n);
-    for (uint32_t i = 0; i < n; ++i) {
-      const WireChar& w = wire[i];
-      PdfChar& o = out[i];
-      o.code = static_cast<char32_t>(w.code);
-      o.x0 = w.x0;
-      o.y0 = w.y0;
-      o.x1 = w.x1;
-      o.y1 = w.y1;
-      o.lx0 = w.lx0;
-      o.ly0 = w.ly0;
-      o.lx1 = w.lx1;
-      o.ly1 = w.ly1;
-      o.size = w.size;
-      o.mcid = w.mcid;
-      o.generated = w.flags & 1;
-      o.bad_map = w.flags & 2;
-      o.invisible = w.flags & 4;
-    }
-    return out;
+    return c.chars();
   });
 }
 
@@ -456,15 +517,7 @@ std::vector<LineBox> PdfPool::pictures(const std::filesystem::path& file, int pa
   return with_helper(file, [&](Helper& h, const std::string& key) {
     Call c{h, helper_, file.string() + " page " + std::to_string(page)};
     c.run(kPictures, page, scale, key);
-    uint32_t n = 0;
-    c.get(&n, 4);
-    std::vector<LineBox> out(n);
-    for (LineBox& b : out) {
-      double v[4];
-      c.get(v, sizeof v);
-      b = {v[0], v[1], v[2], v[3]};
-    }
-    return out;
+    return c.pictures();
   });
 }
 
@@ -472,28 +525,7 @@ PdfStructure PdfPool::structure(const std::filesystem::path& file, int page) {
   return with_helper(file, [&](Helper& h, const std::string& key) {
     Call c{h, helper_, file.string() + " page " + std::to_string(page)};
     c.run(kStructure, page, 1.0, key);
-    PdfStructure out;
-    uint32_t ne = 0;
-    c.get(&ne, 4);
-    out.elements.resize(ne);
-    for (PdfStructElement& e : out.elements) {
-      int32_t parent = -1;
-      uint32_t len = 0;
-      c.get(&parent, 4);
-      c.get(&len, 4);
-      e.parent = parent;
-      e.type.resize(len);
-      if (len) c.get(e.type.data(), len);
-    }
-    uint32_t nr = 0;
-    c.get(&nr, 4);
-    out.runs.resize(nr);
-    for (auto& r : out.runs) {
-      int32_t v[2];
-      c.get(v, sizeof v);
-      r = {v[0], v[1]};
-    }
-    return out;
+    return c.structure();
   });
 }
 

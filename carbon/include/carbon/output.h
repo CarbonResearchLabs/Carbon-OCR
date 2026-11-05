@@ -57,5 +57,8 @@ std::string to_html_body(const OcrPage& page);
 // the original page).
 std::string to_pdf(std::span<const OcrPage> pages, std::span<const GrayView> images, double dpi,
                    bool text_only = false);
+// Each page at its own dpi (a PDF read at --dpi auto).
+std::string to_pdf(std::span<const OcrPage> pages, std::span<const GrayView> images, std::span<const double> dpis,
+                   bool text_only = false);
 
 }  // namespace carbon

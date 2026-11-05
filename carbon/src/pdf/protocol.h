@@ -17,6 +17,11 @@
 //   op 8 shared    none: the helper maps the region the pool made for it, `page` its handle
 //                  (Windows: duplicated into the helper) or file descriptor (POSIX: 3), `scale`
 //                  its bytes; the pool asks it once, after starting the helper
+//   op 9 page      a page's parts from one load of it: the op's high bits (op >> 8) are
+//                  PdfWant's, `scale` 0 the page's own, and the answer is f64 the scale
+//                  read at, then each part asked in that order: the image as op 7's (into
+//                  the region when the helper has one and it fits), then the chars as op 4's,
+//                  the pictures as op 5's, the structure as op 6's
 #pragma once
 
 #include <algorithm>
@@ -48,6 +53,7 @@ enum Op : uint32_t {
   kStructure = 6,
   kRenderShared = 7,
   kShared = 8,
+  kPage = 9,
 };
 
 #pragma pack(push, 1)

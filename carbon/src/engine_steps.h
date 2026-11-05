@@ -38,7 +38,7 @@ LineTasks line_tasks(std::span<const OcrLine> lines, const CropRule& crop, int p
 
 // The page at the detector's scale: its long side long_side, the crop rule's
 // antialiased bilinear.
-GrayImage det_scale(const GrayView& page, int long_side);
+GrayImage det_scale(const GrayView& page, int long_side, int64_t area = 0);
 
 // The orientation model's input, [side][side] float32: the page at the detector's
 // scale fitted to side x side (its long side side), as an ink map, the rest paper.
@@ -62,6 +62,12 @@ struct Upright {
 void make_upright(const GrayView& page, int rotation, GrayImage small, const EngineOptions& o, Upright& u,
                   std::optional<Skew> skew = std::nullopt, const RowSplit& split = {});
 
+// A page's line pitch in its pixels: the lag, 4 to 64 rows, where the autocorrelation of its rows' ink
+// counts (pixels of 160 or darker, the mean taken away) peaks, where that peak is at least 0.3 of the zero lag's:
+// the smallest lag that is a peak within 90% of the largest (a periodic profile peaks again at twice its pitch);
+// 0 where none is (a page of no clear lines).
+double line_pitch(const GrayView& page);
+
 // A detector run: its input [1, 1, h, w] (an ink map, h and w multiples of 32), its maps.
 using DetectRun = std::function<Tensor(const Tensor&)>;
 
@@ -77,7 +83,7 @@ Detection on_page(const Detection& d, int vw, int vh, int dw, int dh);
 // maps) and decoded; its boxes in the upright page's pixels.  Nothing where that
 // scale is no larger than dw x dh.
 std::optional<Detection> second_pass(const GrayView& upright, int dw, int dh, const EngineOptions& o,
-                                     const DetectRun& run);
+                                     const DetectRun& run, const Detection& first);
 
 // The page's detection on the upright page: the first pass's, made at the
 // detector's scale (dw x dh), merged with the second pass's (merge_passes) where it
@@ -92,7 +98,7 @@ void place_detection(const Detection& first, const GrayView& upright, int dw, in
 // an unsure space the ink does not bear out is dropped (SpaceRule).
 void read_line(OcrLine& line, const CtcLine& d, int32_t length, const CropRule& crop,
                const std::vector<std::string>& vocab, const uint8_t* ink = nullptr, int ink_width = 0,
-               const SpaceRule* spaces = nullptr);
+               const SpaceRule* spaces = nullptr, bool char_confidence = false, bool words_at_ink = false);
 
 // A crop's columns that hold ink (SpaceRule): out[x] 1 or 0 for x < width, of an h-row crop `stride` bytes a row;
 // false (out untouched) where the crop's contrast is under 32 levels.
@@ -141,5 +147,9 @@ OrderModel choose_order(const std::filesystem::path& set, const EngineOptions& o
 CropRule model_crop(const std::filesystem::path& set, const std::string& rec, CropRule rule);
 // How sure orientation must be to turn a page: the set's own (orient's carbon.orient.turn_probability), else 0.95.
 float model_turn_probability(const std::filesystem::path& set);
+// An orient file's own; and the detector's decoding thresholds from its file's carbon.det.* metadata over
+// `rule`.
+float model_turn_probability_of(const std::filesystem::path& file);
+DetRule model_det_rule(const std::filesystem::path& file, DetRule rule);
 
 }  // namespace carbon::detail

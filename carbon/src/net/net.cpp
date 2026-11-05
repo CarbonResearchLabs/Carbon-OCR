@@ -8,6 +8,9 @@
 // Identity or a Squeeze is a name for its input.  Conv (dense or depthwise),
 // Resize (nearest, whole scales), AveragePool, ReduceMean over the image, Gemm
 // and Add are the layers; any other op is refused when the file is opened.
+// A nearest upsampling that only a convolution's residual reads (the FPN's
+// top-down path) is not written: the output stage reads its input in place
+// (CARBON_NATIVE_UPSAMPLE_IN_PLACE=0 writes it, for tests and timing).
 //
 // int8: a file with QuantizeLinear and DequantizeLinear nodes (the Q/DQ format
 // ONNX Runtime's quantizer and quantization-aware training write) runs in int8.
@@ -32,7 +35,10 @@
 // rec-latin on 8 lines of 512 px 34.6 and 35.0 ms (the FP32 file: 59.7, 6.5 and
 // 34.4 ms), and FP32 tensors keep a rounding fewer.  The graph's outputs are
 // FP32, as the layer's float sums give them (finer than FP16).
-// CARBON_FP16_ACTIVATIONS=1 or 0 in the environment chooses (tests, timing).  At
+// CARBON_FP16_ACTIVATIONS=1 or 0 in the environment chooses (tests, timing).  FP16
+// tensors without FP16 arithmetic have each input row of a convolution widened
+// once, into an FP32 ring the FP32 kernels read (CARBON_NATIVE_WIDEN_ONCE=0
+// widens a value a tap, for tests and timing): the same bits.  At
 // the session the input and outputs are float32, as every other file's.
 //
 // Running: every tensor is NHWC, channels innermost, with a border of zeros (the
@@ -93,9 +99,9 @@ struct Value {
   bool u8 = false, f16 = false;
   Quant q;
   int n = 0, h = 0, w = 0;  // this run's
-  std::vector<float> f;
-  std::vector<uint8_t> b;
-  std::vector<uint16_t> hv;  // FP16
+  cpu::Vector64<float> f;  // 64-byte aligned
+  cpu::Vector64<uint8_t> b;
+  cpu::Vector64<uint16_t> hv;  // FP16
 
   int64_t hp() const { return h + 2 * ph; }
   int64_t wp() const { return w + 2 * pw; }
@@ -145,7 +151,7 @@ struct Value {
 
  private:
   template <typename T>
-  void fill(std::vector<T>& v, size_t size, T zero) {
+  void fill(cpu::Vector64<T>& v, size_t size, T zero) {
     // A new size: resized, not refilled whole: the inside is the making layer's to write, the
     // border is zeroed below and the slack here, so a run whose batch or width changed (most of recognition's) no
     // longer zeroes every tensor end to end.
@@ -205,6 +211,9 @@ struct Layer {
   std::vector<uint16_t> dw16;  // depthwise FP16: [taps][c]
   std::vector<float> scale;
   int fh = 1, fw = 1;  // Resize's scales
+  // The residual is a nearest upsampling's input, read in place: output row oy takes its row oy / res_fh,
+  // pixel ox its pixel ox >> res_shift
+  int res_fh = 1, res_shift = 0;
 };
 
 struct Output {
@@ -488,6 +497,7 @@ class Net {
       v.f16 = fp16_ && act16_;
     }
     for (const Output& o : outputs_) values_[o.value].f16 = false;
+    read_upsampling_in_place();
     for (const Layer& l : layers_) {
       if (l.kind != Kind::kConv && l.kind != Kind::kDwConv) continue;
       Value& v = values_[l.in];
@@ -498,6 +508,35 @@ class Net {
     constants_.clear();  // the layers keep their own copies; the model goes after compiling
     owned_.clear();
     qweights_.clear();
+  }
+
+  // A Resize whose output only a convolution's residual reads (the FPN's top-down path) goes, and the
+  // convolution reads its input in place, when the two are stored alike (the values then the same bits) and the
+  // columns' scale is a power of two.  The upsampled tensor (6.5 + 1.6 + 0.4 MB in the detector at 1024 x 800,
+  // FP32) is then never written.
+  void read_upsampling_in_place() {
+    if (env("CARBON_NATIVE_UPSAMPLE_IN_PLACE") == "0") return;  // written (tests, timing)
+    for (size_t p = 0; p < layers_.size();) {
+      const Layer& up = layers_[p];
+      int reads = 0, reader = -1;
+      for (size_t i = 0; i < layers_.size(); ++i) {
+        const Layer& l = layers_[i];
+        reads += (l.in == up.out) + (l.other == up.out) + (l.residual == up.out);
+        if (l.residual == up.out) reader = static_cast<int>(i);
+      }
+      for (const Output& o : outputs_) reads += o.value == up.out;
+      const bool pow2 = up.fw > 0 && (up.fw & (up.fw - 1)) == 0;
+      if (up.kind != Kind::kResize || reads != 1 || reader < 0 || !pow2 ||
+          !values_[up.in].same_storage(values_[up.out]) || layers_[reader].res_fh != 1) {
+        ++p;
+        continue;
+      }
+      Layer& l = layers_[reader];
+      l.residual = up.in;
+      l.res_fh = up.fh;
+      for (int f = up.fw; f > 1; f >>= 1) ++l.res_shift;
+      layers_.erase(layers_.begin() + static_cast<std::ptrdiff_t>(p));
+    }
   }
 
   // A fused op's output: the value it joins, which now ends as this name.
@@ -925,7 +964,9 @@ class Net {
       for (int kx = 0; kx < l.kw; ++kx) offsets_[ky * l.kw + kx] = (ky * x.wp() + kx) * x.c;
     }
     const Value* r = l.residual >= 0 ? &values_[l.residual] : nullptr;
-    if (r && (r->n != y.n || r->h != y.h || r->w != y.w)) refuse("'" + l.node + "': the residual's shape differs");
+    if (r && (r->n != y.n || r->h * l.res_fh != y.h || (static_cast<int64_t>(r->w) << l.res_shift) != y.w)) {
+      refuse("'" + l.node + "': the residual's shape differs");
+    }
     cpu::Epilogue e;
     e.scale = l.int8 ? l.scale.data() : nullptr;
     e.bias = l.bias.data();
@@ -937,13 +978,25 @@ class Net {
     }
     if (r) {
       e.residual_ld = r->c;
+      e.residual_shift = l.res_shift;
       e.residual_scale = r->q.scale;
       e.residual_zero = r->q.zero;
+    }
+    // FP16 tensors summed in FP32 (no FP16 arithmetic): each padded input row widened once into a ring of
+    // R = kh + sh rows, the row in slot p mod R and again in slot p mod R + R where a window wraps (slots under
+    // kh - 1), so a window's kh rows are contiguous, as in the tensor.  The FP32 kernels then read the ring: the same
+    // values summed in the same order as the FP16 kernels widening a value a tap.
+    const bool ring = l.half && x.f16 && widen_once_ && !cpu::f16_arithmetic(isa_);
+    const int ring_rows = l.kh + l.sh;
+    const int64_t row_len = x.wp() * x.c;
+    if (ring && ring_.size() < static_cast<size_t>(2 * ring_rows * row_len + 64)) {
+      ring_.assign(static_cast<size_t>(2 * ring_rows * row_len + 64), 0.0f);  // the slack, for the kernels' wide reads
     }
     const int64_t kp = l.im2col ? cpu::k_padded(taps * l.cin, isa_) : 0;
     // (the bytes of a row past its taps meet B's zero padding: any value)
     if (l.im2col && cols_.size() < static_cast<size_t>(ow) * kp + 64) cols_.resize(static_cast<size_t>(ow) * kp + 64);
     for (int i = 0; i < y.n; ++i) {
+      int next = 0;  // the ring's next padded row to widen
       for (int oy = 0; oy < oh; ++oy) {
         if (y.u8) {
           e.out_u8 = y.bat(i, oy, 0);
@@ -952,12 +1005,29 @@ class Net {
         } else {
           e.out_f32 = y.fat(i, oy, 0);
         }
-        if (r && r->u8) e.residual_u8 = r->bat(i, oy, 0);
-        if (r && r->f16) e.residual_f16 = r->hat(i, oy, 0);
-        if (r && !r->u8 && !r->f16) e.residual_f32 = r->fat(i, oy, 0);
+        const int ry = oy / l.res_fh;  // an upsampling's input row
+        if (r && r->u8) e.residual_u8 = r->bat(i, ry, 0);
+        if (r && r->f16) e.residual_f16 = r->hat(i, ry, 0);
+        if (r && !r->u8 && !r->f16) e.residual_f32 = r->fat(i, ry, 0);
         const int y0 = oy * l.sh - l.pt, x0 = -l.pl;
         const int64_t step = int64_t{l.sw} * x.c;
-        if (l.half && x.f16) {  // FP16 activations: the FP16 kernels' own arithmetic
+        if (ring) {  // the window's rows widened once, in the ring
+          const int p0 = y0 + x.ph;
+          for (next = std::max(next, p0); next < p0 + l.kh; ++next) {
+            const int slot = next % ring_rows;
+            float* to = ring_.data() + slot * row_len;
+            cpu::to_f32(x.hv.data() + (static_cast<int64_t>(i) * x.hp() + next) * row_len, to,
+                        static_cast<size_t>(row_len), isa_);
+            if (slot < l.kh - 1) std::memcpy(to + ring_rows * row_len, to, sizeof(float) * row_len);
+          }
+          const float* base = ring_.data() + (p0 % ring_rows) * row_len + static_cast<int64_t>(x0 + x.pw) * x.c;
+          const cpu::Rows<float> rows = cpu::grid(base, step, taps, offsets_.data());
+          if (l.kind == Kind::kConv) {
+            cpu::gemm_f16(rows, l.weights16, ow, e);
+          } else {
+            cpu::dwconv_f16(rows, l.dw16.data(), l.cin, ow, e, isa_);
+          }
+        } else if (l.half && x.f16) {  // FP16 activations: the FP16 kernels' own arithmetic
           const cpu::Rows<uint16_t> rows = cpu::grid(x.hat(i, y0, x0), step, taps, offsets_.data());
           if (l.kind == Kind::kConv) {
             cpu::gemm_f16(rows, l.weights16, ow, e);
@@ -1073,6 +1143,8 @@ class Net {
   std::map<std::string, int> uses_;
   std::vector<int64_t> offsets_;
   std::vector<uint8_t> cols_;  // im2col rows
+  cpu::Vector64<float> ring_;  // FP16 input rows widened once
+  bool widen_once_ = env("CARBON_NATIVE_WIDEN_ONCE") != "0";
   std::vector<double> sums_;   // a pool's sums
   std::vector<double> profile_;
   int runs_ = 0;

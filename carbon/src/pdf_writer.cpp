@@ -13,6 +13,7 @@
 #include <libdeflate.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -181,12 +182,21 @@ std::string glyphless_ttf() {
 
 // ---------------------------------------------------------------- the PDF
 
-std::string deflated(const void* data, size_t n) {
-  libdeflate_compressor* c = libdeflate_alloc_compressor(6);
+// zlib data at `level`, by a compressor each thread keeps for each level (one compressor a call cost an
+// allocation of its tables).
+std::string deflated(const void* data, size_t n, int level = 6) {
+  struct Compressors {
+    std::array<libdeflate_compressor*, 13> at{};
+    ~Compressors() {
+      for (libdeflate_compressor* c : at) libdeflate_free_compressor(c);
+    }
+  };
+  thread_local Compressors cs;
+  libdeflate_compressor*& c = cs.at[static_cast<size_t>(std::clamp(level, 0, 12))];
+  if (!c) c = libdeflate_alloc_compressor(level);
   if (!c) throw Error("to_pdf: no memory for the compressor");
   std::string out(libdeflate_zlib_compress_bound(c, n), '\0');
   const size_t got = libdeflate_zlib_compress(c, data, n, out.data(), out.size());
-  libdeflate_free_compressor(c);
   if (!got) throw Error("to_pdf: deflate failed");
   out.resize(got);
   return out;
@@ -247,9 +257,16 @@ std::pair<std::string, int> utf16_hex(const std::string& utf8) {
 }  // namespace
 
 std::string to_pdf(std::span<const OcrPage> pages, std::span<const GrayView> images, double dpi, bool text_only) {
-  if (pages.size() != images.size()) throw Error("to_pdf: as many images as pages");
-  if (!(dpi > 0)) throw Error("to_pdf: dpi must be positive");
-  const double k = 72.0 / dpi;  // points a pixel
+  const std::vector<double> dpis(pages.size(), dpi);
+  return to_pdf(pages, images, dpis, text_only);
+}
+
+std::string to_pdf(std::span<const OcrPage> pages, std::span<const GrayView> images, std::span<const double> dpis,
+                   bool text_only) {
+  if (pages.size() != images.size() || pages.size() != dpis.size()) throw Error("to_pdf: as many images as pages");
+  for (double dpi : dpis) {
+    if (!(dpi > 0)) throw Error("to_pdf: dpi must be positive");
+  }
   // 1 catalog, 2 pages, 3 the font, 4 its CID font, 5 descriptor, 6 font file, 7 CID to glyph, 8 to Unicode
   std::vector<std::string> obj(7);
   obj[0] = "<< /Type /Catalog /Pages 2 0 R >>";
@@ -279,6 +296,7 @@ std::string to_pdf(std::span<const OcrPage> pages, std::span<const GrayView> ima
   std::string kids;
   for (size_t p = 0; p < pages.size(); ++p) {
     const OcrPage& page = pages[p];
+    const double k = 72.0 / dpis[p];  // points a pixel
     GrayImage turned;
     GrayView img = images[p];
     if (page.rotation) {  // the boxes are the upright page's
@@ -294,14 +312,23 @@ std::string to_pdf(std::span<const OcrPage> pages, std::span<const GrayView> ima
     const size_t content_obj = text_only ? obj.size() + 1 : image_obj + 1, page_obj = content_obj + 1;
     std::string c = "BT\n3 Tr\n";
     if (!text_only) {
-      std::string pixels(static_cast<size_t>(img.width) * img.height, '\0');
-      for (int y = 0; y < img.height; ++y) {
-        std::copy_n(img.data + y * img.stride, img.width, pixels.begin() + static_cast<int64_t>(y) * img.width);
+      // The raw pixels at level 6: on rendered and scanned pages libdeflate's level 6 takes about 12.5 ms and gives
+      // the smallest file; PNG's Up predictor gained no speed at level 6 and saved 3-6 ms at levels 1-2 for files
+      // 6-7% larger (14 OmniParseBench pages). Deflated in place where the rows are contiguous.
+      std::string copy;
+      const uint8_t* px = img.data;
+      if (img.stride != img.width) {
+        copy.resize(static_cast<size_t>(img.width) * img.height);
+        for (int y = 0; y < img.height; ++y) {
+          std::copy_n(img.data + static_cast<int64_t>(y) * img.stride, img.width,
+                      copy.begin() + static_cast<int64_t>(y) * img.width);
+        }
+        px = reinterpret_cast<const uint8_t*>(copy.data());
       }
       obj.push_back(stream("/Type /XObject /Subtype /Image /Width " + std::to_string(img.width) + " /Height " +
                                std::to_string(img.height) +
                                " /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode",
-                           deflated(pixels.data(), pixels.size())));
+                           deflated(px, static_cast<size_t>(img.width) * img.height)));
       c = "q\n" + num(w) + " 0 0 " + num(h) + " 0 0 cm\n/Im0 Do\nQ\n" + c;
     }
     for (const OcrLine& l : page.lines) {

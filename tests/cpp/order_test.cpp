@@ -19,7 +19,103 @@
 namespace carbon {
 namespace {
 
-// Outputs for n lines, every logit 0 (the model sure of nothing).
+// The XY-cut as it was before it sorted once: both axes sorted again at every level, the boxes split by
+// copying. The reference the single-sort cut must give the same order as.
+void xy_cut_reference(std::vector<size_t> idx, const std::vector<LineBox>& b, std::vector<size_t>& out) {
+  auto lo = [](const LineBox& x, int axis) { return axis ? x.y0 : x.x0; };
+  auto hi = [](const LineBox& x, int axis) { return axis ? x.y1 : x.x1; };
+  if (idx.size() <= 1) {
+    out.insert(out.end(), idx.begin(), idx.end());
+    return;
+  }
+  auto gap = [&](int axis) {
+    std::sort(idx.begin(), idx.end(), [&](size_t p, size_t q) { return lo(b[p], axis) < lo(b[q], axis); });
+    double end = hi(b[idx[0]], axis), best = 0, at = 0;
+    for (size_t k = 1; k < idx.size(); ++k) {
+      const double start = lo(b[idx[k]], axis);
+      if (start > end && start - end > best) {
+        best = start - end;
+        at = (start + end) / 2;
+      }
+      end = std::max(end, hi(b[idx[k]], axis));
+    }
+    return std::pair{best, at};
+  };
+  const auto [gx, atx] = gap(0);
+  const auto [gy, aty] = gap(1);
+  if (gx > 0 || gy > 0) {
+    const int axis = gx > gy ? 0 : 1;
+    const double at = axis ? aty : atx;
+    std::vector<size_t> before, after;
+    for (size_t i : idx) (hi(b[i], axis) <= at ? before : after).push_back(i);
+    xy_cut_reference(std::move(before), b, out);
+    xy_cut_reference(std::move(after), b, out);
+    return;
+  }
+  std::sort(idx.begin(), idx.end(), [&](size_t p, size_t q) {
+    return b[p].y0 != b[q].y0 ? b[p].y0 < b[q].y0 : b[p].x0 < b[q].x0;
+  });
+  out.insert(out.end(), idx.begin(), idx.end());
+}
+
+// The XY-cut sorted once gives the order it gave before on pages of columns, tables, overlaps and scattered
+// boxes (no two boxes at the same corner, where the old order was the sort's to choose); and a page of 3,000 evenly
+// spaced lines, which cut one line off at each level, comes back top to bottom at once.
+TEST(Order, TheXyCutSortedOnceIsTheXyCut) {
+  std::mt19937 rng(7);
+  for (int page = 0; page < 300; ++page) {
+    std::uniform_int_distribution<int> lines(1, 120), kind(0, 2);
+    const int n = lines(rng), k = kind(rng);
+    std::vector<LineBox> boxes;
+    std::uniform_real_distribution<double> u(0, 1);
+    for (int i = 0; i < n; ++i) {
+      double x0, y0, w, h;
+      if (k == 0) {  // columns of lines
+        const int col = static_cast<int>(u(rng) * 3);
+        x0 = 50 + col * 330 + u(rng) * 20;
+        y0 = 40 + u(rng) * 1200;
+        w = 200 + u(rng) * 100;
+        h = 12 + u(rng) * 10;
+      } else if (k == 1) {  // a grid of cells
+        x0 = 40 + static_cast<int>(u(rng) * 6) * 150 + u(rng) * 5;
+        y0 = 40 + static_cast<int>(u(rng) * 30) * 40 + u(rng) * 5;
+        w = 60 + u(rng) * 70;
+        h = 15 + u(rng) * 10;
+      } else {  // anywhere, overlapping
+        x0 = u(rng) * 900;
+        y0 = u(rng) * 1300;
+        w = 10 + u(rng) * 400;
+        h = 5 + u(rng) * 60;
+      }
+      boxes.push_back({x0, y0, x0 + w, y0 + h});
+    }
+    std::vector<size_t> want;
+    std::vector<size_t> idx(boxes.size());
+    for (size_t i = 0; i < idx.size(); ++i) idx[i] = i;
+    xy_cut_reference(idx, boxes, want);
+    ASSERT_EQ(reading_order(boxes), want) << "page " << page << " of kind " << k;
+  }
+  std::vector<LineBox> column;
+  for (int i = 0; i < 3000; ++i) column.push_back({100, 10.0 + 20 * i, 900, 22.0 + 20 * i});
+  const std::vector<size_t> order = reading_order(column);
+  ASSERT_EQ(order.size(), column.size());
+  for (size_t i = 0; i < order.size(); ++i) ASSERT_EQ(order[i], i);
+}
+
+// A box that ends before it starts (x1 < x0, as a text layer's out-of-order words once made one) past a gap: the gap
+// parts nothing, so the part is read as a leaf, not cut again forever; every box comes back once.
+TEST(Order, TheXyCutEndsWhereAGapPartsNothing) {
+  std::vector<LineBox> boxes;
+  for (int i = 0; i < 20; ++i) boxes.push_back({100, 10.0 + 30 * i, 900, 30.0 + 30 * i});
+  boxes.push_back({2416.67, 609.8, 1317.75, 662.5});  // inverted, beyond a gutter at x 900 to 1317
+  const std::vector<size_t> order = reading_order(boxes);
+  ASSERT_EQ(order.size(), boxes.size());
+  std::vector<size_t> sorted = order;
+  std::sort(sorted.begin(), sorted.end());
+  for (size_t i = 0; i < sorted.size(); ++i) EXPECT_EQ(sorted[i], i);
+}
+
+// Outputs for n lines, every logit 0 (the model sure of nothing).// Outputs for n lines, every logit 0 (the model sure of nothing).
 struct Outputs {
   int n;
   std::vector<float> successor, same_block, row, col, cell, labels;
@@ -459,6 +555,11 @@ TEST(Split, LinesAtWideGaps) {
   // a table row: one word a cell, every gap 14 px (0.7 h): no spaces, so 0.25 h each
   EXPECT_EQ(split_lines({words_line({{0, 30}, {44, 70}, {84, 120}})}).size(), 3u);
   // a gap of 1.5 h splits whatever the spaces
+  EXPECT_EQ(split_lines({words_line({{0, 30}, {41, 70}, {100, 130}})}).size(), 2u);
+  // words out of order (a text layer's): each piece's box spans its words, never x1 < x0
+  OcrLine back = words_line({{0, 30}, {35, 60}, {100, 140}});
+  std::swap(back.words[0].box, back.words[1].box);
+  for (const OcrLine& p : split_lines({back})) EXPECT_LE(p.box.x0, p.box.x1) << p.text;  // a gap of 1.5 h splits whatever the spaces
   EXPECT_EQ(split_lines({words_line({{0, 30}, {41, 70}, {100, 130}})}).size(), 2u);
   OcrLine bare;
   bare.box = {0, 0, 500, 20};

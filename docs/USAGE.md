@@ -38,8 +38,8 @@ By default the pages run in parallel on the CPU, one worker per physical core. `
 | `--text-out FILE` | | also write the pages' text to this file, beside any format |
 | `--text-only` | off | `pdf`: only the invisible text, without the page images |
 | `--image-dpi N` | 300 | `pdf`: the dpi an image page is placed at |
-| `--dpi N` | 200 | the dpi a PDF's pages are rendered at |
-| `--text-layer auto\|off` | `auto` | read a PDF page from its own text layer where it passes the checks |
+| `--dpi N\|auto` | 200 | the dpi a PDF's pages are rendered at; `auto`: each page at the dpi its small print or its scan needs, from 200 to 400 |
+| `--text-layer auto\|off` | `auto` | read a PDF page from its own text layer where it passes the checks; a tagged page in its structure tree's order |
 | `--hybrid auto\|off` | `auto` | read the pictures of a page that was read from its text layer by OCR |
 | `--second-pass auto\|off` | `auto` | detect a page of tiny text (its median line under 9 px at the detector's scale) again at twice the scale, and merge the two passes |
 | `--second-pass-share F` | 0 | also take the second pass where at least this share of the lines (and 8 of them) are tiny; 0: by the median alone |
@@ -57,6 +57,8 @@ By default the pages run in parallel on the CPU, one worker per physical core. `
 | `--batch N` | 8 | `cuda`: pages in a detection batch |
 | `--in-flight N` | 32 | `cuda`: pages in the pipeline at once |
 | `--engine-cache DIR` | | keep TensorRT's built engines here, for later runs |
+| `--head-accumulate fp32\|fp16` | `fp32` | `cuda`: the fused CTC head's sums; `fp16` runs at twice the rate on GeForce cards, the logits within about 1e-3 |
+| `--json-html`, `--json-markdown` | off | `json`: each page's HTML body, or its markdown, in it as well |
 
 The reading order comes from the set's `order.onnx` when the set has one; otherwise the engine orders lines by the XY-cut. The order model is also used only where it is sure of its result, and the XY-cut takes over elsewhere. The model's blocks are then put in order by their geometry, a page's columns first. The JSON output records which of the two ordered each page.
 

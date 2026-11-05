@@ -4,6 +4,8 @@
 // for a small random network written to a file the test makes.
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstring>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -16,6 +18,7 @@
 #include "carbon/error.h"
 #include "carbon/order.h"
 #include "carbon/session.h"
+#include "../../carbon/src/net/net.h"
 
 namespace carbon {
 namespace {
@@ -217,6 +220,85 @@ TEST(OrderNet, IsOrderPysForwardOnEveryInstructionSet) {
   EXPECT_THROW(open_session(Backend::kNative, bad), Error);
   std::filesystem::remove(file);
   std::filesystem::remove(bad);
+}
+
+// The native model's pairwise heads computed where read are the full matrices' entries, bit for bit (the
+// chain of an order's neighbours, the logits among a set of lines), on every instruction set, and decode_order gives
+// the same order, blocks and cells from either.
+TEST(OrderNet, ThePairsWhereReadAreTheFullMatrices) {
+  const Net net = random_net(11);
+  const auto file = std::filesystem::temp_directory_path() / "carbon-test-order-pairs.native.bin";
+  write(net, file);
+  std::mt19937 g(5);
+  std::uniform_real_distribution<float> u(0.0f, 1.0f);
+  for (cpu::Isa isa : cpu::isas_available()) {
+    SessionOptions o;
+    o.isa = cpu::isa_name(isa);
+    auto s = open_session(Backend::kNative, file, o);
+    for (int n : {1, 2, 9, 40}) {
+      std::vector<float> x(static_cast<size_t>(n) * kOrderFeatures);
+      for (float& v : x) v = u(g);
+      Tensor in = Tensor::empty(DType::kFloat32, {1, n, kOrderFeatures});
+      std::copy(x.begin(), x.end(), in.data<float>().begin());
+      const std::vector<Tensor> y = s->run(std::span<const Tensor>(&in, 1));
+      auto at = [&](size_t i) { return std::span<const float>(y[i].data<float>()); };
+      const OrderOutputs whole{n, at(0), at(1), at(2), at(3), at(4), at(5)};
+      OrderOutputs lazy;
+      ASSERT_TRUE(net::run_order_pairs(*s, x, n, lazy));
+      ASSERT_NE(lazy.pairs, nullptr);
+      ASSERT_EQ(lazy.successor.size(), whole.successor.size());
+      EXPECT_EQ(std::memcmp(lazy.successor.data(), whole.successor.data(), 4 * whole.successor.size()), 0);
+      EXPECT_EQ(std::memcmp(lazy.labels.data(), whole.labels.data(), 4 * whole.labels.size()), 0);
+      std::vector<size_t> order(n);
+      for (int i = 0; i < n; ++i) order[i] = static_cast<size_t>(i);
+      std::shuffle(order.begin(), order.end(), g);
+      const std::vector<float> links = lazy.pairs->chain(0, order);
+      ASSERT_EQ(links.size(), order.size() - 1);
+      for (size_t k = 0; k + 1 < order.size(); ++k) {
+        const float w = whole.same_block[order[k] * n + order[k + 1]];
+        EXPECT_EQ(std::memcmp(&links[k], &w, 4), 0) << o.isa << ", " << n << " lines, link " << k;
+      }
+      const std::vector<size_t> some(order.begin(), order.begin() + (n + 1) / 2);
+      const std::span<const float> heads[3] = {whole.table_row, whole.table_col, whole.table_cell};
+      for (int h = 1; h <= 3; ++h) {
+        const std::vector<float> among = lazy.pairs->among(h, some);
+        const size_t m = some.size();
+        ASSERT_EQ(among.size(), m * m);
+        for (size_t a = 0; a < m; ++a) {
+          for (size_t b = 0; b < m; ++b) {
+            if (a == b) continue;
+            const float w = heads[h - 1][some[a] * n + some[b]];
+            ASSERT_EQ(std::memcmp(&among[a * m + b], &w, 4), 0) << o.isa << ", head " << h << ", " << a << ", " << b;
+          }
+        }
+      }
+      // decode_order alike from either, every block a table so the table heads are read too
+      std::vector<LineBox> boxes(n);
+      for (int i = 0; i < n; ++i) boxes[i] = LineBox{10.0 * (i % 3), 20.0 * i, 10.0 * (i % 3) + 8, 20.0 * i + 12};
+      std::vector<float> labels(whole.labels.begin(), whole.labels.end());
+      for (int i = 0; i < n; ++i) labels[static_cast<size_t>(i) * kBlockLabels + block_label("Table")] = 50.0f;
+      OrderOutputs w2 = whole, l2 = lazy;
+      w2.labels = labels;
+      l2.labels = labels;
+      OrderRule rule;
+      rule.min_sure = 0;  // the model's order, not the XY-cut's
+      const PageOrder a = decode_order(w2, boxes, rule), b = decode_order(l2, boxes, rule);
+      EXPECT_EQ(a.order, b.order);
+      EXPECT_EQ(a.sure, b.sure);
+      ASSERT_EQ(a.blocks.size(), b.blocks.size()) << o.isa << ", " << n << " lines";
+      for (size_t k = 0; k < a.blocks.size(); ++k) {
+        EXPECT_EQ(a.blocks[k].lines, b.blocks[k].lines);
+        EXPECT_EQ(a.blocks[k].label, b.blocks[k].label);
+        ASSERT_EQ(a.blocks[k].cells.size(), b.blocks[k].cells.size());
+        for (size_t c = 0; c < a.blocks[k].cells.size(); ++c) {
+          EXPECT_EQ(a.blocks[k].cells[c].row, b.blocks[k].cells[c].row);
+          EXPECT_EQ(a.blocks[k].cells[c].col, b.blocks[k].cells[c].col);
+          EXPECT_EQ(a.blocks[k].cells[c].lines, b.blocks[k].cells[c].lines);
+        }
+      }
+    }
+  }
+  std::filesystem::remove(file);
 }
 
 }  // namespace

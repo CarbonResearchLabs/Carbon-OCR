@@ -6,12 +6,14 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <random>
 #include <span>
 #include <string>
 #include <utility>
@@ -22,6 +24,7 @@
 #include "carbon/image.h"
 #include "carbon/textlayer.h"
 #include "../../carbon/src/engine_steps.h"
+#include "../../carbon/src/escape_scan.h"
 
 namespace carbon {
 namespace {
@@ -117,6 +120,56 @@ TEST(Engine, DetectsAPageOfTinyTextAgainAtTwiceTheScale) {
   EXPECT_EQ(print.ms.second_pass, 0.0);
   EXPECT_EQ(print.text(), "aaa\naaaaa\naa\n");
   EXPECT_NE(print.json().find("\"second_pass\": false"), std::string::npos);
+}
+
+// A page of print with a share of tiny text (the six tiny bars, then eight bars 16 px high): its median line is
+// not tiny, so the pass by share takes it on the tiny lines' bands alone, and finds what the whole page's pass finds,
+// every bar once.
+TEST(Engine, ThePassByShareRunsOnTheTinyLinesBands) {
+  GrayImage page = tiny_page();
+  for (int i = 0; i < 8; ++i) {
+    const int y = 560 + 40 * i;
+    for (int d = 0; d < 3; ++d) {
+      for (int r = y; r < y + 16; ++r) std::fill_n(page.pixels.begin() + r * 800 + 100 + 32 * d, 24, uint8_t{20});
+    }
+  }
+  EngineOptions o;
+  o.pool.workers = 2;
+  o.crop.flip_margin = 0;
+  o.det.second_pass_share = 0.15;
+  o.det.second_pass_lines = 3;
+  EngineOptions whole = o;
+  whole.det.second_pass_bands = false;
+  const OcrPage a = Engine(kSet, o).ocr(page.view()), b = Engine(kSet, whole).ocr(page.view());
+  EXPECT_TRUE(a.second_pass);
+  EXPECT_TRUE(b.second_pass);
+  ASSERT_EQ(a.lines.size(), 14u);
+  ASSERT_EQ(b.lines.size(), a.lines.size());
+  for (size_t i = 0; i < a.lines.size(); ++i) {
+    EXPECT_EQ(a.lines[i].text, b.lines[i].text) << "line " << i;
+    EXPECT_NEAR(a.lines[i].box.y0, b.lines[i].box.y0, 0.25) << "line " << i;
+    EXPECT_NEAR(a.lines[i].box.y1, b.lines[i].box.y1, 0.25) << "line " << i;
+    EXPECT_NEAR(a.lines[i].box.x0, b.lines[i].box.x0, 0.25) << "line " << i;
+  }
+}
+
+// The line pitch of pages of lines 30, 17 and 50 rows apart, with ragged lengths; none for a blank page or
+// one of noise; and a page of large text detected at a smaller scale reads as it does at the full one.
+TEST(Engine, ALinesPitchFromItsRowsInk) {
+  std::mt19937 rng(8);
+  for (int pitch : {30, 17, 50}) {
+    GrayImage p{600, 800, std::vector<uint8_t>(600 * 800, 255)};
+    for (int y = 20; y + 10 < 800; y += pitch) {
+      const int len = 200 + static_cast<int>(rng() % 300), hgt = std::max(4, pitch / 3);
+      for (int r = y; r < y + hgt; ++r) std::fill_n(p.pixels.begin() + r * 600 + 40, len, uint8_t{30});
+    }
+    EXPECT_EQ(detail::line_pitch(p.view()), pitch) << pitch;
+  }
+  GrayImage blank{600, 800, std::vector<uint8_t>(600 * 800, 255)};
+  EXPECT_EQ(detail::line_pitch(blank.view()), 0);
+  GrayImage noise{600, 800, std::vector<uint8_t>(600 * 800)};
+  for (uint8_t& v : noise.pixels) v = static_cast<uint8_t>(rng());
+  EXPECT_EQ(detail::line_pitch(noise.view()), 0);
 }
 
 // The page turned 2.5 degrees: levelled before detection, read as it was.
@@ -465,6 +518,21 @@ TEST(Engine, TurnsPagesByTheOrientationModelsOwnThreshold) {
   fresh();
   add_metadata(set / "orient.onnx", {{"carbon.orient.turn_probability", "0.2"}});  // under even odds
   EXPECT_THROW(Engine{set}, Error);
+  // The file the engine runs gives its own: FP16's its own threshold, the FP32 file's none of its business
+  fresh();
+  add_metadata(set / "orient.onnx", {{"carbon.orient.turn_probability", "0.62"}});
+  add_metadata(set / "orient.fp16.onnx", {{"carbon.orient.turn_probability", "0.7"}});
+  EXPECT_EQ(detail::model_turn_probability_of(set / "orient.fp16.onnx"), 0.7f);  // (its fake is TensorRT's alone)
+  EXPECT_EQ(Engine(set).turn_probability(), 0.62f);
+  // and the detector's thresholds from its file, where stamped; a bad one named
+  add_metadata(set / "det.onnx", {{"carbon.det.core_threshold", "0.4"}, {"carbon.det.min_core_pixels", "3"}});
+  const DetRule stamped = detail::model_det_rule(set / "det.onnx", DetRule{});
+  EXPECT_FLOAT_EQ(stamped.core_threshold, 0.4f);
+  EXPECT_EQ(stamped.min_core_pixels, 3);
+  EXPECT_FLOAT_EQ(stamped.picture_threshold, DetRule{}.picture_threshold);
+  EXPECT_FLOAT_EQ(detail::model_det_rule(set / "det.fp16.onnx", DetRule{}).core_threshold, DetRule{}.core_threshold);
+  add_metadata(set / "det.fp16.onnx", {{"carbon.det.merge_iou", "1.5"}});
+  EXPECT_THROW(detail::model_det_rule(set / "det.fp16.onnx", DetRule{}), Error);
   std::filesystem::remove_all(set);
 }
 
@@ -623,6 +691,129 @@ TEST(Gate, TablesOfTextAreText) {
   EXPECT_TRUE(p.blocks[0].cells.empty());
   EXPECT_EQ(p.blocks[1].label, "Table");
   EXPECT_EQ(p.blocks[1].cells.size(), 2u);
+}
+
+// Five graded options (the characters' confidence on by default, the rest off): a tall page detected by its
+// area (letter pages as before); the second pass at the tiny lines' own scale; a justified line of one wide gap
+// kept whole; a line's confidence over its characters; a word's box at its ink.
+TEST(Gate, TheGradedOptions) {
+  GrayImage tall;
+  tall.width = 600;
+  tall.height = 8000;
+  tall.pixels.assign(600 * 8000, 255);
+  const GrayImage by_side = detail::det_scale(tall.view(), 1024);
+  EXPECT_EQ(by_side.height, 1024);
+  EXPECT_LT(by_side.width, 80);
+  const GrayImage by_area = detail::det_scale(tall.view(), 1024, 1024 * 800);
+  EXPECT_NEAR(1.0 * by_area.width * by_area.height, 1024.0 * 800, 1024.0 * 800 * 0.01);
+  GrayImage letter;
+  letter.width = 1700;
+  letter.height = 2200;
+  letter.pixels.assign(1700 * 2200, 255);
+  const GrayImage l1 = detail::det_scale(letter.view(), 1024), l2 = detail::det_scale(letter.view(), 1024, 1024 * 800);
+  EXPECT_EQ(l1.width, l2.width);
+  EXPECT_EQ(l1.height, l2.height);
+
+  const GrayImage tiny = tiny_page();
+  EngineOptions o;
+  o.pool.workers = 2;
+  o.crop.flip_margin = 0;
+  o.det.second_pass_target = 18;
+  const OcrPage p = Engine(kSet, o).ocr(tiny.view());
+  EXPECT_TRUE(p.second_pass);
+  ASSERT_EQ(p.lines.size(), 6u) << "the tiny lines found at their own scale";
+
+  OcrLine two;
+  two.box = {0, 0, 300, 20};
+  two.words = {{{0, 0, 100, 20}, "Total", 0.9f}, {{114, 0, 300, 20}, "amount", 0.9f}};  // one gap, 0.7 heights
+  two.text = "Total amount";
+  SplitRule rule;
+  EXPECT_EQ(split_lines({two}, rule).size(), 2u);
+  rule.justified = true;
+  EXPECT_EQ(split_lines({two}, rule).size(), 1u);
+
+  const CropRule crop;
+  const std::vector<std::string> vocab = {"", "a", "b", " "};
+  CtcLine d;
+  d.ids = {1, 3, 2};
+  d.frames = {2, 5, 9};
+  d.probs = {0.9f, 0.3f, 0.7f};
+  OcrLine all, chars;
+  all.box = chars.box = {0, 0, 100, 20};
+  detail::read_line(all, d, 16, crop, vocab);
+  detail::read_line(chars, d, 16, crop, vocab, nullptr, 0, nullptr, true);
+  EXPECT_FLOAT_EQ(all.confidence, (0.9f + 0.3f + 0.7f) / 3);
+  EXPECT_FLOAT_EQ(chars.confidence, (0.9f + 0.7f) / 2);
+
+  std::vector<uint8_t> ink(64, 0);
+  for (int x = 4; x < 14; ++x) ink[x] = 1;   // the first word's ink: columns 4-13
+  for (int x = 30; x < 44; ++x) ink[x] = 1;  // the second's: 30-43
+  OcrLine boxed;
+  boxed.box = {0, 0, 64, 20};
+  CtcLine e;
+  e.ids = {1, 3, 2};
+  e.frames = {2, 5, 9};  // a at crop x 8 (inside its ink), the space at 20, b at 36
+  e.probs = {0.9f, 0.9f, 0.9f};
+  detail::read_line(boxed, e, 16, crop, vocab, ink.data(), 64, nullptr, false, true);
+  ASSERT_EQ(boxed.words.size(), 2u);
+  const double per_px = (crop_region(boxed.box, crop).x1 - crop_region(boxed.box, crop).x0) /
+                        crop_region(boxed.box, crop).width;
+  const double x0 = crop_region(boxed.box, crop).x0;
+  EXPECT_NEAR(boxed.words[0].box.x0, std::max(0.0, x0 + 4 * per_px), 1e-9) << "out of the glyph to its blank";
+  EXPECT_NEAR(boxed.words[0].box.x1, x0 + 14 * per_px, 1e-9) << "back from the gap to the ink";
+}
+
+// The JSON writer's numbers (std::to_chars) as printf writes them on this platform, ties included, and its
+// escapes as a byte-by-byte scan finds them.
+TEST(Gate, TheWritersNumbersAndEscapes) {
+  OcrPage p;
+  p.width = p.height = 100;
+  const double edges[] = {0.25, 0.75, 12.25, 1.05, 2.5, 1e-5, 3.0, 99.95, 1234.45, 0.125};
+  for (double x0 : edges) {
+    OcrLine l;
+    l.box = {x0, x0 / 2, x0 + 0.35, x0 * 3};
+    l.text = "a";
+    l.confidence = static_cast<float>(x0 / 2000);
+    l.det_score = 0.03125f;  // a tie at the fifth decimal
+    p.lines.push_back(l);
+  }
+  p.skew = -0.125;
+  p.ms.total = 2.675;
+  const std::string json = p.json();
+  for (const OcrLine& l : p.lines) {
+    char want[160];
+    std::snprintf(want, sizeof want, "{\"box\": [%.1f, %.1f, %.1f, %.1f], \"text\": \"a\", \"confidence\": %.4f, "
+                  "\"det_score\": %.4f", l.box.x0, l.box.y0, l.box.x1, l.box.y1, l.confidence, l.det_score);
+    EXPECT_NE(json.find(want), std::string::npos) << want << "\n" << json;
+  }
+  char skew[48], total[48];
+  std::snprintf(skew, sizeof skew, "\"skew\": %.2f", p.skew);
+  std::snprintf(total, sizeof total, "\"total\": %.2f}}", p.ms.total);
+  EXPECT_NE(json.find(skew), std::string::npos) << json;
+  EXPECT_NE(json.find(total), std::string::npos) << json;
+
+  std::string s;
+  uint32_t r = 99;
+  const char pool[] = "ab\"'\\&<>\t\n\x01\x1f e\xc3\xa9";
+  for (int i = 0; i < 4000; ++i) {
+    r = r * 1664525u + 1013904223u;
+    s += pool[(r >> 16) % (sizeof pool - 1)];
+  }
+  for (size_t i = 0; i <= s.size(); i += 7) {
+    size_t want = i;
+    while (want < s.size()) {
+      const unsigned char c = static_cast<unsigned char>(s[want]);
+      if (c < 0x20 || c == '"' || c == '\'' || c == '\\' || c == '&' || c == '<' || c == '>') break;
+      ++want;
+    }
+    ASSERT_EQ(detail::special_from(s, i), want) << i;
+  }
+  OcrPage q;
+  OcrLine l;
+  l.text = "say \"hi\" \\ <b>&\x01\t'";
+  q.lines.push_back(l);
+  const std::string escaped = "\"text\": \"say \\\"hi\\\" \\\\ <b>&\\u0001\\t'\"";
+  EXPECT_NE(q.json().find(escaped), std::string::npos) << q.json();
 }
 
 // Spaces by the ink (SpaceRule): of a crop of four characters, a and b a pixel apart, b and c 9 apart, c and d a

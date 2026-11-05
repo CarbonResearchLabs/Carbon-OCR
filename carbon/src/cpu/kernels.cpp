@@ -401,6 +401,199 @@ void skew_rows(const float* x, const float* y, int64_t n, double c, double s, do
   }
 }
 
+void softmax_rows(float* rows, int n_rows, int n, float scale, Isa isa) {
+  if (n_rows <= 0 || n <= 0) return;
+  check(isa, "softmax_rows");
+#if defined(CARBON_KERNEL_AVX2)
+  if (dw_kernel(isa) == Isa::kAvx2) {
+    detail::softmax_rows_avx2(rows, n_rows, n, scale);
+    return;
+  }
+#endif
+  for (int i = 0; i < n_rows; ++i) {  // the reference
+    float* row = rows + static_cast<size_t>(i) * n;
+    float hi = -std::numeric_limits<float>::infinity();
+    for (int j = 0; j < n; ++j) {
+      row[j] *= scale;
+      hi = row[j] > hi ? row[j] : hi;
+    }
+    float s[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int j = 0; j < n; ++j) {
+      row[j] = detail::exp_neg(row[j] - hi);
+      s[j & 7] = s[j & 7] + row[j];
+    }
+    const float sum = ((s[0] + s[4]) + (s[2] + s[6])) + ((s[1] + s[5]) + (s[3] + s[7]));
+    const float inv = 1.0f / sum;
+    for (int j = 0; j < n; ++j) row[j] *= inv;
+  }
+}
+
+void dot_chains(const float* a, const float* b, const int32_t* ia, const int32_t* ib, int pairs, int d, float* out,
+                Isa isa) {
+  if (pairs <= 0) return;
+  check(isa, "dot_chains");
+#if defined(CARBON_KERNEL_AVX2)
+  if (dw_kernel(isa) == Isa::kAvx2) {
+    detail::dot_chains_avx2(a, b, ia, ib, pairs, d, out);
+    return;
+  }
+#endif
+  for (int p = 0; p < pairs; ++p) {  // the reference
+    const float* x = a + static_cast<int64_t>(ia[p]) * d;
+    const float* y = b + static_cast<int64_t>(ib[p]) * d;
+    float s = 0.0f;
+    for (int k = 0; k < d; ++k) s = std::fma(x[k], y[k], s);
+    out[p] = s;
+  }
+}
+
+void det_stem(const float* x, int h, int w, const DetStemWeights& sw, float* out, int row0, int row1, Isa isa) {
+  if (h % 4 || w % 4 || h <= 0 || w <= 0) throw Error("det_stem: the ink map's sides must be multiples of 4");
+  const int h2 = h / 2, w2 = w / 2, h4 = h / 4, w4 = w / 4;
+  row0 = std::max(row0, 0);
+  row1 = std::min(row1, h4);
+  if (row0 >= row1) return;
+  check(isa, "det_stem");
+#if defined(CARBON_KERNEL_AVX2)
+  if (dw_kernel(isa) == Isa::kAvx2 && sw.c1 == 16 && sw.c2 % 8 == 0 && sw.c2 <= 24) {
+    detail::det_stem_avx2(x, h, w, sw, out, row0, row1);
+    return;
+  }
+#endif
+  // The reference: the stride-2 rows a band needs, each made once, in a ring of three (slot y2 mod 3).
+  const int c1 = sw.c1;
+  std::vector<float> ring(static_cast<size_t>(3) * w2 * c1);  // [slot][x2][c1]
+  int held[3] = {-1, -1, -1};
+  auto stem_row = [&](int y2) -> const float* {
+    float* r = ring.data() + static_cast<size_t>(y2 % 3) * w2 * c1;
+    if (held[y2 % 3] == y2) return r;
+    for (int x2 = 0; x2 < w2; ++x2) {
+      for (int c = 0; c < c1; ++c) {
+        float acc = sw.b1[c];
+        for (int ky = 0; ky < 3; ++ky) {
+          const int iy = 2 * y2 + ky - 1;
+          for (int kx = 0; kx < 3; ++kx) {
+            const int ix = 2 * x2 + kx - 1;
+            const float v = iy < 0 || iy >= h || ix < 0 || ix >= w ? 0.0f : x[static_cast<size_t>(iy) * w + ix];
+            acc = std::fma(sw.w1[(c * 3 + ky) * 3 + kx], v, acc);
+          }
+        }
+        r[static_cast<size_t>(x2) * c1 + c] = acc > 0.0f ? acc : 0.0f;
+      }
+    }
+    held[y2 % 3] = y2;
+    return r;
+  };
+  for (int y4 = row0; y4 < row1; ++y4) {
+    const float* rows[3];
+    for (int ky = 0; ky < 3; ++ky) {
+      const int y2 = 2 * y4 + ky - 1;
+      rows[ky] = y2 < 0 || y2 >= h2 ? nullptr : stem_row(y2);
+    }
+    for (int x4 = 0; x4 < w4; ++x4) {
+      for (int d = 0; d < sw.c2; ++d) {
+        float acc = sw.b2[d];
+        for (int ky = 0; ky < 3; ++ky) {
+          for (int kx = 0; kx < 3; ++kx) {
+            const int x2 = 2 * x4 + kx - 1;
+            const bool in = rows[ky] && x2 >= 0 && x2 < w2;
+            for (int c = 0; c < c1; ++c) {
+              const float v = in ? rows[ky][static_cast<size_t>(x2) * c1 + c] : 0.0f;
+              acc = std::fma(sw.w2[((static_cast<size_t>(d) * c1 + c) * 3 + ky) * 3 + kx], v, acc);
+            }
+          }
+        }
+        out[(static_cast<size_t>(d) * h4 + y4) * w4 + x4] = acc > 0.0f ? acc : 0.0f;
+      }
+    }
+  }
+}
+
+void gelu(float* v, size_t n, Isa isa) {
+  if (n == 0) return;
+  check(isa, "gelu");
+#if defined(CARBON_KERNEL_AVX2)
+  if (dw_kernel(isa) == Isa::kAvx2) {
+    detail::gelu_avx2(v, n);
+    return;
+  }
+#endif
+  for (size_t i = 0; i < n; ++i) {
+    const float x = v[i];
+    const float h = 0.5f * x;
+    v[i] = h * (1.0f + detail::erf_of(x * 0.70710678118654752f));
+  }
+}
+
+PackedHead pack_rec_head(const float* w, const float* b, int k, int classes) {
+  PackedHead h;
+  h.k = k;
+  h.classes = classes;
+  const int blocks = (classes + kHeadBlock - 1) / kHeadBlock;
+  h.w.assign(static_cast<size_t>(blocks) * k * kHeadBlock, 0.0f);
+  for (int c = 0; c < classes; ++c) {
+    for (int j = 0; j < k; ++j) {
+      h.w[(static_cast<size_t>(c / kHeadBlock) * k + j) * kHeadBlock + c % kHeadBlock] = w[static_cast<size_t>(c) * k + j];
+    }
+  }
+  h.b.assign(b, b + classes);
+  return h;
+}
+
+void ctc_head(const float* features, int k, int frames, int t_n, const PackedHead& head, int32_t* ids, float* probs,
+              Isa isa) {
+  if (t_n <= 0 || head.classes <= 0) return;
+  if (k != head.k) throw Error("ctc_head: features of " + std::to_string(k) + " channels, a head of " +
+                               std::to_string(head.k));
+  check(isa, "ctc_head");
+  thread_local std::vector<float> tile;  // [classes][kHeadFrames], in L1
+  tile.resize(static_cast<size_t>(head.classes) * kHeadFrames);
+  const int blocks = (head.classes + kHeadBlock - 1) / kHeadBlock;
+  for (int t0 = 0; t0 < t_n; t0 += kHeadFrames) {
+    const int nt = std::min(kHeadFrames, t_n - t0);
+#if defined(CARBON_KERNEL_AVX2)
+    if (dw_kernel(isa) == Isa::kAvx2 && t0 + kHeadFrames <= frames) {
+      detail::head_tile_avx2(features, k, frames, t0, head.w.data(), head.b.data(), head.classes, tile.data());
+      ctc_argmax(tile.data(), head.classes, kHeadFrames, nt, ids + t0, probs + t0, isa);
+      continue;
+    }
+#endif
+    for (int cb = 0; cb < blocks; ++cb) {  // the reference: each logit an FMA chain from its bias, j in order
+      for (int q = 0; q < kHeadBlock && cb * kHeadBlock + q < head.classes; ++q) {
+        const int c = cb * kHeadBlock + q;
+        for (int t = 0; t < nt; ++t) {
+          float acc = head.b[static_cast<size_t>(c)];
+          for (int j = 0; j < k; ++j) {
+            acc = std::fma(head.w[(static_cast<size_t>(cb) * k + j) * kHeadBlock + q],
+                           features[static_cast<size_t>(j) * frames + t0 + t], acc);
+          }
+          tile[static_cast<size_t>(c) * kHeadFrames + t] = acc;
+        }
+      }
+    }
+    ctc_argmax(tile.data(), head.classes, kHeadFrames, nt, ids + t0, probs + t0, isa);
+  }
+}
+
+void bgrx_to_gray(const uint8_t* src, int64_t src_stride, int w, int h, uint8_t* dst, int64_t dst_stride, Isa isa) {
+  if (w <= 0 || h <= 0) return;
+  check(isa, "bgrx_to_gray");
+#if defined(CARBON_KERNEL_AVX2)
+  if (dw_kernel(isa) == Isa::kAvx2) {
+    detail::bgrx_to_gray_avx2(src, src_stride, w, h, dst, dst_stride);
+    return;
+  }
+#endif
+  for (int y = 0; y < h; ++y) {  // the reference
+    const uint8_t* row = src + y * src_stride;
+    uint8_t* out = dst + y * dst_stride;
+    for (int x = 0; x < w; ++x) {
+      const int b = row[4 * x], g = row[4 * x + 1], r = row[4 * x + 2];
+      out[x] = static_cast<uint8_t>((299 * r + 587 * g + 114 * b + 500) / 1000);
+    }
+  }
+}
+
 ByteCounts count_beyond(const uint8_t* c, int w, int h, int64_t stride, int lo, int hi, Isa isa) {
   ByteCounts n{0, 0};
   if (w <= 0 || h <= 0 || (lo < 0 && hi > 255)) return n;

@@ -201,7 +201,23 @@ nb::list infos(const std::vector<carbon::TensorInfo>& v) {
 
 // ---------------------------------------------------------------- pages
 
-nb::dict page_dict(const carbon::OcrPage& p, bool html = false, bool markdown = false) {
+// A page's strings, made by the writers with the GIL released: the Python objects are made from them after.
+struct PageText {
+  std::string text, html, markdown;
+  bool has_html = false, has_markdown = false;
+};
+
+PageText page_text(const carbon::OcrPage& p, bool html, bool markdown) {
+  PageText t;
+  t.text = p.text();
+  t.has_html = html;
+  t.has_markdown = markdown;
+  if (html) t.html = carbon::to_html_body(p);
+  if (markdown) t.markdown = carbon::to_markdown(std::span<const carbon::OcrPage>(&p, 1));
+  return t;
+}
+
+nb::dict page_dict(const carbon::OcrPage& p, const PageText& t) {
   nb::dict d;
   d["width"] = p.width;
   d["height"] = p.height;
@@ -243,10 +259,24 @@ nb::dict page_dict(const carbon::OcrPage& p, bool html = false, bool markdown = 
   ms["total"] = p.ms.total;
   ms["load"] = p.ms.load;
   d["ms"] = ms;
-  d["text"] = p.text();
-  if (html) d["html"] = carbon::to_html_body(p);
-  if (markdown) d["markdown"] = carbon::to_markdown(std::span<const carbon::OcrPage>(&p, 1));
+  d["text"] = t.text;
+  if (t.has_html) d["html"] = t.html;
+  if (t.has_markdown) d["markdown"] = t.markdown;
   return d;
+}
+
+// Pages and their strings, the strings made with the GIL released.
+nb::list page_dicts(const std::vector<carbon::OcrPage>& pages, const std::vector<PageText>& texts) {
+  nb::list result;
+  for (size_t i = 0; i < pages.size(); ++i) result.append(page_dict(pages[i], texts[i]));
+  return result;
+}
+
+std::vector<PageText> page_texts(const std::vector<carbon::OcrPage>& pages, bool html, bool markdown) {
+  std::vector<PageText> texts;
+  texts.reserve(pages.size());
+  for (const carbon::OcrPage& page : pages) texts.push_back(page_text(page, html, markdown));
+  return texts;
 }
 
 std::vector<DecodedLine> to_python(std::vector<carbon::CtcLine>&& lines) {
@@ -314,7 +344,9 @@ NB_MODULE(carbon_ocr, m) {
           [](carbon::Engine* e, const std::filesystem::path& set, int workers, bool pin, const std::string& rec,
              std::optional<std::filesystem::path> order_model, const std::string& precision, bool gate,
              const std::string& block_order, float single_pixel, double second_pass_share, bool table_spans,
-             bool share_sessions, double bucket_ratio, bool spaces_from_ink) {
+             bool share_sessions, double bucket_ratio, bool spaces_from_ink, int64_t det_area,
+             double second_pass_target, bool justified, bool flip_needs_dark, bool char_confidence,
+             bool word_boxes_at_ink, bool fused_rec_head, bool det_stem, double det_pitch) {
             carbon::EngineOptions o;
             o.pool.workers = workers;
             o.pool.pin = pin;
@@ -333,12 +365,23 @@ NB_MODULE(carbon_ocr, m) {
             if (!(bucket_ratio > 1.0 && bucket_ratio < 2.0)) throw carbon::Error("bucket_ratio is in (1, 2)");
             o.bucket_ratio = bucket_ratio;
             if (spaces_from_ink) o.spaces = carbon::SpaceRule{};
+            o.det_area = det_area;
+            o.det.second_pass_target = second_pass_target;
+            if (o.split) o.split->justified = justified;
+            o.crop.flip_needs_dark = flip_needs_dark;
+            o.char_confidence = char_confidence;
+            o.word_boxes_at_ink = word_boxes_at_ink;
+            o.fused_rec_head = fused_rec_head;
+            o.det_stem = det_stem;
+            o.det_pitch = det_pitch;
             new (e) carbon::Engine(set, o);
           },
           "set"_a, "workers"_a = 0, "pin"_a = true, "rec"_a = "rec-latin", "order_model"_a = nb::none(),
           "precision"_a = "auto", "gate"_a = true, "block_order"_a = "geometry",
           "single_pixel"_a = carbon::DetRule{}.single_pixel, "second_pass_share"_a = carbon::DetRule{}.second_pass_share,
-          "table_spans"_a = true, "share_sessions"_a = true, "bucket_ratio"_a = 1.3, "spaces_from_ink"_a = false,
+          "table_spans"_a = true, "share_sessions"_a = true, "bucket_ratio"_a = 1.3, "spaces_from_ink"_a = false, "det_area"_a = 0,
+          "second_pass_target"_a = 0.0, "justified"_a = false, "flip_needs_dark"_a = true, "char_confidence"_a = true,
+          "word_boxes_at_ink"_a = false, "fused_rec_head"_a = false, "det_stem"_a = false, "det_pitch"_a = 0.0,
           "A Fullerene set's directory (orient.onnx, det.onnx, <rec>.onnx, <rec>.vocab.json, and order.native.bin "
           "or order.onnx where it has one; order_model another); workers 0 is one per physical core. precision: "
           "the models' files, \"auto\" (the fastest the set has), \"fp32\", \"fp16\" or \"int8\" "
@@ -354,13 +397,13 @@ NB_MODULE(carbon_ocr, m) {
             std::vector<carbon::GrayView> views;
             for (const Gray& g : pages) views.push_back(view(g));
             std::vector<carbon::OcrPage> out;
+            std::vector<PageText> texts;
             {
               nb::gil_scoped_release unlocked;
               out = e.ocr(views);
+              texts = page_texts(out, html, markdown);
             }
-            nb::list result;
-            for (const auto& p : out) result.append(page_dict(p, html, markdown));
-            return result;
+            return page_dicts(out, texts);
           },
           "pages"_a, "html"_a = false, "markdown"_a = false,
           "Reads grayscale pages (uint8 [h, w], paper 255) in parallel; for each a dict: width, height, rotation, "
@@ -400,12 +443,14 @@ NB_MODULE(carbon_ocr, m) {
           "next",
           [](carbon::Engine& e, bool html, bool markdown) -> nb::object {
             std::optional<carbon::OcrPage> p;
+            PageText t;
             {
               nb::gil_scoped_release unlocked;
               p = e.next();
+              if (p) t = page_text(*p, html, markdown);
             }
             if (!p) return nb::none();
-            return page_dict(*p, html, markdown);
+            return page_dict(*p, t);
           },
           "html"_a = false, "markdown"_a = false,
           "The next page given to submit(), in the order given, as ocr() returns it; waits for it. Raises the error "
@@ -419,9 +464,15 @@ NB_MODULE(carbon_ocr, m) {
           [](carbon::Pipeline* p, const std::filesystem::path& set, std::optional<std::string> device,
              int page_batch, int line_batch, int in_flight, int threads, int model_threads, const std::string& rec,
              std::optional<std::filesystem::path> order_model, std::optional<std::filesystem::path> engine_cache,
-             const std::string& precision) {
+             const std::string& precision, bool gate, const std::string& block_order, bool table_spans,
+             bool head_fp16_accumulate) {
             carbon::PipelineOptions o;
+            o.head_fp16_accumulate = head_fp16_accumulate;
             o.engine.precision = precision_of(precision);
+            if (!gate) o.engine.gate.reset();
+            if (block_order != "geometry" && block_order != "model") throw carbon::Error("block_order: geometry or model");
+            o.engine.blocks_by_geometry = block_order == "geometry";
+            o.engine.table_spans = table_spans;
             if (device) {
               if (*device != "cpu" && *device != "cuda") throw carbon::Error("device: cpu or cuda");
               o.device = *device == "cuda" ? carbon::Device::kCuda : carbon::Device::kCpu;
@@ -438,12 +489,13 @@ NB_MODULE(carbon_ocr, m) {
           },
           "set"_a, "device"_a = nb::none(), "page_batch"_a = 8, "line_batch"_a = 256, "in_flight"_a = 32,
           "threads"_a = 0, "model_threads"_a = 0, "rec"_a = "rec-latin", "order_model"_a = nb::none(),
-          "engine_cache"_a = nb::none(), "precision"_a = "auto",
+          "engine_cache"_a = nb::none(), "precision"_a = "auto", "gate"_a = true, "block_order"_a = "geometry",
+          "table_spans"_a = true, "head_fp16_accumulate"_a = false,
           "A Fullerene set's directory; device \"cpu\" or \"cuda\" (None: the GPU where this build has CUDA and "
           "TensorRT and a GPU is there); page_batch pages an orientation or detection run, line_batch lines a "
           "recognition run, in_flight pages at once; threads the CPU threads preparing and assembling pages and "
           "model_threads a CPU model run's (0: the physical cores); precision the CPU's files, as Engine's (the "
-          "GPU runs the set's FP16 files).")
+          "GPU runs the set's FP16 files); gate, block_order and table_spans as Engine's.")
       .def_prop_ro("device",
                    [](const carbon::Pipeline& p) { return p.device() == carbon::Device::kCuda ? "cuda" : "cpu"; })
       .def(
@@ -452,16 +504,48 @@ NB_MODULE(carbon_ocr, m) {
             std::vector<carbon::GrayView> views;
             for (const Gray& g : pages) views.push_back(view(g));
             std::vector<carbon::OcrPage> out;
+            std::vector<PageText> texts;
             {
               nb::gil_scoped_release unlocked;
               out = p.ocr(views);
+              texts = page_texts(out, html, markdown);
             }
-            nb::list result;
-            for (const auto& page : out) result.append(page_dict(page, html, markdown));
-            return result;
+            return page_dicts(out, texts);
           },
           "pages"_a, "html"_a = false, "markdown"_a = false,
           "Reads grayscale pages (uint8 [h, w], paper 255), each a dict as Engine.ocr gives it, in order.")
+      .def(
+          "submit",
+          [](carbon::Pipeline& p, Gray page) {
+            carbon::GrayImage img;
+            img.width = static_cast<int>(page.shape(1));
+            img.height = static_cast<int>(page.shape(0));
+            img.pixels.assign(page.data(), page.data() + page.size());  // the pipeline holds its own copy
+            nb::gil_scoped_release unlocked;
+            return p.submit(std::move(img));
+          },
+          "page"_a,
+          "Gives the pipeline a page (uint8 [h, w], paper 255), copied, and returns its number, from 0 in the order "
+          "given; waits while in_flight pages are in it.")
+      .def(
+          "close", [](carbon::Pipeline& p) { p.close(); },
+          "No more pages: next() returns None once every page given is out.")
+      .def(
+          "next",
+          [](carbon::Pipeline& p, bool html, bool markdown) -> nb::object {
+            std::optional<carbon::OcrPage> page;
+            PageText t;
+            {
+              nb::gil_scoped_release unlocked;
+              page = p.next();
+              if (page) t = page_text(*page, html, markdown);
+            }
+            if (!page) return nb::none();
+            return page_dict(*page, t);
+          },
+          "html"_a = false, "markdown"_a = false,
+          "The next page given to submit(), in the order given, as ocr() returns it; waits for it. Raises the error "
+          "that page met (the stream goes on); None once close() was called and every page given is out.")
       .def_prop_ro("stats", [](const carbon::Pipeline& p) {
         const carbon::PipelineStats s = p.stats();
         nb::dict d;

@@ -116,9 +116,10 @@ void paper_copy(const uint8_t* row, int width, int a, int b, uint8_t* dst) {
 
 // The scalar passes, the reference: the horizontal one over every row the vertical
 // one reads, into an 8-bit intermediate, as in PIL.
-void resample_scalar(const GrayView& im, const Axis& ax, const Axis& ay, int ow, int oh, uint8_t* out, int64_t os) {
-  const int top = ay.first[0];
-  const int rows = ay.first[oh - 1] + ay.count[oh - 1] - top;
+void resample_scalar(const GrayView& im, const Axis& ax, const Axis& ay, int ow, int row0, int row1, uint8_t* out,
+                     int64_t os) {
+  const int top = ay.first[row0];
+  const int rows = ay.first[row1 - 1] + ay.count[row1 - 1] - top;
   std::vector<uint8_t> tmp(static_cast<size_t>(rows) * ow);
   for (int r = 0; r < rows; ++r) {
     const int y = top + r;
@@ -136,11 +137,11 @@ void resample_scalar(const GrayView& im, const Axis& ax, const Axis& ay, int ow,
       t[xx] = clip8(ss);
     }
   }
-  for (int yy = 0; yy < oh; ++yy) {
+  for (int yy = row0; yy < row1; ++yy) {
     const int32_t* k = &ay.k[static_cast<size_t>(yy) * ay.taps];
     const uint8_t* src = &tmp[static_cast<size_t>(ay.first[yy] - top) * ow];
     const int n = ay.count[yy];
-    uint8_t* o = out + yy * os;
+    uint8_t* o = out + (yy - row0) * os;
     for (int xx = 0; xx < ow; ++xx) {
       int32_t ss = kHalf;
       for (int i = 0; i < n; ++i) ss += src[static_cast<size_t>(i) * ow + xx] * k[i];
@@ -158,8 +159,8 @@ void resample_scalar(const GrayView& im, const Axis& ax, const Axis& ay, int ow,
 // made once.  Vertical: an output row at a time, from the rows of its taps, which
 // the horizontal pass keeps in a ring as tall as the tallest window: the windows only
 // move down, so each row goes through the horizontal pass once, in order.
-void resample_vector(const GrayView& im, const Axis& ax, const Axis& ay, int ow, int oh, uint8_t* out, int64_t os,
-                     const ResampleKernels& kern) {
+void resample_vector(const GrayView& im, const Axis& ax, const Axis& ay, int ow, int row0, int row1, uint8_t* out,
+                     int64_t os, const ResampleKernels& kern) {
   const int chunks = (ax.most_taps() + 7) / 8, reach = 8 * chunks, groups = (ow + 7) / 8;
   std::vector<int32_t> first(static_cast<size_t>(groups) * 8);
   for (size_t i = 0; i < first.size(); ++i) first[i] = ax.first[std::min(i, static_cast<size_t>(ow - 1))];
@@ -178,7 +179,7 @@ void resample_vector(const GrayView& im, const Axis& ax, const Axis& ay, int ow,
 
   // The ring's rows, and the paper row after them, `stride` bytes apart: the vertical
   // kernel reads them to a multiple of 32.
-  const int tall = ay.most_taps(), top = ay.first[0];
+  const int tall = ay.most_taps(), top = ay.first[row0];
   const size_t stride = static_cast<size_t>((groups * 8 + 31) / 32 * 32);
   std::vector<uint8_t> ring(static_cast<size_t>(tall + 1) * stride);
   uint8_t* const paper = ring.data() + static_cast<size_t>(tall) * stride;
@@ -204,7 +205,7 @@ void resample_vector(const GrayView& im, const Axis& ax, const Axis& ay, int ow,
   std::vector<const uint8_t*> rows(static_cast<size_t>(tall));
   bool have_paper = false;
   int next = top;  // the first row not through the horizontal pass yet
-  for (int yy = 0; yy < oh; ++yy) {
+  for (int yy = row0; yy < row1; ++yy) {
     const int f = ay.first[yy], n = ay.count[yy];
     for (int y = std::max(next, f); y < f + n; ++y) {
       if (inside(y)) {
@@ -216,25 +217,31 @@ void resample_vector(const GrayView& im, const Axis& ax, const Axis& ay, int ow,
     }
     next = std::max(next, f + n);
     for (int i = 0; i < n; ++i) rows[i] = slot(f + i);
-    kern.v(rows.data(), &ay.k[static_cast<size_t>(yy) * ay.taps], n, ow, out + yy * os);
+    kern.v(rows.data(), &ay.k[static_cast<size_t>(yy) * ay.taps], n, ow, out + (yy - row0) * os);
   }
 }
 
 }  // namespace
 
-void resample_gray(const GrayView& im, double x0, double y0, double x1, double y1, int ow, int oh,
-                   uint8_t* out, int64_t os, cpu::Isa isa) {
+void resample_gray_rows(const GrayView& im, double x0, double y0, double x1, double y1, int ow, int oh, int row0,
+                        int row1, uint8_t* out, int64_t os, cpu::Isa isa) {
   if (ow <= 0 || oh <= 0) throw Error("resample_gray: empty output");
+  if (row0 < 0 || row1 > oh || row0 >= row1) throw Error("resample_gray: rows outside the output");
   if (!cpu::isa_available(isa)) {
     throw Error(std::string("resample_gray: ") + cpu::isa_name(isa) + " is not available on this CPU");
   }
   const Axis ax(x0, x1, ow), ay(y0, y1, oh);
   const ResampleKernels kern = resample_kernels(isa);
   if (kern.h && ax.forward() && ay.forward()) {
-    resample_vector(im, ax, ay, ow, oh, out, os, kern);
+    resample_vector(im, ax, ay, ow, row0, row1, out, os, kern);
   } else {
-    resample_scalar(im, ax, ay, ow, oh, out, os);
+    resample_scalar(im, ax, ay, ow, row0, row1, out, os);
   }
+}
+
+void resample_gray(const GrayView& im, double x0, double y0, double x1, double y1, int ow, int oh,
+                   uint8_t* out, int64_t os, cpu::Isa isa) {
+  resample_gray_rows(im, x0, y0, x1, y1, ow, oh, 0, oh, out, os, isa);
 }
 
 namespace {
@@ -306,8 +313,11 @@ void finish_crop(uint8_t* c, int w, int out_width, const CropRule& rule) {
   if (w <= 0 || h <= 0) return;
   // The ground's histogram once: the test's ground, and the padding's (the flipped crop's, the histogram backwards).
   const std::array<int, 256> hist = ground_histogram(c, w, h, out_width);
-  const bool flip = rule.flip_margin > 0 &&
-                    lighter_than_darker(c, w, h, out_width, ground_of(hist, 2 * w + h, false), rule.flip_margin);
+  bool flip = rule.flip_margin > 0 &&
+              lighter_than_darker(c, w, h, out_width, ground_of(hist, 2 * w + h, false), rule.flip_margin);
+  if (flip && rule.flip_needs_dark) {  // mostly dark too (bytes at most 127)
+    flip = 2 * cpu::count_beyond(c, w, h, out_width, 127, 256).below > static_cast<int64_t>(w) * h;
+  }
   if (flip) {
     for (int y = 0; y < h; ++y)
       for (int x = 0; x < w; ++x) c[y * out_width + x] = static_cast<uint8_t>(255 - c[y * out_width + x]);

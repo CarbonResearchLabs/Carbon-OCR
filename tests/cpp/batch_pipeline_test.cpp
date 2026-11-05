@@ -229,6 +229,45 @@ TEST(BatchPipeline, ABrokenDeviceStopsThePipeline) {
   EXPECT_THROW(pipe.submit(GrayImage{page.width, page.height, page.pixels}), Error);
 }
 
+// Pages as they finish (next_finished): every page out once, under its own number, a failed run's pages with
+// its error and the rest as the engine reads them; nullopt after close once all are out; next refuses after it.
+TEST(BatchPipeline, PagesAsTheyFinish) {
+  const GrayImage page = load_image(kSet / "page.png");
+  const GrayImage blank = paper(400, 300);  // landscape: padded 1024 wide, its detection run fails below
+  const GrayView kinds[] = {page.view(), blank.view()};
+  std::vector<GrayView> pages;
+  for (int i = 0; i < 6; ++i) pages.push_back(kinds[i % 2]);
+  EngineOptions eo;
+  eo.pool.workers = 2;
+  const std::vector<OcrPage> want = Engine(kSet, eo).ocr(pages);
+  auto models = std::make_unique<FaultyModels>(cpu_pipeline_models(kSet, EngineOptions{}, 2));
+  FaultyModels& f = *models;
+  Pipeline pipe(kSet, cpu_options(), std::move(models));
+  f.detect_fails_at_width = 1024;
+  for (const GrayView& p : pages) {
+    pipe.submit(GrayImage{p.width, p.height, std::vector<uint8_t>(p.data, p.data + p.width * p.height)});
+  }
+  pipe.close();
+  std::vector<int> seen(pages.size(), 0);
+  while (std::optional<Pipeline::Finished> got = pipe.next_finished()) {
+    ASSERT_LT(got->number, pages.size());
+    ++seen[got->number];
+    if (got->number % 2 == 1) {
+      ASSERT_TRUE(got->error) << "page " << got->number;
+      try {
+        std::rethrow_exception(got->error);
+      } catch (const Error& e) {
+        EXPECT_STREQ(e.what(), "detect failed");
+      }
+    } else {
+      ASSERT_FALSE(got->error) << "page " << got->number;
+      expect_same(got->page, want[got->number], static_cast<int>(got->number));
+    }
+  }
+  EXPECT_EQ(seen, std::vector<int>(pages.size(), 1));
+  EXPECT_THROW(pipe.next(), Error);
+}
+
 // A run that fails fails the pages it held, each with that error, and no other: the rest come out as the
 // engine reads them, in the order given, and the pipeline goes on taking pages.
 TEST(BatchPipeline, AFailedRunFailsItsPagesAndTheRestGoOn) {

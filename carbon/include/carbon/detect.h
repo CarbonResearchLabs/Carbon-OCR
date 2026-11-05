@@ -65,6 +65,16 @@ struct DetRule {
   // pass runs on the tiny lines' bands alone.
   double second_pass_share = 0;
   int second_pass_lines = 8;
+  // A pass by share (its median line not tiny) runs on the bands of rows that hold the tiny lines, not the
+  // page: each tiny line's rows at the second scale, a line height either side, bands closer than
+  // second_pass_join rows joined, each run with the strips' halo; a band's line is kept where its centre lies in
+  // the band's own rows. False: the whole page, as a pass by the median.
+  bool second_pass_bands = true;
+  int second_pass_join = 256;
+  // The second pass at the scale that makes the tiny lines' median height this many pixels, capped by the
+  // page's own resolution over the first pass's (and at least second_pass_scale), its strips keeping each run
+  // about a first pass's pixels. 0: second_pass_scale, within second_pass_long_side (the default).
+  double second_pass_target = 0;
 };
 
 struct DetBox {

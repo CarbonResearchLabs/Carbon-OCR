@@ -19,11 +19,12 @@
 //
 //       gray            the sample; 16 bits: its high byte; 1, 2 and 4 bits: times 255,
 //                       85 or 17
-//       gray + alpha    the gray sample, as above (alpha dropped)
+//       gray + alpha    the gray sample, as above, over white by its alpha
 //       RGB, RGBA       (77 r + 150 g + 29 b) >> 8; 16 bits: (77 r + 150 g + 29 b) >> 16
 //       palette         the entry's RGB as for RGB (1 to 8 bits an index)
 //
-//     tRNS gives the others an alpha channel, which the gray drops as well.  8-bit gray,
+//     RGBA's alpha, a palette's tRNS and gray's and RGB's tRNS key (the transparent colour) put the
+//     gray over white as well, as stb_image's gray + alpha composited (over_white).  8-bit gray,
 //     most pages, is unfiltered straight into the image's pixels, the rest in place in
 //     the inflated buffer and converted from there.
 //
@@ -42,6 +43,7 @@
 #include <utility>
 #include <vector>
 
+#include "carbon/image.h"
 #include "cpu/png_kernels.h"
 
 namespace carbon::detail {
@@ -62,15 +64,49 @@ uint32_t be32(const uint8_t* p) {
          p[3];
 }
 
-// libdeflate's decompressor holds its tables (some tens of KB): one per thread, kept.
-libdeflate_decompressor* decompressor() {
+}  // namespace
+
+#if defined(CARBON_INFLATE_AVX2)
+// libdeflate's decoder compiled with /arch:AVX2 (inflate_avx2.c), its names its own
+extern "C" {
+libdeflate_decompressor* carbon_inflate_avx2_alloc(void);
+void carbon_inflate_avx2_free(libdeflate_decompressor* d);
+libdeflate_result carbon_inflate_avx2_zlib(libdeflate_decompressor* d, const void* in, size_t in_nbytes, void* out,
+                                           size_t out_nbytes_avail, size_t* actual_out_nbytes_ret);
+}
+#endif
+
+bool zlib_inflate_avx2_built() {
+#if defined(CARBON_INFLATE_AVX2)
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool zlib_inflate(const uint8_t* in, size_t n, uint8_t* out, size_t out_n, bool avx2) {
+  // libdeflate's decompressor holds its tables (some tens of KB): one per thread and kind, kept.
   struct Owned {
     libdeflate_decompressor* d = libdeflate_alloc_decompressor();
     ~Owned() { libdeflate_free_decompressor(d); }
   };
+#if defined(CARBON_INFLATE_AVX2)
+  struct OwnedAvx2 {
+    libdeflate_decompressor* d = carbon_inflate_avx2_alloc();
+    ~OwnedAvx2() { carbon_inflate_avx2_free(d); }
+  };
+  if (avx2) {
+    thread_local OwnedAvx2 fast;
+    return fast.d && carbon_inflate_avx2_zlib(fast.d, in, n, out, out_n, nullptr) == LIBDEFLATE_SUCCESS;
+  }
+#else
+  (void)avx2;
+#endif
   thread_local Owned owned;
-  return owned.d;
+  return owned.d && libdeflate_zlib_decompress(owned.d, in, n, out, out_n, nullptr) == LIBDEFLATE_SUCCESS;
 }
+
+namespace {
 
 // A thread's buffer of at least n bytes (above), and its letting go of a large one.
 constexpr size_t kKeep = size_t{64} << 20;
@@ -138,8 +174,10 @@ struct Png {
   int depth = 0, color = 0;
   int channels = 0;     // samples a pixel: 1 gray or a palette index, 2 gray + alpha, 3 RGB, 4 RGBA
   bool trns = false;    // a tRNS chunk: stb_image adds an alpha channel to all but a palette's
+  uint16_t key[3] = {};  // gray's or RGB's tRNS: the transparent colour's samples
   int palette_len = 0;  // entries
   uint8_t palette[256][3] = {};
+  uint8_t palette_alpha[256];  // a palette's tRNS, 255 past it (filled in parse)
   const uint8_t* zlib = nullptr;  // the IDAT chunks' data end to end
   size_t zlib_len = 0;
 };
@@ -150,6 +188,7 @@ bool parse(const uint8_t* data, size_t size, Png& p, Scratch& s) {
   static const uint8_t kSignature[8] = {137, 80, 78, 71, 13, 10, 26, 10};
   if (size < 8 || std::memcmp(data, kSignature, 8) != 0 || size > INT_MAX) return false;
   std::vector<std::pair<const uint8_t*, uint32_t>> idat;
+  std::memset(p.palette_alpha, 255, sizeof p.palette_alpha);
   bool first = true, any_idat = false;
   for (size_t at = 8;;) {
     if (size - at < 8) return false;
@@ -193,11 +232,13 @@ bool parse(const uint8_t* data, size_t size, Png& p, Scratch& s) {
         if (first || any_idat) return false;
         if (p.color == 3) {
           if (p.palette_len == 0 || len > static_cast<uint32_t>(p.palette_len)) return false;
+          std::memcpy(p.palette_alpha, d, len);
         } else {
           if (!(p.channels & 1) || len != 2u * static_cast<uint32_t>(p.channels)) return false;
           p.trns = true;
+          for (int c = 0; c < p.channels; ++c) p.key[c] = static_cast<uint16_t>(d[2 * c] << 8 | d[2 * c + 1]);
         }
-        break;  // the alpha it gives, the gray drops
+        break;  // the alpha it gives puts the gray over white
       case kIDAT:
         if (first || (p.color == 3 && p.palette_len == 0) || len > (1u << 30)) return false;
         if (p.zlib_len + len > INT_MAX) return false;
@@ -241,7 +282,8 @@ bool parse(const uint8_t* data, size_t size, Png& p, Scratch& s) {
 void palette_gray(const Png& p, uint16_t lut[256]) {
   for (int i = 0; i < 256; ++i) {
     const uint8_t* e = p.palette[i];
-    lut[i] = i < p.palette_len ? static_cast<uint16_t>((e[0] * 77 + e[1] * 150 + e[2] * 29) >> 8) : uint16_t{0x100};
+    lut[i] = i < p.palette_len ? over_white((e[0] * 77 + e[1] * 150 + e[2] * 29) >> 8, p.palette_alpha[i])
+                               : uint16_t{0x100};
   }
 }
 
@@ -289,6 +331,9 @@ class ToGray {
     } else if (p.depth < 8) {
       static const uint8_t kScale[5] = {0, 0xff, 0x55, 0, 0x11};  // stbi__depth_scale_table
       for (int i = 0; i < (1 << p.depth); ++i) lut_[i] = static_cast<uint16_t>(i * kScale[p.depth]);
+      // the tRNS key's sample, transparent: white
+      // stb_image compares the key's low byte, scaled: only a sample of its value matches
+      if (p.trns && (p.key[0] & 255u) < (1u << p.depth)) lut_[p.key[0] & 255u] = 255;
     }
     if (p.depth == 1) unpack1_.emplace(lut_);
     if (p.depth == 2) unpack2_.emplace(lut_);
@@ -304,23 +349,48 @@ class ToGray {
     }
     const bool wide = p_.depth == 16;
     const size_t step = static_cast<size_t>(p_.channels) * (wide ? 2 : 1);
+    const size_t bytes = wide ? 2 : 1;
     switch (p_.color) {
-      case 0:  // gray 16: the high byte
-      case 4:  // gray + alpha: the gray sample's (high) byte
-        for (size_t x = 0; x < w; ++x) out[x] = in[x * step];
-        return;
-      case 2:
-      case 6:
-        if (!wide) {
-          k_.gray_rgb8(in, out, w, p_.channels);
+      case 0:  // gray: the sample, 16 bits its high byte; the tRNS key's samples white
+        if (p_.trns) {
+          for (size_t x = 0; x < w; ++x) {
+            const uint16_t v = wide ? static_cast<uint16_t>(in[2 * x] << 8 | in[2 * x + 1]) : in[x];
+            out[x] = v == (wide ? p_.key[0] : (p_.key[0] & 255u)) ? uint8_t{255} : in[x * step];  // 8 bits: its low byte
+          }
           return;
         }
-        for (size_t x = 0; x < w; ++x, in += step) {
-          const uint32_t r = static_cast<uint32_t>(in[0]) << 8 | in[1], g = static_cast<uint32_t>(in[2]) << 8 | in[3],
-                         b = static_cast<uint32_t>(in[4]) << 8 | in[5];
-          out[x] = static_cast<uint8_t>((r * 77 + g * 150 + b * 29) >> 16);
+        for (size_t x = 0; x < w; ++x) out[x] = in[x * step];
+        return;
+      case 4:  // gray + alpha: the gray sample's (high) byte over white by the alpha's (high) byte
+        for (size_t x = 0; x < w; ++x) out[x] = over_white(in[x * step], in[x * step + bytes]);
+        return;
+      case 2:
+      case 6: {
+        if (!wide) {
+          k_.gray_rgb8(in, out, w, p_.channels);
+        } else {
+          for (size_t x = 0; x < w; ++x) {
+            const uint8_t* q = in + x * step;
+            const uint32_t r = static_cast<uint32_t>(q[0]) << 8 | q[1], g = static_cast<uint32_t>(q[2]) << 8 | q[3],
+                           b = static_cast<uint32_t>(q[4]) << 8 | q[5];
+            out[x] = static_cast<uint8_t>((r * 77 + g * 150 + b * 29) >> 16);
+          }
+        }
+        if (p_.color == 6) {  // over white by the alpha's (high) byte
+          for (size_t x = 0; x < w; ++x) out[x] = over_white(out[x], in[x * step + 3 * bytes]);
+        } else if (p_.trns) {  // the tRNS key's colour white
+          for (size_t x = 0; x < w; ++x) {
+            const uint8_t* q = in + x * step;
+            bool key = true;
+            for (int c = 0; c < 3; ++c) {
+              const uint16_t v = wide ? static_cast<uint16_t>(q[2 * c] << 8 | q[2 * c + 1]) : q[c];
+              key = key && v == (wide ? p_.key[c] : (p_.key[c] & 255u));
+            }
+            if (key) out[x] = 255;
+          }
         }
         return;
+      }
       default: {  // 3, 8-bit indices
         uint16_t s = 0;
         for (size_t x = 0; x < w; ++x) {
@@ -358,10 +428,9 @@ bool png_to_gray(std::span<const uint8_t> png, cpu::Isa isa, GrayImage& out) {
   const size_t n = (static_cast<size_t>(p.channels) * w * p.depth + 7) / 8;  // a row's bytes past its filter byte
   const size_t stride = n + 1;
   uint8_t* rows = scratch(s.rows, stride * h);
-  libdeflate_decompressor* d = decompressor();
-  if (!d || libdeflate_zlib_decompress(d, p.zlib, p.zlib_len, rows, stride * h, nullptr) != LIBDEFLATE_SUCCESS) {
-    return false;
-  }
+  // The AVX2 build of the decoder where the CPU has AVX2 and BMI2 (and the build has one)
+  static const bool fast = cpu::features().avx2 && cpu::features().bmi2;
+  if (!detail::zlib_inflate(p.zlib, p.zlib_len, rows, stride * h, fast)) return false;
   for (size_t y = 0; y < h; ++y) {
     if (rows[y * stride] > 4) return false;  // stb_image: "invalid filter"
   }
@@ -374,7 +443,7 @@ bool png_to_gray(std::span<const uint8_t> png, cpu::Isa isa, GrayImage& out) {
   r.raw_stride = stride;
   r.n = n;
   r.bpp = p.depth < 8 ? 1 : p.channels * p.depth / 8;  // stb_image's filter_bytes
-  if (p.color == 0 && p.depth == 8) {  // straight into the pixels
+  if (p.color == 0 && p.depth == 8 && !p.trns) {  // straight into the pixels
     r.cur_stride = w;
     for (size_t y = 0; y < h;) {
       r.raw = rows + y * stride + 1;

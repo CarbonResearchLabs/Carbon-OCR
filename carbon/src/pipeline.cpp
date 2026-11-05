@@ -210,6 +210,7 @@ struct Pipeline::Impl {
   std::condition_variable cv;
   size_t submitted = 0, delivered = 0, taken = 0;
   bool closed = false, stopping = false;
+  bool by_finished = false;  // next_finished took a page: next may not
   std::exception_ptr error;
   std::map<size_t, OcrPage> ready;
   std::map<size_t, std::exception_ptr> failed;  // the pages that met an error, each with its own
@@ -585,7 +586,7 @@ struct Pipeline::Impl {
           if (err) continue;
           try {
             detail::read_line(group[items[i].page]->out.lines[items[i].line], decoded[i - a], lengths[i - a],
-                              e.crop, vocab);
+                              e.crop, vocab, nullptr, 0, nullptr, e.char_confidence);
           } catch (...) {
             err = std::current_exception();
           }
@@ -650,6 +651,7 @@ struct Pipeline::Impl {
 
   std::optional<OcrPage> next() {
     std::unique_lock lk(m);
+    if (by_finished) throw Error("Pipeline::next: this stream's pages are taken by next_finished");
     cv.wait(lk, [&] {
       return error || ready.count(taken) || failed.count(taken) || (closed && taken == submitted) || stopping;
     });
@@ -664,6 +666,31 @@ struct Pipeline::Impl {
     if (it == ready.end()) return std::nullopt;
     OcrPage out = std::move(it->second);
     ready.erase(it);
+    ++taken;
+    return out;
+  }
+
+  // The first given among the pages done, as each finishes.
+  std::optional<Pipeline::Finished> next_finished() {
+    std::unique_lock lk(m);
+    by_finished = true;
+    cv.wait(lk, [&] {
+      return error || !ready.empty() || !failed.empty() || (closed && taken == submitted) || stopping;
+    });
+    if (error) std::rethrow_exception(error);
+    const size_t r = ready.empty() ? SIZE_MAX : ready.begin()->first;
+    const size_t f = failed.empty() ? SIZE_MAX : failed.begin()->first;
+    if (r == SIZE_MAX && f == SIZE_MAX) return std::nullopt;
+    Pipeline::Finished out;
+    if (f < r) {
+      out.number = f;
+      out.error = failed.begin()->second;
+      failed.erase(failed.begin());
+    } else {
+      out.number = r;
+      out.page = std::move(ready.begin()->second);
+      ready.erase(ready.begin());
+    }
     ++taken;
     return out;
   }
@@ -684,6 +711,8 @@ size_t Pipeline::submit(GrayImage page) { return impl_->submit(std::move(page));
 void Pipeline::close() { impl_->close(); }
 
 std::optional<OcrPage> Pipeline::next() { return impl_->next(); }
+
+std::optional<Pipeline::Finished> Pipeline::next_finished() { return impl_->next_finished(); }
 
 std::vector<OcrPage> Pipeline::ocr(std::span<const GrayView> pages) {
   std::vector<OcrPage> out;

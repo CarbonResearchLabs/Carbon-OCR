@@ -99,8 +99,9 @@ class OrderNet {
     if (f.read(&extra, 1)) refuse("it is longer than its sizes say");
   }
 
-  // features [n][16] -> successor [(n+1)^2], the four pairwise [n^2], labels [n][13]
-  void run(const float* x, int n, std::vector<float>* out) {
+  // features [n][16] -> successor [(n+1)^2], the four pairwise [n^2], labels [n][13]; pairs_only: the four
+  // pairwise left to chain() and among(), out[1..4] empty
+  void run(const float* x, int n, std::vector<float>* out, bool pairs_only = false) {
     const int t = n + 1, d = d_, dh = d_ / heads_;
     h_.assign(static_cast<size_t>(t) * d, 0.0f);
     in_.assign(static_cast<size_t>(t) * kOrderFeatures, -1.0f);  // the start token's features
@@ -130,7 +131,7 @@ class OrderNet {
         }
         const cpu::PackedF32 kb = cpu::pack_f32(kt_.data(), dh, t, isa_);
         product(q, t, 3 * d, kb, p_.data(), t);
-        for (int i = 0; i < t; ++i) softmax(p_.data() + static_cast<size_t>(i) * t, t, qk_scale);
+        cpu::softmax_rows(p_.data(), t, t, qk_scale, isa_);  // the CPU's vectors, the same bits everywhere
         const cpu::PackedF32 vb = cpu::pack_f32(v_.data(), t, dh, isa_);
         product(p_.data(), t, t, vb, att_.data() + hd * dh, d);
       }
@@ -138,7 +139,7 @@ class OrderNet {
       std::swap(h_, h2_);
       layer_norm(h_.data(), y_.data(), t, d);
       gemm(y_.data(), t, d, L.ff1, ff_.data(), ffn_);
-      for (float& v : ff_) v = 0.5f * v * (1.0f + std::erf(v * 0.70710678118654752f));
+      cpu::gelu(ff_.data(), ff_.size(), isa_);
       gemm(ff_.data(), t, ffn_, L.ff2, h2_.data(), d, h_.data());  // h + feed-forward
       std::swap(h_, h2_);
     }
@@ -151,13 +152,54 @@ class OrderNet {
     pair(h2_.data(), y_.data(), t, d, succ.data(), scale, false);
     // the others over the lines, made symmetric
     const float* lines = y_.data() + d;
+    n_ = n;
+    out[5].resize(static_cast<size_t>(n) * kBlockLabels);
+    gemm(lines, n, d, labels_, out[5].data(), kBlockLabels);
+    if (pairs_only) {  // same_block's w x kept for its chain; the table heads as their blocks ask
+      for (int f = 1; f < 5; ++f) out[f].clear();
+      wx_.resize(static_cast<size_t>(n) * d);
+      gemm(lines, n, d, forms_[1], wx_.data(), d);
+      return;
+    }
     for (int f = 1; f < 5; ++f) {
       out[f].resize(static_cast<size_t>(n) * n);
       gemm(lines, n, d, forms_[f], h2_.data(), d);
       pair(h2_.data(), lines, n, d, out[f].data(), scale, true);
     }
-    out[5].resize(static_cast<size_t>(n) * kBlockLabels);
-    gemm(lines, n, d, labels_, out[5].data(), kBlockLabels);
+  }
+
+  // After a pairs_only run: same_block's logits between consecutive lines of order, each (s_ab scale + s_ba
+  // scale) / 2 from the chains gemm_f32 sums, as pair() makes them
+  std::vector<float> chain(std::span<const size_t> order) const {
+    const size_t m = order.size() < 2 ? 0 : order.size() - 1;
+    if (static_cast<int64_t>(n_) * d_ >= (int64_t{1} << 31)) refuse("too many lines for the pairs' indices");
+    std::vector<int32_t> ia(2 * m), ib(2 * m);
+    for (size_t k = 0; k < m; ++k) {
+      ia[2 * k] = ib[2 * k + 1] = static_cast<int32_t>(order[k]);
+      ib[2 * k] = ia[2 * k + 1] = static_cast<int32_t>(order[k + 1]);
+    }
+    std::vector<float> s(2 * m);
+    const float* lines = y_.data() + d_;
+    cpu::dot_chains(wx_.data(), lines, ia.data(), ib.data(), static_cast<int>(2 * m), d_, s.data(), isa_);
+    const float scale = 1.0f / std::sqrt(static_cast<float>(d_));
+    std::vector<float> out(m);
+    for (size_t k = 0; k < m; ++k) out[k] = (s[2 * k] * scale + s[2 * k + 1] * scale) * 0.5f;
+    return out;
+  }
+
+  // head (1 table_row, 2 table_col, 3 table_cell)'s logits among these lines, [m][m]: pair() on their rows,
+  // whose entries are the full matrix's (a GEMM's rows and columns do not change one another's bits)
+  std::vector<float> among(int head, std::span<const size_t> which) {
+    const int m = static_cast<int>(which.size()), d = d_;
+    sub_.resize(static_cast<size_t>(m) * d);
+    const float* lines = y_.data() + d;
+    for (int r = 0; r < m; ++r) std::copy_n(lines + which[r] * d, d, sub_.data() + static_cast<size_t>(r) * d);
+    std::vector<float> s(static_cast<size_t>(m) * m);
+    if (m == 0) return s;
+    sub_wx_.resize(static_cast<size_t>(m) * d);
+    gemm(sub_.data(), m, d, forms_[head + 1], sub_wx_.data(), d);
+    pair(sub_wx_.data(), sub_.data(), m, d, s.data(), 1.0f / std::sqrt(static_cast<float>(d)), true);
+    return s;
   }
 
   int d() const { return d_; }
@@ -220,31 +262,17 @@ class OrderNet {
     }
   }
 
-  // a row of scores, scaled, to its softmax
-  static void softmax(float* row, int n, float scale) {
-    float hi = -INFINITY;
-    for (int j = 0; j < n; ++j) {
-      row[j] *= scale;
-      hi = std::max(hi, row[j]);
-    }
-    float sum = 0;
-    for (int j = 0; j < n; ++j) {
-      row[j] = std::exp(row[j] - hi);
-      sum += row[j];
-    }
-    const float inv = 1.0f / sum;
-    for (int j = 0; j < n; ++j) row[j] *= inv;
-  }
-
   cpu::Isa isa_;
   int d_ = 0, layers_ = 0, heads_ = 0, ffn_ = 0;
   Linear embed_, labels_;
   Linear forms_[5];  // successor, same_block, table_row, table_col, table_cell
   std::vector<Layer> layer_;
   std::vector<float> in_, h_, h2_, y_, qkv_, att_, ff_, p_, kt_, v_, yt_;
+  std::vector<float> wx_, sub_, sub_wx_;  // same_block's w x; a block's rows and theirs
+  int n_ = 0;
 };
 
-class OrderSession final : public Session {
+class OrderSession final : public Session, public OrderPairs {
  public:
   OrderSession(const std::filesystem::path& file, cpu::Isa isa) : net_(file, isa) {
     inputs_ = {{"x", DType::kFloat32, {1, -1, kOrderFeatures}}};
@@ -254,6 +282,25 @@ class OrderSession final : public Session {
   }
 
   Backend backend() const override { return Backend::kNative; }
+
+  // Successor and labels, the pairwise heads left to chain() and among(); the spans until the next run
+  void run_pairs(const float* x, int n, OrderOutputs& o) {
+    net_.run(x, n, pairs_out_, true);
+    o = OrderOutputs{};
+    o.n = n;
+    o.successor = pairs_out_[0];
+    o.labels = pairs_out_[5];
+    o.pairs = this;
+  }
+  std::vector<float> chain(int head, std::span<const size_t> order) const override {
+    if (head != 0) throw Error("the order model's chain is same_block's");
+    return net_.chain(order);
+  }
+  std::vector<float> among(int head, std::span<const size_t> lines) const override {
+    if (head < 1 || head > 3) throw Error("the order model's table heads are 1 to 3");
+    return const_cast<OrderNet&>(net_).among(head, lines);  // its buffers, a worker's session
+  }
+
   using Session::run;  // and run() with its outputs in place: the base's, over this one
 
   std::vector<Tensor> run(std::span<const Tensor> inputs) override {
@@ -275,6 +322,7 @@ class OrderSession final : public Session {
 
  private:
   OrderNet net_;
+  std::vector<float> pairs_out_[6];
 };
 
 }  // namespace
@@ -287,6 +335,14 @@ bool is_order_net(const std::filesystem::path& file) {
 
 std::unique_ptr<Session> open_order_net(const std::filesystem::path& file, cpu::Isa isa) {
   return std::make_unique<OrderSession>(file, isa);
+}
+
+bool run_order_pairs(Session& s, std::span<const float> x, int n, OrderOutputs& out) {
+  auto* o = dynamic_cast<OrderSession*>(&s);
+  if (!o) return false;
+  if (x.size() != static_cast<size_t>(n) * kOrderFeatures) throw Error("the order model's features are not n x 16");
+  o->run_pairs(x.data(), n, out);
+  return true;
 }
 
 }  // namespace carbon::net

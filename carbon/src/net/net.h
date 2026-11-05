@@ -6,6 +6,7 @@
 #include <memory>
 
 #include "carbon/cpu.h"
+#include "carbon/order.h"
 #include "carbon/session.h"
 
 namespace carbon::net {
@@ -23,5 +24,10 @@ std::unique_ptr<Session> open_native_session(const std::filesystem::path& model,
 // The order model's weights file (order_net.cpp): whether `file` is one, and its network.
 bool is_order_net(const std::filesystem::path& file);
 std::unique_ptr<Session> open_order_net(const std::filesystem::path& file, cpu::Isa isa);
+
+// The native order model's run with its four pairwise heads computed where decode_order reads them: out's
+// successor and labels point into the session (until its next run) and out.pairs is the session.  False, and out
+// untouched, when s is not the native order model.
+bool run_order_pairs(Session& s, std::span<const float> x, int n, OrderOutputs& out);
 
 }  // namespace carbon::net

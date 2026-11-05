@@ -543,6 +543,111 @@ std::string cut(std::string_view model, const std::string& output, int32_t dtype
   return out;
 }
 
+std::string cut_input(std::string_view model, const std::string& input, int32_t dtype, const std::vector<int64_t>& dims) {
+  // The nodes the outputs depend on, from the graph's end back, stopped at `input`.
+  const Model m = parse(model);
+  std::set<std::string> needed;
+  for (const ValueInfo& o : m.graph.outputs) needed.insert(o.name);
+  std::vector<bool> keep(m.graph.nodes.size(), false);
+  bool made = false;
+  for (size_t k = m.graph.nodes.size(); k-- > 0;) {
+    const Node& n = m.graph.nodes[k];
+    bool want = false, makes = false;
+    for (const std::string& o : n.outputs) {
+      want = want || (needed.count(o) && o != input);
+      makes = makes || o == input;
+    }
+    made = made || makes;
+    if (!want) continue;
+    keep[k] = true;
+    for (const std::string& i : n.inputs) {
+      if (!i.empty()) needed.insert(i);
+    }
+  }
+  if (!made) throw Error("ONNX: no node makes " + input);
+  for (const ValueInfo& in : m.graph.inputs) {
+    const bool init = std::any_of(m.graph.initializers.begin(), m.graph.initializers.end(),
+                                  [&](const TensorData& t) { return t.name == in.name; });
+    if (!init && in.name != input && needed.count(in.name)) {
+      throw Error("ONNX: the graph still reads " + in.name + " past " + input);
+    }
+  }
+  // The new input's ValueInfoProto: its name and type.
+  std::string tensor_type, type, value;
+  put_int(tensor_type, 1, static_cast<uint64_t>(dtype));
+  if (!dims.empty()) {
+    std::string shape;
+    for (size_t d = 0; d < dims.size(); ++d) {
+      std::string dim;
+      if (dims[d] >= 0) put_int(dim, 1, static_cast<uint64_t>(dims[d]));
+      else put_bytes(dim, 2, "d" + std::to_string(d));
+      put_bytes(shape, 1, dim);
+    }
+    put_bytes(tensor_type, 2, shape);
+  }
+  put_bytes(type, 1, tensor_type);
+  put_bytes(value, 1, input);
+  put_bytes(value, 2, type);
+  // The graph again: the nodes kept, the initializers they read, the new input first, the outputs as they were.
+  std::string graph;
+  std::string_view graph_bytes;
+  Reader top(model);
+  uint32_t field, wire;
+  while (top.next(field, wire)) {
+    if (field == 7 && wire == 2) graph_bytes = top.bytes();
+    else top.skip(wire);
+  }
+  Reader g(graph_bytes);
+  size_t node = 0;
+  bool input_put = false;
+  while (g.next(field, wire)) {
+    if (wire != 2) {
+      g.skip(wire);
+      continue;
+    }
+    const std::string_view b = g.bytes();
+    switch (field) {
+      case 1:  // a node
+        if (keep[node++]) put_bytes(graph, 1, b);
+        break;
+      case 5:  // an initializer a kept node reads
+        if (needed.count(name_in(b, 8))) put_bytes(graph, 5, b);
+        break;
+      case 11: {  // the inputs: the new one in the old one's place; initializers listed as inputs kept as theirs are
+        const std::string name = name_in(b, 1);
+        const bool init = std::any_of(m.graph.initializers.begin(), m.graph.initializers.end(),
+                                      [&](const TensorData& t) { return t.name == name; });
+        if (init) {
+          if (needed.count(name)) put_bytes(graph, 11, b);
+        } else if (!input_put) {
+          put_bytes(graph, 11, value);
+          input_put = true;
+        }
+        break;
+      }
+      case 13:  // value_info: the shapes of tensors that may be gone
+        break;
+      default: put_bytes(graph, field, b);
+    }
+  }
+  if (!input_put) put_bytes(graph, 11, value);
+  std::string out;
+  Reader r(model);
+  while (r.next(field, wire)) {
+    if (field == 7 && wire == 2) {
+      r.bytes();
+      put_bytes(out, 7, graph);
+      continue;
+    }
+    switch (wire) {
+      case 0: put_int(out, field, r.varint()); break;
+      case 2: put_bytes(out, field, r.bytes()); break;
+      default: throw Error("ONNX: a ModelProto field of wire type " + std::to_string(wire));
+    }
+  }
+  return out;
+}
+
 std::map<std::string, std::string> metadata(const std::filesystem::path& path) {
   std::ifstream in(path, std::ios::binary);
   if (!in) throw Error("cannot read " + path.string());

@@ -456,13 +456,39 @@ inline __m256 exp_neg8(__m256 x) {
 
 namespace {
 
-// det_head's row of the head at stride 4: channel c's row in head[c][w4], an FMA chain a pixel, bias first.
+// det_head's row of the head at stride 4: channel c's row in head[c][w4], an FMA chain a pixel, bias first.  Four
+// channels by 16 pixels a pass (8 accumulators, each input's two vectors loaded once for the four, 6 loads to
+// 8 FMAs), then each channel's pixels left 8 and 1 at a time; every pixel's chain the same.
 void det_head_row(const float* x, int h4, int w4, const DetHeadWeights& w, int p, float* head) {
   const __m256 zero = _mm256_setzero_ps();
+  const int64_t plane = static_cast<int64_t>(h4) * w4;
+  const float* xr = x + static_cast<int64_t>(p) * w4;
+  const int wide = w4 & ~15, quads = w.mid & ~3;
+  for (int c = 0; c < quads; c += 4) {
+    const float* wc = w.w1 + static_cast<size_t>(c) * w.in;
+    for (int px = 0; px < wide; px += 16) {
+      __m256 a[4][2];
+      for (int j = 0; j < 4; ++j) a[j][0] = a[j][1] = _mm256_set1_ps(w.b1[c + j]);
+      for (int i = 0; i < w.in; ++i) {
+        const float* xi = xr + i * plane + px;
+        const __m256 x0 = _mm256_loadu_ps(xi), x1 = _mm256_loadu_ps(xi + 8);
+        for (int j = 0; j < 4; ++j) {
+          const __m256 wv = _mm256_set1_ps(wc[static_cast<size_t>(j) * w.in + i]);
+          a[j][0] = _mm256_fmadd_ps(wv, x0, a[j][0]);
+          a[j][1] = _mm256_fmadd_ps(wv, x1, a[j][1]);
+        }
+      }
+      for (int j = 0; j < 4; ++j) {
+        float* hc = head + static_cast<size_t>(c + j) * w4 + px;
+        _mm256_storeu_ps(hc, _mm256_max_ps(a[j][0], zero));
+        _mm256_storeu_ps(hc + 8, _mm256_max_ps(a[j][1], zero));
+      }
+    }
+  }
   for (int c = 0; c < w.mid; ++c) {
     const float* wc = w.w1 + static_cast<size_t>(c) * w.in;
     float* hc = head + static_cast<size_t>(c) * w4;
-    int px = 0;
+    int px = c < quads ? wide : 0;
     for (; px + 8 <= w4; px += 8) {
       __m256 acc = _mm256_set1_ps(w.b1[c]);
       for (int i = 0; i < w.in; ++i) {
@@ -503,6 +529,44 @@ void det_head_up(const float* head, int mid, int w4, int P, float* u) {
 
 }  // namespace
 
+namespace {
+
+// 16 output pixels of a row from ox, OUT maps: per channel 9 weight broadcasts and 18 loads for 18 FMAs, then
+// 4 broadcasts for 8 (each broadcast twice), 13 accumulators and temporaries in the 16 ymm; every pixel's chains as
+// the 8-pixel pass's.  row: the maps' row oy, planes H x W apart.
+template <int OUT>
+void head_pass16(const float* const* z, const DetHeadWeights& w, int P, int ox, float* row, int H, int W) {
+  const __m256 zero = _mm256_setzero_ps();
+  __m256 m[OUT][2];
+  for (int o = 0; o < OUT; ++o) m[o][0] = m[o][1] = _mm256_set1_ps(w.b3[o]);
+  for (int c = 0; c < w.mid; ++c) {
+    const float* wc = w.w2 + static_cast<size_t>(c) * 9;
+    __m256 a0 = _mm256_set1_ps(w.b2[c]), a1 = a0;
+    for (int ky = 0; ky < 3; ++ky) {
+      const float* zr = z[ky] + static_cast<size_t>(c) * P + ox;
+      for (int kx = 0; kx < 3; ++kx) {
+        const __m256 wv = _mm256_set1_ps(wc[ky * 3 + kx]);
+        a0 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(zr + kx), a0);
+        a1 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(zr + kx + 8), a1);
+      }
+    }
+    a0 = _mm256_max_ps(a0, zero);
+    a1 = _mm256_max_ps(a1, zero);
+    for (int o = 0; o < OUT; ++o) {
+      const __m256 wv = _mm256_set1_ps(w.w3[static_cast<size_t>(o) * w.mid + c]);
+      m[o][0] = _mm256_fmadd_ps(wv, a0, m[o][0]);
+      m[o][1] = _mm256_fmadd_ps(wv, a1, m[o][1]);
+    }
+  }
+  for (int o = 0; o < OUT; ++o) {
+    float* r = row + static_cast<int64_t>(o) * H * W + ox;
+    _mm256_storeu_ps(r, m[o][0]);
+    _mm256_storeu_ps(r + 8, m[o][1]);
+  }
+}
+
+}  // namespace
+
 void det_head_avx2(const float* x, int h4, int w4, const DetHeadWeights& w, float* maps, int row0, int row1) {
   const int H = 2 * h4, W = 2 * w4, P = W + 2, mid = w.mid, out = w.out;
   float* head = scratch_of<float>(Scratch::kA, static_cast<size_t>(mid) * (w4 + 4 * P));
@@ -529,6 +593,9 @@ void det_head_avx2(const float* x, int h4, int w4, const DetHeadWeights& w, floa
       z[ky] = u;
     }
     int ox = 0;
+    if (out == 4) {  // 16 pixels a pass, each broadcast used twice (fullerene's head: 4 maps)
+      for (; ox + 16 <= W; ox += 16) head_pass16<4>(z, w, P, ox, maps + static_cast<int64_t>(oy) * W, H, W);
+    }
     for (; ox + 8 <= W; ox += 8) {
       __m256 m[8];
       for (int o = 0; o < out; ++o) m[o] = _mm256_set1_ps(w.b3[o]);
@@ -642,6 +709,370 @@ ByteCounts count_beyond_avx2(const uint8_t* c, int w, int h, int64_t stride, int
   _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), above);
   if (any_above) n.above += lanes[0] + lanes[1] + lanes[2] + lanes[3];
   return n;
+}
+
+// The softmax: the scale and the max by vmulps and vmaxps (the max is the same whatever the order); exp_neg8 of
+// each less the max into 8 lanes, lane j mod 8 the reference's partial sum j, a tail's lanes past the row 0; the
+// lanes joined as the reference joins them (high half to low, then pairs, then the two); times 1 / the sum.
+void softmax_rows_avx2(float* rows, int n_rows, int n, float scale) {
+  const __m256 sc = _mm256_set1_ps(scale);
+  const int whole = n & ~7, tail = n - whole;
+  alignas(32) static const int32_t kLanes[16] = {-1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0};
+  const __m256i mask = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(kLanes + 8 - tail));
+  for (int i = 0; i < n_rows; ++i) {
+    float* row = rows + static_cast<size_t>(i) * n;
+    __m256 hi8 = _mm256_set1_ps(-INFINITY);
+    for (int j = 0; j < whole; j += 8) {
+      const __m256 x = _mm256_mul_ps(_mm256_loadu_ps(row + j), sc);
+      _mm256_storeu_ps(row + j, x);
+      hi8 = _mm256_max_ps(hi8, x);
+    }
+    float hi = -INFINITY;
+    for (int j = whole; j < n; ++j) {
+      row[j] *= scale;
+      hi = row[j] > hi ? row[j] : hi;
+    }
+    alignas(32) float lanes[8];
+    _mm256_store_ps(lanes, hi8);
+    for (int k = 0; k < 8; ++k) hi = lanes[k] > hi ? lanes[k] : hi;
+    const __m256 h = _mm256_set1_ps(hi);
+    __m256 acc = _mm256_setzero_ps();
+    for (int j = 0; j < whole; j += 8) {
+      const __m256 e = exp_neg8(_mm256_sub_ps(_mm256_loadu_ps(row + j), h));
+      _mm256_storeu_ps(row + j, e);
+      acc = _mm256_add_ps(acc, e);
+    }
+    if (tail) {
+      const __m256 e = exp_neg8(_mm256_sub_ps(_mm256_maskload_ps(row + whole, mask), h));
+      _mm256_maskstore_ps(row + whole, mask, e);
+      acc = _mm256_add_ps(acc, _mm256_and_ps(e, _mm256_castsi256_ps(mask)));
+    }
+    const __m128 q = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));  // s_k + s_k+4
+    const __m128 pr = _mm_add_ps(q, _mm_movehl_ps(q, q));                                   // (0+4)+(2+6), (1+5)+(3+7)
+    const float sum = _mm_cvtss_f32(_mm_add_ss(pr, _mm_shuffle_ps(pr, pr, 1)));
+    const __m256 inv = _mm256_set1_ps(1.0f / sum);
+    for (int j = 0; j < whole; j += 8) _mm256_storeu_ps(row + j, _mm256_mul_ps(_mm256_loadu_ps(row + j), inv));
+    const float inv1 = 1.0f / sum;
+    for (int j = whole; j < n; ++j) row[j] *= inv1;
+  }
+}
+
+// The stem: the stride-2 rows in a ring of three, each [w2 + 2 pixels][16 channels] with a zero pixel either side
+// (the second convolution's padding), a zero row for the rows past the map; 4 stride-2 pixels a step, per tap 4
+// broadcasts of the input and 2 weight vectors for 8 FMAs (the input rows copied with a zero either side). The
+// downsampling: each output pixel's 144 inputs gathered from the ring into L1 (9 taps of 16 contiguous channels,
+// in the reference's order), a 4-pixel by c2-channel tile (up to 12 accumulators) over them, per k c2 / 8 weight
+// vectors and 4 broadcasts; ReLU, then each channel's 4 pixels stored to the NCHW output.
+namespace {
+
+// The 4-pixel tile over the 144 inputs, NV vectors of 8 channels (c2 = 8 NV), ReLU'd into tile[pixel][channel].
+template <int NV>
+[[maybe_unused]] void stem_tile(const float* const* cols, const float* w2p, const float* b2, float (*tile)[24]) {
+  constexpr int kK = 144, kC2 = 8 * NV;
+  __m256 acc[4][NV];
+  for (int j = 0; j < NV; ++j) {
+    const __m256 bj = _mm256_loadu_ps(b2 + 8 * j);
+    for (int p = 0; p < 4; ++p) acc[p][j] = bj;
+  }
+  for (int k = 0; k < kK; ++k) {
+    __m256 b[NV];
+    for (int j = 0; j < NV; ++j) b[j] = _mm256_loadu_ps(w2p + static_cast<size_t>(k) * kC2 + 8 * j);
+    for (int p = 0; p < 4; ++p) {
+      const __m256 a = _mm256_broadcast_ss(cols[p] + k);
+      for (int j = 0; j < NV; ++j) acc[p][j] = _mm256_fmadd_ps(b[j], a, acc[p][j]);
+    }
+  }
+  const __m256 zero = _mm256_setzero_ps();
+  for (int p = 0; p < 4; ++p) {
+    for (int j = 0; j < NV; ++j) _mm256_store_ps(&tile[p][8 * j], _mm256_max_ps(acc[p][j], zero));
+  }
+}
+
+// fullerene's 24 channels: the 12 accumulators named (MSVC keeps an array of them in memory), 3 weight vectors and
+// a broadcast: the 16 ymm registers.
+void stem_tile24(const float* const* cols, const float* w2p, const float* b2, float (*tile)[24]) {
+  const float *p0 = cols[0], *p1 = cols[1], *p2 = cols[2], *p3 = cols[3];
+  __m256 a00 = _mm256_loadu_ps(b2), a01 = _mm256_loadu_ps(b2 + 8), a02 = _mm256_loadu_ps(b2 + 16);
+  __m256 a10 = a00, a11 = a01, a12 = a02, a20 = a00, a21 = a01, a22 = a02, a30 = a00, a31 = a01, a32 = a02;
+  for (int k = 0; k < 144; ++k) {
+    const float* wk = w2p + static_cast<size_t>(k) * 24;
+    const __m256 b0 = _mm256_loadu_ps(wk), b1 = _mm256_loadu_ps(wk + 8), b2v = _mm256_loadu_ps(wk + 16);
+    __m256 v = _mm256_broadcast_ss(p0 + k);
+    a00 = _mm256_fmadd_ps(b0, v, a00);
+    a01 = _mm256_fmadd_ps(b1, v, a01);
+    a02 = _mm256_fmadd_ps(b2v, v, a02);
+    v = _mm256_broadcast_ss(p1 + k);
+    a10 = _mm256_fmadd_ps(b0, v, a10);
+    a11 = _mm256_fmadd_ps(b1, v, a11);
+    a12 = _mm256_fmadd_ps(b2v, v, a12);
+    v = _mm256_broadcast_ss(p2 + k);
+    a20 = _mm256_fmadd_ps(b0, v, a20);
+    a21 = _mm256_fmadd_ps(b1, v, a21);
+    a22 = _mm256_fmadd_ps(b2v, v, a22);
+    v = _mm256_broadcast_ss(p3 + k);
+    a30 = _mm256_fmadd_ps(b0, v, a30);
+    a31 = _mm256_fmadd_ps(b1, v, a31);
+    a32 = _mm256_fmadd_ps(b2v, v, a32);
+  }
+  const __m256 z = _mm256_setzero_ps();
+  _mm256_store_ps(&tile[0][0], _mm256_max_ps(a00, z));
+  _mm256_store_ps(&tile[0][8], _mm256_max_ps(a01, z));
+  _mm256_store_ps(&tile[0][16], _mm256_max_ps(a02, z));
+  _mm256_store_ps(&tile[1][0], _mm256_max_ps(a10, z));
+  _mm256_store_ps(&tile[1][8], _mm256_max_ps(a11, z));
+  _mm256_store_ps(&tile[1][16], _mm256_max_ps(a12, z));
+  _mm256_store_ps(&tile[2][0], _mm256_max_ps(a20, z));
+  _mm256_store_ps(&tile[2][8], _mm256_max_ps(a21, z));
+  _mm256_store_ps(&tile[2][16], _mm256_max_ps(a22, z));
+  _mm256_store_ps(&tile[3][0], _mm256_max_ps(a30, z));
+  _mm256_store_ps(&tile[3][8], _mm256_max_ps(a31, z));
+  _mm256_store_ps(&tile[3][16], _mm256_max_ps(a32, z));
+}
+
+// The stem's 4 stride-2 pixels from q0 of a row: the 8 accumulators named; per tap 2 weight vectors and 4
+// broadcasts. in: the 3 padded input rows (w + 2 apart), at the pixels' first column.
+void stem_four(const float* in, int64_t pitch, const float* w1p, const float* b1, float* r) {
+  __m256 a0 = _mm256_loadu_ps(b1), b0 = _mm256_loadu_ps(b1 + 8);
+  __m256 a1 = a0, b1v = b0, a2 = a0, b2 = b0, a3 = a0, b3 = b0;
+  for (int ky = 0; ky < 3; ++ky) {
+    const float* p = in + ky * pitch;
+    for (int kx = 0; kx < 3; ++kx) {
+      const float* wt = w1p + (ky * 3 + kx) * 16;
+      const __m256 wa = _mm256_loadu_ps(wt), wb = _mm256_loadu_ps(wt + 8);
+      __m256 v = _mm256_broadcast_ss(p + kx);
+      a0 = _mm256_fmadd_ps(wa, v, a0);
+      b0 = _mm256_fmadd_ps(wb, v, b0);
+      v = _mm256_broadcast_ss(p + 2 + kx);
+      a1 = _mm256_fmadd_ps(wa, v, a1);
+      b1v = _mm256_fmadd_ps(wb, v, b1v);
+      v = _mm256_broadcast_ss(p + 4 + kx);
+      a2 = _mm256_fmadd_ps(wa, v, a2);
+      b2 = _mm256_fmadd_ps(wb, v, b2);
+      v = _mm256_broadcast_ss(p + 6 + kx);
+      a3 = _mm256_fmadd_ps(wa, v, a3);
+      b3 = _mm256_fmadd_ps(wb, v, b3);
+    }
+  }
+  const __m256 z = _mm256_setzero_ps();
+  _mm256_storeu_ps(r, _mm256_max_ps(a0, z));
+  _mm256_storeu_ps(r + 8, _mm256_max_ps(b0, z));
+  _mm256_storeu_ps(r + 16, _mm256_max_ps(a1, z));
+  _mm256_storeu_ps(r + 24, _mm256_max_ps(b1v, z));
+  _mm256_storeu_ps(r + 32, _mm256_max_ps(a2, z));
+  _mm256_storeu_ps(r + 40, _mm256_max_ps(b2, z));
+  _mm256_storeu_ps(r + 48, _mm256_max_ps(a3, z));
+  _mm256_storeu_ps(r + 56, _mm256_max_ps(b3, z));
+}
+
+}  // namespace
+
+void det_stem_avx2(const float* x, int h, int w, const DetStemWeights& sw, float* out, int row0, int row1) {
+  constexpr int kC1 = 16, kK = 9 * kC1;
+  const int h2 = h / 2, w2 = w / 2, h4 = h / 4, w4 = w / 4, c2 = sw.c2, nv = c2 / 8;
+  const size_t pitch = static_cast<size_t>(w2 + 2) * kC1;  // a ring row's floats
+  // One scratch block: the ring's 3 rows and a zero row, 3 padded input rows, W2 packed [k][c2] (k = tap * 16 + c),
+  // W1 packed [tap][16], and 4 pixels' 144 inputs.
+  const size_t ring_n = 4 * pitch, in_n = 3 * static_cast<size_t>(w + 2), w2_n = static_cast<size_t>(kK) * 24;
+  float* ring = scratch_of<float>(Scratch::kA, ring_n + in_n + w2_n + 144 + 4 * kK + 64);
+  float* zero_row = ring + 3 * pitch;
+  float* in = ring + ring_n;
+  float* w2p = in + in_n;
+  float* w1p = w2p + w2_n;
+  float* col = w1p + 144;
+  memset(zero_row, 0, sizeof(float) * pitch);
+  for (int d = 0; d < c2; ++d) {
+    for (int c = 0; c < kC1; ++c) {
+      for (int t = 0; t < 9; ++t) w2p[static_cast<size_t>(t * kC1 + c) * c2 + d] = sw.w2[(static_cast<size_t>(d) * kC1 + c) * 9 + t];
+    }
+  }
+  for (int c = 0; c < kC1; ++c) {
+    for (int t = 0; t < 9; ++t) w1p[t * 16 + c] = sw.w1[c * 9 + t];
+  }
+  int held[3] = {-1, -1, -1};
+  const __m256 zero = _mm256_setzero_ps();
+  const __m256 b1a = _mm256_loadu_ps(sw.b1), b1b = _mm256_loadu_ps(sw.b1 + 8);
+  auto stem_row = [&](int y2) -> const float* {
+    float* r = ring + static_cast<size_t>(y2 % 3) * pitch;
+    if (held[y2 % 3] == y2) return r;
+    for (int ky = 0; ky < 3; ++ky) {  // the input rows, a zero either side (and zero rows past the map)
+      float* p = in + static_cast<size_t>(ky) * (w + 2);
+      const int iy = 2 * y2 + ky - 1;
+      p[0] = 0.0f;
+      p[w + 1] = 0.0f;
+      if (iy < 0 || iy >= h) {
+        memset(p + 1, 0, sizeof(float) * w);
+      } else {
+        memcpy(p + 1, x + static_cast<size_t>(iy) * w, sizeof(float) * w);
+      }
+    }
+    memset(r, 0, sizeof(float) * kC1);  // the zero pixels either side
+    memset(r + pitch - kC1, 0, sizeof(float) * kC1);
+    int x2 = 0;
+    for (; x2 + 4 <= w2; x2 += 4) {  // padded index 2 x2 + kx; the ring's pixels from x2 + 1
+      stem_four(in + 2 * x2, w + 2, w1p, sw.b1, r + static_cast<size_t>(x2 + 1) * kC1);
+    }
+    for (; x2 < w2; ++x2) {
+      __m256 a0 = b1a, a1 = b1b;
+      for (int ky = 0; ky < 3; ++ky) {
+        const float* p = in + static_cast<size_t>(ky) * (w + 2) + 2 * x2;
+        for (int kx = 0; kx < 3; ++kx) {
+          const int t = ky * 3 + kx;
+          const __m256 v = _mm256_broadcast_ss(p + kx);
+          a0 = _mm256_fmadd_ps(_mm256_loadu_ps(w1p + t * 16), v, a0);
+          a1 = _mm256_fmadd_ps(_mm256_loadu_ps(w1p + t * 16 + 8), v, a1);
+        }
+      }
+      float* o = r + static_cast<size_t>(x2 + 1) * kC1;
+      _mm256_storeu_ps(o, _mm256_max_ps(a0, zero));
+      _mm256_storeu_ps(o + 8, _mm256_max_ps(a1, zero));
+    }
+    held[y2 % 3] = y2;
+    return r;
+  };
+  alignas(32) float tile[4][24];
+  for (int y4 = row0; y4 < row1; ++y4) {
+    const float* rows[3];
+    for (int ky = 0; ky < 3; ++ky) {
+      const int y2 = 2 * y4 + ky - 1;
+      rows[ky] = y2 < 0 || y2 >= h2 ? zero_row : stem_row(y2);
+    }
+    for (int x4 = 0; x4 < w4; x4 += 4) {
+      const int np = w4 - x4 < 4 ? w4 - x4 : 4;
+      for (int p = 0; p < np; ++p) {  // the pixel's 144 inputs: tap by tap, 16 channels each (ring pixel 2 x4 + kx)
+        float* cp = col + static_cast<size_t>(p) * kK;
+        for (int ky = 0; ky < 3; ++ky) {
+          for (int kx = 0; kx < 3; ++kx) {
+            memcpy(cp + (ky * 3 + kx) * kC1, rows[ky] + static_cast<size_t>(2 * (x4 + p) + kx) * kC1,
+                        sizeof(float) * kC1);
+          }
+        }
+      }
+      const float* cols[4];
+      for (int p = 0; p < 4; ++p) cols[p] = col + static_cast<size_t>(p < np ? p : 0) * kK;
+      switch (nv) {  // the accumulators in registers: the vector count a constant
+        case 1: stem_tile<1>(cols, w2p, sw.b2, tile); break;
+        case 2: stem_tile<2>(cols, w2p, sw.b2, tile); break;
+        default: stem_tile24(cols, w2p, sw.b2, tile); break;
+      }
+      for (int d = 0; d < c2; ++d) {
+        float* o = out + (static_cast<size_t>(d) * h4 + y4) * w4 + x4;
+        for (int p = 0; p < np; ++p) o[p] = tile[p][d];
+      }
+    }
+  }
+}
+
+// The dot products: 8 pairs in the lanes, each lane's chain an FMA a k from 0 (the rows by vgatherdps, the
+// indices kept under 2^31 by the caller's check), the pairs past a multiple of 8 one chain each by vfmadd231ss.
+void dot_chains_avx2(const float* a, const float* b, const int32_t* ia, const int32_t* ib, int pairs, int d,
+                     float* out) {
+  int p = 0;
+  const __m256i dv = _mm256_set1_epi32(d), one = _mm256_set1_epi32(1);
+  for (; p + 8 <= pairs; p += 8) {
+    __m256i xa = _mm256_mullo_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(ia + p)), dv);
+    __m256i xb = _mm256_mullo_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(ib + p)), dv);
+    __m256 acc = _mm256_setzero_ps();
+    for (int k = 0; k < d; ++k) {
+      acc = _mm256_fmadd_ps(_mm256_i32gather_ps(a, xa, 4), _mm256_i32gather_ps(b, xb, 4), acc);
+      xa = _mm256_add_epi32(xa, one);
+      xb = _mm256_add_epi32(xb, one);
+    }
+    _mm256_storeu_ps(out + p, acc);
+  }
+  for (; p < pairs; ++p) {
+    const float* x = a + static_cast<int64_t>(ia[p]) * d;
+    const float* y = b + static_cast<int64_t>(ib[p]) * d;
+    __m128 s = _mm_setzero_ps();
+    for (int k = 0; k < d; ++k) s = _mm_fmadd_ss(_mm_set_ss(x[k]), _mm_set_ss(y[k]), s);
+    out[p] = _mm_cvtss_f32(s);
+  }
+}
+
+// The GELU: erf_of on 8 lanes, the same operations in the same order (vminps/vmaxps, vmulps and vaddps apart,
+// one vdivps).
+void gelu_avx2(float* v, size_t n) {
+  const __m256 four = _mm256_set1_ps(4.0f), mfour = _mm256_set1_ps(-4.0f), half = _mm256_set1_ps(0.5f),
+               one = _mm256_set1_ps(1.0f), r2 = _mm256_set1_ps(0.70710678118654752f);
+  auto madd = [](__m256 a, __m256 b, float c) { return _mm256_add_ps(_mm256_mul_ps(a, b), _mm256_set1_ps(c)); };
+  alignas(32) float pad[8];
+  for (size_t i = 0; i < n; i += 8) {
+    const size_t m = n - i < 8 ? n - i : 8;  // a tail through the same lanes, from a copy (no inline erf_of here)
+    float* at = v + i;
+    if (m < 8) {
+      for (size_t k = 0; k < 8; ++k) pad[k] = k < m ? at[k] : 0.0f;
+      at = pad;
+    }
+    const __m256 x0 = _mm256_loadu_ps(at);
+    __m256 x = _mm256_mul_ps(x0, r2);
+    x = _mm256_max_ps(_mm256_min_ps(x, four), mfour);
+    const __m256 x2 = _mm256_mul_ps(x, x);
+    __m256 p = madd(x2, _mm256_set1_ps(kErfA13), kErfA11);
+    p = madd(x2, p, kErfA9);
+    p = madd(x2, p, kErfA7);
+    p = madd(x2, p, kErfA5);
+    p = madd(x2, p, kErfA3);
+    p = madd(x2, p, kErfA1);
+    p = _mm256_mul_ps(x, p);
+    __m256 q = madd(x2, _mm256_set1_ps(kErfB8), kErfB6);
+    q = madd(x2, q, kErfB4);
+    q = madd(x2, q, kErfB2);
+    q = madd(x2, q, kErfB0);
+    const __m256 erf = _mm256_div_ps(p, q);
+    _mm256_storeu_ps(at, _mm256_mul_ps(_mm256_mul_ps(half, x0), _mm256_add_ps(one, erf)));
+    if (m < 8) {
+      for (size_t k = 0; k < m; ++k) v[i + k] = pad[k];
+    }
+  }
+}
+
+// The tile: 8 frames in the lanes, kHeadBlock (10) classes a block in 10 accumulators; per channel j one load of
+// the 8 frames' feature, 10 broadcasts of the block's weights (contiguous: packed [block][k][10]) and 10
+// vfmadd231ps, from the biases, j in order: the reference's FMA chains. 13 ymm of 16. FMA-bound.
+void head_tile_avx2(const float* features, int k, int frames, int t0, const float* w, const float* b, int classes,
+                    float* tile) {
+  const int blocks = (classes + 9) / 10;
+  for (int cb = 0; cb < blocks; ++cb) {
+    const int c0 = cb * 10, nc = classes - c0 < 10 ? classes - c0 : 10;  // no std::min: no template here
+    __m256 acc[10];
+    for (int q = 0; q < 10; ++q) acc[q] = _mm256_set1_ps(q < nc ? b[c0 + q] : 0.0f);
+    const float* wb = w + static_cast<size_t>(cb) * k * 10;
+    const float* f = features + t0;
+    for (int j = 0; j < k; ++j) {
+      const __m256 fv = _mm256_loadu_ps(f + static_cast<size_t>(j) * frames);
+      const float* wj = wb + static_cast<size_t>(j) * 10;
+      for (int q = 0; q < 10; ++q) acc[q] = _mm256_fmadd_ps(_mm256_broadcast_ss(wj + q), fv, acc[q]);
+    }
+    for (int q = 0; q < nc; ++q) _mm256_storeu_ps(tile + static_cast<size_t>(c0 + q) * 8, acc[q]);
+  }
+}
+
+// 8 pixels a step: the BGRx bytes widened to 16 bits (vpunpck*bw), each pixel's (b, g, r, x) by (114, 587, 299, 0)
+// in two vpmaddwd sums, joined by vphaddd (which keeps the pixels in order, 0-3 in the low lane, 4-7 in the high);
+// + 500, and the division by 1000 exact as ((s >> 3) * 33555) >> 22 (vpsrld, vpmulld, vpsrld); packed to bytes.
+void bgrx_to_gray_avx2(const uint8_t* src, int64_t src_stride, int w, int h, uint8_t* dst, int64_t dst_stride) {
+  const __m256i weights = _mm256_setr_epi16(114, 587, 299, 0, 114, 587, 299, 0, 114, 587, 299, 0, 114, 587, 299, 0);
+  const __m256i zero = _mm256_setzero_si256(), half = _mm256_set1_epi32(500), magic = _mm256_set1_epi32(33555);
+  for (int y = 0; y < h; ++y) {
+    const uint8_t* row = src + y * src_stride;
+    uint8_t* out = dst + y * dst_stride;
+    int x = 0;
+    for (; x + 8 <= w; x += 8) {
+      const __m256i px = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row + 4 * x));
+      const __m256i lo = _mm256_madd_epi16(_mm256_unpacklo_epi8(px, zero), weights);
+      const __m256i hi = _mm256_madd_epi16(_mm256_unpackhi_epi8(px, zero), weights);
+      const __m256i s = _mm256_add_epi32(_mm256_hadd_epi32(lo, hi), half);
+      const __m256i q = _mm256_srli_epi32(_mm256_mullo_epi32(_mm256_srli_epi32(s, 3), magic), 22);
+      const __m256i b = _mm256_packus_epi16(_mm256_packus_epi32(q, zero), zero);
+      const uint32_t first = static_cast<uint32_t>(_mm_cvtsi128_si32(_mm256_castsi256_si128(b)));
+      const uint32_t second = static_cast<uint32_t>(_mm_cvtsi128_si32(_mm256_extracti128_si256(b, 1)));
+      std::memcpy(out + x, &first, 4);
+      std::memcpy(out + x + 4, &second, 4);
+    }
+    for (; x < w; ++x) {
+      const int bl = row[4 * x], g = row[4 * x + 1], r = row[4 * x + 2];
+      out[x] = static_cast<uint8_t>((299 * r + 587 * g + 114 * bl + 500) / 1000);
+    }
+  }
 }
 
 void ctc_argmax_avx2(const float* logits, int classes, int frames, int t_n, int32_t* ids, float* probs) {

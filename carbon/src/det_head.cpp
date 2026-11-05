@@ -1,5 +1,6 @@
 #include "det_head.h"
 
+#include <algorithm>
 #include <fstream>
 #include <iterator>
 
@@ -145,7 +146,112 @@ bool conv(const View& v, const Node* n, int64_t group, int k, Weights& w, Weight
   return true;
 }
 
+// A Conv of a 3x3 kernel, stride 2, padding 1, dilation 1, one group, with a bias (the stem).
+bool conv_s2(const View& v, const Node* n, Weights& w, Weights& b) {
+  if (!n || n->op != "Conv" || n->inputs.size() < 3 || n->i("group", 1) != 1) return false;
+  if (!all_are(n->ints("strides", {1, 1}), 2) || !all_are(n->ints("dilations", {1, 1}), 1)) return false;
+  if (!all_are(n->ints("pads", {0, 0, 0, 0}), 1) || n->s("auto_pad", "NOTSET") != "NOTSET") return false;
+  const auto wt = v.weights(n->inputs[1]), bt = v.weights(n->inputs[2]);
+  if (!wt || !bt || wt->dims.size() != 4 || wt->dims[2] != 3 || wt->dims[3] != 3) return false;
+  if (bt->dims.size() != 1 || bt->dims[0] != wt->dims[0]) return false;
+  w = *wt;
+  b = *bt;
+  return true;
+}
+
 }  // namespace
+
+bool with_det_stem(FusedHead& head) {
+  if (!head.cut || head.stem) return false;
+  onnx::Model m;
+  try {
+    m = onnx::parse(*head.cut);
+  } catch (const Error&) {
+    return false;
+  }
+  const Graph& g = m.graph;
+  std::vector<const onnx::ValueInfo*> inputs;
+  for (const onnx::ValueInfo& i : g.inputs) {
+    const bool init = std::any_of(g.initializers.begin(), g.initializers.end(),
+                                  [&](const TensorData& t) { return t.name == i.name; });
+    if (!init) inputs.push_back(&i);
+  }
+  if (inputs.size() != 1 || inputs[0]->dtype != onnx::kFloat || inputs[0]->dims.size() != 4 ||
+      inputs[0]->dims[1] != 1) {
+    return false;  // FP32, one channel
+  }
+  const View v{g};
+  // The input's one reader, a stride-2 convolution, then ReLU, a second, ReLU.
+  auto reader = [&](const std::string& t) -> const Node* {
+    const Node* only = nullptr;
+    for (const Node& n : g.nodes) {
+      for (const std::string& i : n.inputs) {
+        if (i != t) continue;
+        if (only && only != &n) return nullptr;
+        only = &n;
+      }
+    }
+    return only;
+  };
+  Weights w1, b1, w2, b2;
+  const Node* stem = reader(inputs[0]->name);
+  if (!conv_s2(v, stem, w1, b1) || w1.dims[1] != 1) return false;
+  const Node* r1 = reader(stem->outputs[0]);
+  if (!r1 || r1->op != "Relu") return false;
+  const Node* down = reader(r1->outputs[0]);
+  if (!conv_s2(v, down, w2, b2) || w2.dims[1] != w1.dims[0]) return false;
+  const Node* r2 = reader(down->outputs[0]);
+  if (!r2 || r2->op != "Relu") return false;
+  FusedStem s;
+  s.output = r2->outputs[0];
+  s.c1 = static_cast<int>(w1.dims[0]);
+  s.c2 = static_cast<int>(w2.dims[0]);
+  try {
+    head.cut = std::make_shared<const std::string>(onnx::cut_input(*head.cut, s.output, onnx::kFloat, {-1, s.c2, -1, -1}));
+  } catch (const Error&) {
+    return false;
+  }
+  s.w1 = std::move(w1.v);
+  s.b1 = std::move(b1.v);
+  s.w2 = std::move(w2.v);
+  s.b2 = std::move(b2.v);
+  head.stem = std::move(s);
+  return true;
+}
+
+std::optional<RecHead> fused_rec_head(const std::filesystem::path& file) {
+  std::ifstream f(file, std::ios::binary);
+  if (!f) return std::nullopt;
+  const std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  onnx::Model m;
+  try {
+    m = onnx::parse(bytes);
+  } catch (const Error&) {
+    return std::nullopt;
+  }
+  const Graph& g = m.graph;
+  if (g.outputs.size() != 1 || g.outputs[0].dtype != onnx::kFloat) return std::nullopt;  // FP32 files alone
+  const View v{g};
+  const Node* sq = v.producer(g.outputs[0].name);
+  if (!sq || sq->op != "Squeeze") return std::nullopt;
+  std::vector<int64_t> axes = sq->ints("axes", {});
+  if (axes.empty() && sq->inputs.size() > 1) {
+    const auto a = v.constant(sq->inputs[1]);
+    if (a) axes = a->ints();
+  }
+  if (axes != std::vector<int64_t>{2}) return std::nullopt;
+  Weights w, b;
+  const Node* head = v.producer(sq->inputs[0]);
+  if (!conv(v, head, 1, 1, w, b)) return std::nullopt;
+  RecHead r;
+  try {
+    r.cut = std::make_shared<const std::string>(onnx::cut(bytes, head->inputs[0], onnx::kFloat, {-1, w.dims[1], 1, -1}));
+  } catch (const Error&) {
+    return std::nullopt;
+  }
+  r.head = cpu::pack_rec_head(w.v.data(), b.v.data(), static_cast<int>(w.dims[1]), static_cast<int>(w.dims[0]));
+  return r;
+}
 
 std::optional<FusedHead> fused_det_head(const std::filesystem::path& file) {
   std::ifstream f(file, std::ios::binary);

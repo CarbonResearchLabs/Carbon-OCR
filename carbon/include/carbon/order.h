@@ -58,11 +58,24 @@ int block_label(std::string_view name);  // -1 for none of them
 std::vector<float> order_features(std::span<const LineBox> boxes, std::span<const std::string> texts, int width,
                                   int height);
 
+// The four pairwise heads computed where decode_order reads them (the native order model's).  head: 0
+// same_block, 1 table_row, 2 table_col, 3 table_cell.  Each value is the symmetric logit, the same bits as that
+// head's full matrix's entry.
+class OrderPairs {
+ public:
+  virtual ~OrderPairs() = default;
+  // the logits between consecutive lines of `order`: order.size() - 1 of them
+  virtual std::vector<float> chain(int head, std::span<const size_t> order) const = 0;
+  // the logits among `lines`, [m][m] row-major (the diagonal any value)
+  virtual std::vector<float> among(int head, std::span<const size_t> lines) const = 0;
+};
+
 struct OrderOutputs {
   int n = 0;
   std::span<const float> successor;                                 // (n+1) * (n+1)
   std::span<const float> same_block, table_row, table_col, table_cell;  // n * n
   std::span<const float> labels;                                    // n * kBlockLabels
+  const OrderPairs* pairs = nullptr;  // when set, the four pairwise heads' (their spans then empty)
 };
 
 struct OrderRule {

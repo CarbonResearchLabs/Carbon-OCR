@@ -20,7 +20,9 @@
 #include <algorithm>
 #include <cmath>
 #include <mutex>
+#include <vector>
 
+#include "carbon/cpu.h"
 #include "carbon/error.h"
 
 namespace carbon {
@@ -109,44 +111,41 @@ PdfPageSize PdfDocument::page_size(int page) const {
   return {size.width, size.height};
 }
 
-GrayImage PdfDocument::render(int page, double scale) const {
-  std::lock_guard<std::mutex> g(lock());
-  impl_->check_page(page);
-  Page p(impl_->doc, page);
-  if (!p.p) throw Error(impl_->path + ": page " + std::to_string(page) + " cannot be read");
+namespace {
+
+struct PageRef {  // a loaded page, as Page names it
+  FPDF_PAGE p;
+};
+
+// The page's gray at scale, as render gives it: into `into` when it fits into_bytes (out.pixels then empty).
+void render_page(FPDF_PAGE pg, const std::string& path, int page, double scale, GrayImage& out, uint8_t* into,
+                 size_t into_bytes) {
+  const PageRef p{pg};
   const int w = std::max(1, static_cast<int>(std::lround(FPDF_GetPageWidthF(p.p) * scale)));
   const int h = std::max(1, static_cast<int>(std::lround(FPDF_GetPageHeightF(p.p) * scale)));
   if (static_cast<int64_t>(w) * h > (int64_t{1} << 30)) {
-    throw Error(impl_->path + ": page " + std::to_string(page) + " at this scale is " + std::to_string(w) + " x " +
+    throw Error(path + ": page " + std::to_string(page) + " at this scale is " + std::to_string(w) + " x " +
                 std::to_string(h) + " px");
   }
   FPDF_BITMAP bmp = FPDFBitmap_Create(w, h, 0);  // BGRx
   if (!bmp) throw Error("PDFium: no memory for a " + std::to_string(w) + " x " + std::to_string(h) + " page");
   FPDFBitmap_FillRect(bmp, 0, 0, w, h, 0xFFFFFFFF);
   FPDF_RenderPageBitmap(bmp, p.p, 0, 0, w, h, 0, FPDF_ANNOT | FPDF_PRINTING);
-  GrayImage out;
   out.width = w;
   out.height = h;
-  out.pixels.resize(static_cast<size_t>(w) * h);
-  const auto* src = static_cast<const uint8_t*>(FPDFBitmap_GetBuffer(bmp));
-  const int stride = FPDFBitmap_GetStride(bmp);
-  for (int y = 0; y < h; ++y) {
-    const uint8_t* row = src + static_cast<int64_t>(y) * stride;
-    uint8_t* dst = out.pixels.data() + static_cast<int64_t>(y) * w;
-    for (int x = 0; x < w; ++x) {  // BT.601 luma, rounded: 0.299 R + 0.587 G + 0.114 B
-      const int b = row[4 * x], gr = row[4 * x + 1], r = row[4 * x + 2];
-      dst[x] = static_cast<uint8_t>((299 * r + 587 * gr + 114 * b + 500) / 1000);
-    }
+  const size_t bytes = static_cast<size_t>(w) * h;
+  uint8_t* gray = into && bytes <= into_bytes ? into : nullptr;
+  if (!gray) {
+    out.pixels.resize(bytes);
+    gray = out.pixels.data();
   }
+  // BT.601 luma, rounded: 0.299 R + 0.587 G + 0.114 B, on the CPU's vectors, the same bytes
+  cpu::bgrx_to_gray(static_cast<const uint8_t*>(FPDFBitmap_GetBuffer(bmp)), FPDFBitmap_GetStride(bmp), w, h, gray, w);
   FPDFBitmap_Destroy(bmp);
-  return out;
 }
 
-std::vector<LineBox> PdfDocument::pictures(int page, double scale) const {
-  std::lock_guard<std::mutex> g(lock());
-  impl_->check_page(page);
-  Page p(impl_->doc, page);
-  if (!p.p) throw Error(impl_->path + ": page " + std::to_string(page) + " cannot be read");
+std::vector<LineBox> page_pictures(FPDF_PAGE pg, double scale) {
+  const PageRef p{pg};
   constexpr int kFine = 64;  // as in chars(): FPDF_PageToDevice rounds to whole pixels
   const int dw = std::max(1, static_cast<int>(std::lround(FPDF_GetPageWidthF(p.p) * scale * kFine)));
   const int dh = std::max(1, static_cast<int>(std::lround(FPDF_GetPageHeightF(p.p) * scale * kFine)));
@@ -167,11 +166,8 @@ std::vector<LineBox> PdfDocument::pictures(int page, double scale) const {
   return out;
 }
 
-std::vector<PdfChar> PdfDocument::chars(int page, double scale) const {
-  std::lock_guard<std::mutex> g(lock());
-  impl_->check_page(page);
-  Page p(impl_->doc, page);
-  if (!p.p) throw Error(impl_->path + ": page " + std::to_string(page) + " cannot be read");
+std::vector<PdfChar> page_chars(FPDF_PAGE pg, double scale) {
+  const PageRef p{pg};
   FPDF_TEXTPAGE text = FPDFText_LoadPage(p.p);
   if (!text) return {};
   // The page's own space (unrotated, its box's origin anywhere) to the shown page's
@@ -229,8 +225,6 @@ std::vector<PdfChar> PdfDocument::chars(int page, double scale) const {
   return out;
 }
 
-namespace {
-
 // A structure element's type (UTF-16LE from PDFium), as UTF-8.
 std::string element_type(FPDF_STRUCTELEMENT e) {
   const unsigned long bytes = FPDF_StructElement_GetType(e, nullptr, 0);
@@ -254,13 +248,8 @@ std::string element_type(FPDF_STRUCTELEMENT e) {
   return out;
 }
 
-}  // namespace
-
-PdfStructure PdfDocument::structure(int page) const {
-  std::lock_guard<std::mutex> g(lock());
-  impl_->check_page(page);
-  Page p(impl_->doc, page);
-  if (!p.p) throw Error(impl_->path + ": page " + std::to_string(page) + " cannot be read");
+PdfStructure page_structure(FPDF_PAGE pg) {
+  const PageRef p{pg};
   PdfStructure out;
   FPDF_STRUCTTREE tree = FPDF_StructTree_GetForPage(p.p);
   if (!tree) return out;  // untagged, or its MarkInfo does not say Marked
@@ -305,5 +294,72 @@ PdfStructure PdfDocument::structure(int page) const {
   FPDF_StructTree_Close(tree);
   return out;
 }
+
+}  // namespace
+
+namespace {
+
+// The scale for a loaded page (PdfDocument::auto_scale).
+double page_auto_scale(FPDF_PAGE pg) {
+  constexpr double kLow = 200.0 / 72, kHigh = 400.0 / 72, kPx = 25;  // the small print's font size in pixels
+  std::vector<float> sizes;
+  for (const PdfChar& c : page_chars(pg, 1.0)) {
+    if (!c.generated && c.size > 0 && c.code != U' ') sizes.push_back(c.size);
+  }
+  if (sizes.size() >= 20) {
+    const auto at = sizes.begin() + static_cast<std::ptrdiff_t>(sizes.size() / 10);
+    std::nth_element(sizes.begin(), at, sizes.end());
+    return std::clamp(kPx / static_cast<double>(*at), kLow, kHigh);
+  }
+  double best = 0, area = 0;  // no text to speak of: the largest image's own resolution
+  const int n = FPDFPage_CountObjects(pg);
+  for (int i = 0; i < n; ++i) {
+    FPDF_PAGEOBJECT obj = FPDFPage_GetObject(pg, i);
+    if (!obj || FPDFPageObj_GetType(obj) != FPDF_PAGEOBJ_IMAGE) continue;
+    FPDF_IMAGEOBJ_METADATA m{};
+    float l = 0, b = 0, r = 0, t = 0;
+    if (!FPDFImageObj_GetImageMetadata(obj, pg, &m) || !FPDFPageObj_GetBounds(obj, &l, &b, &r, &t)) continue;
+    const double a = static_cast<double>(r - l) * (t - b);
+    if (a > area && m.horizontal_dpi > 0) {
+      area = a;
+      best = m.horizontal_dpi / 72.0;
+    }
+  }
+  return best > 0 ? std::clamp(best, kLow, kHigh) : kLow;
+}
+
+}  // namespace
+
+double PdfDocument::auto_scale(int page) const {
+  std::lock_guard<std::mutex> g(lock());
+  impl_->check_page(page);
+  Page p(impl_->doc, page);
+  if (!p.p) throw Error(impl_->path + ": page " + std::to_string(page) + " cannot be read");
+  return page_auto_scale(p.p);
+}
+
+PdfPage PdfDocument::page(int page, double scale, unsigned want, uint8_t* into, size_t into_bytes) const {
+  std::lock_guard<std::mutex> g(lock());
+  impl_->check_page(page);
+  Page p(impl_->doc, page);
+  if (!p.p) throw Error(impl_->path + ": page " + std::to_string(page) + " cannot be read");
+  PdfPage out;
+  if (!(scale > 0)) scale = page_auto_scale(p.p);
+  out.scale = scale;
+  if (want & kPdfImage) render_page(p.p, impl_->path, page, scale, out.image, into, into_bytes);
+  if (want & kPdfChars) out.chars = page_chars(p.p, scale);
+  if (want & kPdfPictures) out.pictures = page_pictures(p.p, scale);
+  if (want & kPdfStructure) out.structure = page_structure(p.p);
+  return out;
+}
+
+GrayImage PdfDocument::render(int page, double scale) const { return this->page(page, scale, kPdfImage).image; }
+std::vector<PdfChar> PdfDocument::chars(int page, double scale) const {
+  return this->page(page, scale, kPdfChars).chars;
+}
+std::vector<LineBox> PdfDocument::pictures(int page, double scale) const {
+  return this->page(page, scale, kPdfPictures).pictures;
+}
+PdfStructure PdfDocument::structure(int page) const { return this->page(page, 1.0, kPdfStructure).structure; }
 
 }  // namespace carbon

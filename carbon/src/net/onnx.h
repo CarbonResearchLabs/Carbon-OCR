@@ -86,4 +86,11 @@ std::map<std::string, std::string> metadata(const std::filesystem::path& path);
 std::string cut(std::string_view model, const std::string& output, int32_t dtype = kFloat,
                 const std::vector<int64_t>& dims = {});
 
+// The model cut at its input side: `input` (of `dtype`, of shape `dims`) its one graph input, the nodes the
+// outputs need with the walk back stopped there, and only the initializers they read; every other field as it was.
+// For the engine to run a model's first layers itself. Throws Error where a node the outputs need still reads the
+// old input (the tensor does not part the graph) or no node makes `input`.
+std::string cut_input(std::string_view model, const std::string& input, int32_t dtype = kFloat,
+                      const std::vector<int64_t>& dims = {});
+
 }  // namespace carbon::onnx

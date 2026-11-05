@@ -639,7 +639,9 @@ TEST(CpuDwconv, F16EveryKernelGivesTheReferenceBits) {
 // same bits as the same rows listed one pointer at a time.
 TEST(CpuGemm, GridRowsAreTheirList) {
   std::mt19937 rng(3);
-  const int cin = 20, cout = 24, width = 30, pw = width + 2, stride = 2, m = 14;  // 3x3, stride 2
+  // 20 channels, and 160 (10 KB of B a tap: the FP32 grid takes the taps in blocks on any L1D)
+  for (const int cin : {20, 160}) {
+  const int cout = 24, width = 30, pw = width + 2, stride = 2, m = 14;  // 3x3, stride 2
   std::vector<uint8_t> in8(static_cast<size_t>(3) * pw * cin + 64);
   std::vector<float> in32(in8.size());
   for (auto& v : in8) v = static_cast<uint8_t>(rng());
@@ -669,15 +671,19 @@ TEST(CpuGemm, GridRowsAreTheirList) {
         const PackedB pb = pack_b(b8.data(), 9 * cin, cout, isa, 9);
         gemm_u8s8({list8.data(), 9}, 5, pb, m, ew);
         gemm_u8s8(grid(in8.data(), int64_t{stride} * cin, 9, offsets.data()), 5, pb, m, eg);
-        dwconv_u8s8(grid(in8.data(), int64_t{stride} * cin, 9, offsets.data()), 5, b8.data(), cin, m, eg, isa);
-        dwconv_u8s8({list8.data(), 9}, 5, b8.data(), cin, m, ew, isa);
+        if (cin <= cout) {  // the depthwise writes cin channels: the outputs hold cout
+          dwconv_u8s8(grid(in8.data(), int64_t{stride} * cin, 9, offsets.data()), 5, b8.data(), cin, m, eg, isa);
+          dwconv_u8s8({list8.data(), 9}, 5, b8.data(), cin, m, ew, isa);
+        }
       } else {
         const PackedF32 pb = pack_f32(b32.data(), 9 * cin, cout, isa);
         gemm_f32({list32.data(), 9}, pb, m, ew);
         gemm_f32(grid(in32.data(), int64_t{stride} * cin, 9, offsets.data()), pb, m, eg);
       }
-      expect_same(want, got, m, cout, std::string(isa_name(isa)) + (int8 ? " int8" : " fp32"));
+      expect_same(want, got, m, cout, std::string(isa_name(isa)) + (int8 ? " int8" : " fp32") + " cin " +
+                                           std::to_string(cin));
     }
+  }
   }
 }
 
@@ -864,6 +870,218 @@ TEST(CpuCrops, CountBeyondAsTheReference) {
 
 // The deskew search's rows: every ISA's counts the reference's, for points across a page and past its edges (the
 // clamp), at angles either way, a count that is not a multiple of 4 (the tail).
+// The order model's softmax and GELU: every instruction set the reference's bits, rows of every length past
+// a vector (the tail's lanes), and erf within 2e-7 of std::erf.
+TEST(CpuOrder, SoftmaxAndGeluAreTheReference) {
+  std::mt19937 rng(9);
+  std::uniform_real_distribution<float> u(-30, 30);
+  for (int n : {1, 3, 8, 13, 64, 129}) {
+    std::vector<float> rows(static_cast<size_t>(5) * n);
+    for (float& v : rows) v = u(rng);
+    std::vector<float> want = rows;
+    cpu::softmax_rows(want.data(), 5, n, 0.125f, cpu::Isa::kScalar);
+    for (int i = 0; i < 5; ++i) {
+      double s = 0;
+      for (int j = 0; j < n; ++j) s += want[static_cast<size_t>(i) * n + j];
+      ASSERT_NEAR(s, 1.0, 1e-5);
+    }
+    std::vector<float> g(static_cast<size_t>(3) * n + 5);
+    for (float& v : g) v = u(rng) / 6;
+    std::vector<float> want_g = g;
+    cpu::gelu(want_g.data(), want_g.size(), cpu::Isa::kScalar);
+    for (cpu::Isa isa : cpu::isas_available()) {
+      std::vector<float> got = rows, got_g = g;
+      cpu::softmax_rows(got.data(), 5, n, 0.125f, isa);
+      cpu::gelu(got_g.data(), got_g.size(), isa);
+      ASSERT_EQ(got, want) << n << " on " << cpu::isa_name(isa);
+      ASSERT_EQ(got_g, want_g) << n << " on " << cpu::isa_name(isa);
+    }
+  }
+  // gelu(v) = 0.5 v (1 + erf(v / sqrt 2)): at v = x sqrt 2, erf(x) = gelu(v) / (0.5 v) - 1, against std::erf
+  double worst = 0;
+  for (int k = -3072; k <= 3072; ++k) {
+    const float x = k / 512.0f;
+    if (std::abs(x) < 0.05f) continue;  // near 0 the quotient's rounding, not erf's, dominates
+    const float v = x * 1.41421356237f;
+    std::vector<float> one = {v};
+    cpu::gelu(one.data(), 1, cpu::Isa::kScalar);
+    const double e = one[0] / (0.5 * static_cast<double>(v)) - 1.0;
+    worst = std::max(worst, std::abs(e - std::erf(static_cast<double>(v) / 1.4142135623730951)));
+  }
+  EXPECT_LT(worst, 2e-6) << "erf's worst error, through gelu's arithmetic";
+}
+
+// The stem on every instruction set: the two stride-2 convolutions (padding 1, ReLU each) written out plainly, each
+// an FMA chain from the bias (the first's taps row by row; the second's taps row by row, its channels in order within
+// each), bit for bit; fullerene's 16 -> 24 (the AVX2 kernel), 16 -> 8, and 8 -> 12 (the reference), maps not a multiple
+// of the kernels' steps, and row bands cut anywhere.
+TEST(CpuStem, TheStemIsItsTwoConvolutions) {
+  std::mt19937 rng(21);
+  std::normal_distribution<float> n(0.0f, 0.4f);
+  std::uniform_real_distribution<float> u(0.0f, 1.0f);
+  for (const auto& [c1, c2, h, w] : std::vector<std::array<int, 4>>{{16, 24, 32, 40}, {16, 8, 12, 28}, {8, 12, 16, 20},
+                                                                    {16, 24, 4, 4}, {16, 16, 20, 52}}) {
+    std::vector<float> x(static_cast<size_t>(h) * w), w1(c1 * 9), b1(c1), w2(static_cast<size_t>(c2) * c1 * 9), b2(c2);
+    for (float& v : x) v = u(rng) < 0.4f ? u(rng) : 0.0f;
+    for (auto* v : {&w1, &b1, &w2, &b2}) {
+      for (float& e : *v) e = n(rng);
+    }
+    const int h2 = h / 2, w2s = w / 2, h4 = h / 4, w4 = w / 4;
+    std::vector<float> s(static_cast<size_t>(c1) * h2 * w2s), want(static_cast<size_t>(c2) * h4 * w4);
+    for (int c = 0; c < c1; ++c) {
+      for (int y = 0; y < h2; ++y) {
+        for (int xx = 0; xx < w2s; ++xx) {
+          float acc = b1[c];
+          for (int ky = 0; ky < 3; ++ky) {
+            for (int kx = 0; kx < 3; ++kx) {
+              const int iy = 2 * y + ky - 1, ix = 2 * xx + kx - 1;
+              const float v = iy < 0 || iy >= h || ix < 0 || ix >= w ? 0.0f : x[static_cast<size_t>(iy) * w + ix];
+              acc = std::fma(w1[c * 9 + ky * 3 + kx], v, acc);
+            }
+          }
+          s[(static_cast<size_t>(c) * h2 + y) * w2s + xx] = acc > 0.0f ? acc : 0.0f;
+        }
+      }
+    }
+    for (int d = 0; d < c2; ++d) {
+      for (int y = 0; y < h4; ++y) {
+        for (int xx = 0; xx < w4; ++xx) {
+          float acc = b2[d];
+          for (int ky = 0; ky < 3; ++ky) {
+            for (int kx = 0; kx < 3; ++kx) {
+              const int iy = 2 * y + ky - 1, ix = 2 * xx + kx - 1;
+              for (int c = 0; c < c1; ++c) {
+                const float v = iy < 0 || iy >= h2 || ix < 0 || ix >= w2s ? 0.0f : s[(static_cast<size_t>(c) * h2 + iy) * w2s + ix];
+                acc = std::fma(w2[((static_cast<size_t>(d) * c1 + c) * 3 + ky) * 3 + kx], v, acc);
+              }
+            }
+          }
+          want[(static_cast<size_t>(d) * h4 + y) * w4 + xx] = acc > 0.0f ? acc : 0.0f;
+        }
+      }
+    }
+    const DetStemWeights sw{c1, c2, w1.data(), b1.data(), w2.data(), b2.data()};
+    for (Isa isa : isas_available()) {
+      std::vector<float> got(want.size(), -1.0f);
+      det_stem(x.data(), h, w, sw, got.data(), 0, h4, isa);
+      EXPECT_EQ(std::memcmp(got.data(), want.data(), want.size() * sizeof(float)), 0)
+          << isa_name(isa) << " " << c1 << "->" << c2 << " " << h << "x" << w;
+      std::vector<float> bands(want.size(), -1.0f);
+      const int cuts[] = {0, 1, h4 / 2, h4 / 2, h4};
+      for (int b = 0; b + 1 < 5; ++b) det_stem(x.data(), h, w, sw, bands.data(), cuts[b], cuts[b + 1], isa);
+      EXPECT_EQ(std::memcmp(bands.data(), want.data(), want.size() * sizeof(float)), 0) << isa_name(isa) << " in bands";
+    }
+  }
+}
+
+// The recognizer's head fused with CTC's argmax: on every instruction set, the ids and probabilities
+// ctc_argmax gives for the logits as FMA chains from the bias in channel order; classes not a multiple of the block
+// (23) and the model's (800), lines of frames not a multiple of the tile, a line shorter than its frames.
+TEST(CpuHead, FusedIsTheArgmaxOfItsLogits) {
+  std::mt19937 rng(5);
+  std::uniform_real_distribution<float> u(-1, 1);
+  for (int classes : {23, 800}) {
+    const int k = 64, frames = 37, t_n = 35;
+    std::vector<float> f(static_cast<size_t>(k) * frames), w(static_cast<size_t>(classes) * k), b(classes);
+    for (float& v : f) v = u(rng);
+    for (float& v : w) v = 0.3f * u(rng);
+    for (float& v : b) v = u(rng);
+    std::vector<float> logits(static_cast<size_t>(classes) * frames);
+    for (int c = 0; c < classes; ++c) {
+      for (int t = 0; t < frames; ++t) {
+        float acc = b[c];
+        for (int j = 0; j < k; ++j) acc = std::fma(w[static_cast<size_t>(c) * k + j], f[static_cast<size_t>(j) * frames + t], acc);
+        logits[static_cast<size_t>(c) * frames + t] = acc;
+      }
+    }
+    std::vector<int32_t> want_ids(frames, -1), ids;
+    std::vector<float> want_probs(frames, -1), probs;
+    cpu::ctc_argmax(logits.data(), classes, frames, t_n, want_ids.data(), want_probs.data(), cpu::Isa::kScalar);
+    const cpu::PackedHead head = cpu::pack_rec_head(w.data(), b.data(), k, classes);
+    for (cpu::Isa isa : cpu::isas_available()) {
+      ids.assign(frames, -1);
+      probs.assign(frames, -1);
+      cpu::ctc_head(f.data(), k, frames, t_n, head, ids.data(), probs.data(), isa);
+      ASSERT_EQ(ids, want_ids) << classes << " classes on " << cpu::isa_name(isa);
+      for (int t = 0; t < t_n; ++t) {
+        if (ids[t] != 0) ASSERT_EQ(probs[t], want_probs[t]) << "frame " << t << " on " << cpu::isa_name(isa);
+      }
+    }
+  }
+}
+
+// The cost on a line of the recognizer's size (k 256, 800 classes, 128 frames): the fused head against the same
+// logits by gemm_f32 and then ctc_argmax (CARBON_TIME).
+TEST(CpuHead, Time) {
+  if (!std::getenv("CARBON_TIME")) GTEST_SKIP() << "set CARBON_TIME to time it";
+  const int k = 256, classes = 800, frames = 128;
+  std::mt19937 rng(5);
+  std::uniform_real_distribution<float> u(-1, 1);
+  std::vector<float> f(static_cast<size_t>(k) * frames), w(static_cast<size_t>(classes) * k), b(classes);
+  for (float& v : f) v = u(rng);
+  for (float& v : w) v = 0.3f * u(rng);
+  for (float& v : b) v = u(rng);
+  const cpu::PackedHead head = cpu::pack_rec_head(w.data(), b.data(), k, classes);
+  std::vector<float> wt(static_cast<size_t>(k) * classes), ft(static_cast<size_t>(frames) * k);
+  for (int c = 0; c < classes; ++c) {
+    for (int j = 0; j < k; ++j) wt[static_cast<size_t>(j) * classes + c] = w[static_cast<size_t>(c) * k + j];
+  }
+  for (int t = 0; t < frames; ++t) {
+    for (int j = 0; j < k; ++j) ft[static_cast<size_t>(t) * k + j] = f[static_cast<size_t>(j) * frames + t];
+  }
+  const cpu::PackedF32 pb = cpu::pack_f32(wt.data(), k, classes, cpu::best_isa());
+  std::vector<float> logits(static_cast<size_t>(frames) * classes), lt(logits.size());
+  std::vector<int32_t> ids(frames);
+  std::vector<float> probs(frames);
+  auto time = [&](const char* what, const auto& fn) {
+    double best = 1e30;
+    for (int round = 0; round < 9; ++round) {
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int r = 0; r < 20; ++r) fn();
+      best = std::min(best, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 20);
+    }
+    std::printf("%s: %.3f ms a line\n", what, best);
+  };
+  time("fused head", [&] { cpu::ctc_head(f.data(), k, frames, frames, head, ids.data(), probs.data()); });
+  time("gemm_f32 to [frames][classes]", [&] {
+    cpu::Epilogue e;
+    e.bias = b.data();
+    e.out_f32 = logits.data();
+    e.out_ld = classes;
+    cpu::gemm_f32(cpu::rows_of(ft.data(), k), pb, frames, e);
+  });
+  for (int t = 0; t < frames; ++t) {
+    for (int c = 0; c < classes; ++c) lt[static_cast<size_t>(c) * frames + t] = logits[static_cast<size_t>(t) * classes + c];
+  }
+  time("ctc_argmax on [classes][frames]", [&] { cpu::ctc_argmax(lt.data(), classes, frames, frames, ids.data(), probs.data()); });
+}
+
+// PDFium's BGRx to gray on every instruction set: the reference's bytes, the extremes (white, black, each
+// channel alone at 255) and random pixels, odd widths, rows apart by strides of their own.
+TEST(CpuLuma, BgrxToGrayIsTheReference) {
+  std::mt19937 rng(11);
+  for (int w : {1, 7, 8, 9, 31, 64, 333}) {
+    const int h = 5;
+    const int64_t ss = 4 * w + 12, ds = w + 3;
+    std::vector<uint8_t> src(static_cast<size_t>(ss) * h);
+    for (uint8_t& v : src) v = static_cast<uint8_t>(rng());
+    const uint8_t edges[][3] = {{255, 255, 255}, {0, 0, 0}, {255, 0, 0}, {0, 255, 0}, {0, 0, 255}};
+    for (int k = 0; k < 5 && k < w; ++k) std::memcpy(&src[4 * k], edges[k], 3);
+    std::vector<uint8_t> want(static_cast<size_t>(ds) * h, 7), got;
+    for (int y = 0; y < h; ++y) {
+      for (int x = 0; x < w; ++x) {
+        const uint8_t* p = &src[static_cast<size_t>(y * ss + 4 * x)];
+        want[static_cast<size_t>(y * ds + x)] = static_cast<uint8_t>((299 * p[2] + 587 * p[1] + 114 * p[0] + 500) / 1000);
+      }
+    }
+    for (cpu::Isa isa : cpu::isas_available()) {
+      got.assign(want.size(), 7);
+      cpu::bgrx_to_gray(src.data(), ss, w, h, got.data(), ds, isa);
+      ASSERT_EQ(got, want) << "width " << w << " on " << cpu::isa_name(isa);
+    }
+  }
+}
+
 TEST(CpuSkew, RowsAreTheReferences) {
   std::mt19937 rng(11);
   std::uniform_real_distribution<float> px(-900.0f, 900.0f);
@@ -999,7 +1217,9 @@ TEST(Cpu, DetectorHeadInOnePassAsItsStepsGiveIt) {
   std::mt19937 rng(5);
   std::normal_distribution<float> n(0.0f, 0.5f);
   for (const auto& [in, mid, out, h4, w4] : std::vector<std::array<int, 5>>{{5, 3, 4, 7, 13}, {8, 8, 4, 4, 6},
-                                                                             {32, 16, 4, 3, 11}, {2, 2, 1, 1, 1}}) {
+                                                                             {32, 16, 4, 3, 11}, {2, 2, 1, 1, 1},
+                                                                             {6, 6, 4, 2, 21}, {32, 16, 4, 2, 40},
+                                                                             {3, 5, 3, 2, 17}}) {
     std::vector<float> x(static_cast<size_t>(in) * h4 * w4), w1(mid * in), b1(mid), w2(mid * 9), b2(mid), w3(out * mid),
         b3(out);
     for (auto* v : {&x, &w1, &b1, &w2, &b2, &w3, &b3}) {

@@ -36,6 +36,62 @@ struct LineMeta {
 
 constexpr int kThreads = 128;
 
+// The fused crop: what a line's block needs, its region in both axes.
+struct LineRegion {
+  double x0, x1, y0, y1;
+  int width, page;
+};
+constexpr int kMaxTaps = 32;  // the fused kernel's taps a column or a row, in registers and shared memory
+
+// A block for each (128-column tile, line): the line's vertical coefficients made once into shared memory; each
+// thread's horizontal taps for its column, in registers; the horizontal pass over the line's source rows into a
+// shared tile [rows][128] (a column each thread's own, so it needs no barrier); the vertical pass from it. The
+// bytes of horizontal_pass and vertical_pass: the same coefficients, sums and rounding.
+__global__ void __launch_bounds__(kThreads) crop_fused(const LineRegion* lines, const DevicePage* pages, int height,
+                                                       int out_width, int kv, uint8_t* out) {
+  extern __shared__ int32_t smem[];
+  const int i = blockIdx.y, tid = threadIdx.x;
+  const LineRegion m = lines[i];
+  const int xx = blockIdx.x * kThreads + tid;
+  if (blockIdx.x * kThreads >= m.width) return;  // the whole block: past this line's columns
+  int32_t* vk = smem;                       // [height][kv]
+  int32_t* vfirst = vk + height * kv;       // [height]
+  int32_t* vcount = vfirst + height;        // [height]
+  uint8_t* tile = reinterpret_cast<uint8_t*>(vcount + height);  // [rows][kThreads]
+  const detail::Filter fy = detail::filter_for(m.y0, m.y1, height);
+  for (int yy = tid; yy < height; yy += kThreads) {
+    int c = 0;
+    vfirst[yy] = detail::coefficients(fy, m.y0, yy, vk + yy * kv, &c);
+    vcount[yy] = c;
+  }
+  const bool live = xx < m.width;
+  int32_t hk[kMaxTaps];
+  int hcount = 0, hfirst = 0;
+  if (live) hfirst = detail::coefficients(detail::filter_for(m.x0, m.x1, m.width), m.x0, xx, hk, &hcount);
+  __syncthreads();
+  if (!live) return;
+  const int top = vfirst[0], rows = vfirst[height - 1] + vcount[height - 1] - top;
+  const DevicePage p = pages[m.page];
+  for (int r = 0; r < rows; ++r) {
+    const int y = top + r;
+    const uint8_t* row = (y >= 0 && y < p.height) ? p.data + static_cast<int64_t>(y) * p.stride : nullptr;
+    int32_t ss = detail::kHalf;
+    for (int t = 0; t < hcount; ++t) {
+      const int x = hfirst + t;
+      ss += ((row && x >= 0 && x < p.width) ? row[x] : 255) * hk[t];
+    }
+    tile[r * kThreads + tid] = detail::clip8(ss);
+  }
+  uint8_t* o = out + static_cast<size_t>(i) * height * out_width + xx;
+  for (int yy = 0; yy < height; ++yy) {
+    const int32_t* k = vk + yy * kv;
+    const uint8_t* src = tile + (vfirst[yy] - top) * kThreads + tid;
+    int32_t ss = detail::kHalf;
+    for (int t = 0; t < vcount[yy]; ++t) ss += src[t * kThreads] * k[t];
+    o[static_cast<size_t>(yy) * out_width] = detail::clip8(ss);
+  }
+}
+
 __global__ void horizontal_coefficients(const LineMeta* lines, int max_w, int kh, int32_t* hk,
                                         int32_t* hfirst, int32_t* hcount) {
   const int i = blockIdx.y, xx = blockIdx.x * kThreads + threadIdx.x;
@@ -123,9 +179,9 @@ __device__ void count_in(int* hist, unsigned active, int v) {
 // flip (four pixels to an XOR), and the padding with the flipped crop's ground.
 // Widths and out_width are multiples of 4, `out` 4-byte aligned.
 __global__ void __launch_bounds__(kFinishThreads) finish(const int32_t* widths, int height, int out_width, int margin,
-                                                         uint8_t* out) {
+                                                         bool need_dark, uint8_t* out) {
   __shared__ int hist[256];
-  __shared__ int sums[2][kFinishThreads / 32];
+  __shared__ int sums[3][kFinishThreads / 32];
   __shared__ int rank[2];
   const int i = blockIdx.x, w = widths[i], tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   uint8_t* c = out + static_cast<size_t>(i) * height * out_width;
@@ -159,27 +215,32 @@ __global__ void __launch_bounds__(kFinishThreads) finish(const int32_t* widths, 
     const int hi = ground + margin, lo = ground - margin;  // lighter: v >= hi; darker: v <= lo
     const uint32_t hi4 = 0x01010101u * static_cast<uint32_t>(hi <= 255 ? hi : 0);
     const uint32_t lo4 = 0x01010101u * static_cast<uint32_t>(lo >= 0 ? lo : 0);
-    int lighter = 0, darker = 0;
+    int lighter = 0, darker = 0, dark = 0;
+    const uint32_t mid4 = 0x7F7F7F7Fu;  // bytes at most 127
     for (int y = 0; y < height; ++y) {
       const uint32_t* row = px + y * row_words;
       for (int k = tid; k < words; k += kFinishThreads) {
         const uint32_t q = row[k];
         lighter += __popc(__vcmpgeu4(q, hi4));
         darker += __popc(__vcmpleu4(q, lo4));
+        if (need_dark) dark += __popc(__vcmpleu4(q, mid4));
       }
     }
     lighter = hi <= 255 ? __reduce_add_sync(0xffffffffu, static_cast<unsigned>(lighter)) >> 3 : 0;
     darker = lo >= 0 ? __reduce_add_sync(0xffffffffu, static_cast<unsigned>(darker)) >> 3 : 0;
+    dark = __reduce_add_sync(0xffffffffu, static_cast<unsigned>(dark)) >> 3;
     if (lane == 0) {
       sums[0][warp] = lighter;
       sums[1][warp] = darker;
+      sums[2][warp] = dark;
     }
     __syncthreads();
     if (warp == 0) {
       const bool held = lane < kFinishThreads / 32;
-      const unsigned l = held ? sums[0][lane] : 0, d = held ? sums[1][lane] : 0;
+      const unsigned l = held ? sums[0][lane] : 0, d = held ? sums[1][lane] : 0, k = held ? sums[2][lane] : 0;
       const unsigned tl = __reduce_add_sync(0xffffffffu, l), td = __reduce_add_sync(0xffffffffu, d);
-      if (lane == 0) rank[0] = tl > td;
+      const unsigned tk = __reduce_add_sync(0xffffffffu, k);
+      if (lane == 0) rank[0] = tl > td && (!need_dark || 2 * static_cast<int64_t>(tk) > static_cast<int64_t>(w) * height);
     }
     __syncthreads();
     flip = rank[0];
@@ -262,6 +323,63 @@ void crop_lines(std::span<const DevicePage> pages, std::span<const int32_t> page
   if (n == 0) return;
   if (page_of.size() < boxes.size()) throw Error("cuda::crop_lines: page_of is shorter than boxes");
 
+  // The fused kernel where every line's taps fit its registers and its source rows a shared tile: the
+  // regions alone go up, the coefficients are made on the device. Else the kernels below, a pass each.
+  {
+    std::vector<LineRegion> regions(n);
+    std::vector<int32_t> width_of(n);
+    int kh = 1, kv = 1, max_w = 1, max_rows = 1;
+    for (int i = 0; i < n; ++i) {
+      const CropRegion r = crop_region(boxes[i], rule);
+      if (r.width > out_width) {
+        throw Error("cuda::crop_lines: line " + std::to_string(i) + " is " + std::to_string(r.width) +
+                    " px wide, the batch " + std::to_string(out_width));
+      }
+      if (page_of[i] < 0 || page_of[i] >= static_cast<int>(pages.size())) {
+        throw Error("cuda::crop_lines: line " + std::to_string(i) + " has no page " + std::to_string(page_of[i]));
+      }
+      regions[i] = {r.x0, r.x1, r.y0, r.y1, r.width, page_of[i]};
+      width_of[i] = r.width;
+      const detail::Filter fy = detail::filter_for(r.y0, r.y1, h);
+      kh = std::max(kh, detail::max_taps(detail::filter_for(r.x0, r.x1, r.width)));
+      kv = std::max(kv, detail::max_taps(fy));
+      max_w = std::max(max_w, r.width);
+      int32_t k[kMaxTaps * 4];
+      int c0 = 0, c1 = 0;
+      if (detail::max_taps(fy) <= kMaxTaps * 4) {
+        const int top = detail::coefficients(fy, r.y0, 0, k, &c0);
+        const int last = detail::coefficients(fy, r.y0, h - 1, k, &c1);
+        max_rows = std::max(max_rows, last + c1 - top);
+      } else {
+        max_rows = INT32_MAX / 2;
+      }
+    }
+    const size_t shared = (static_cast<size_t>(h) * kv + 2 * h) * sizeof(int32_t) +
+                          static_cast<size_t>(max_rows) * kThreads;
+    int device = 0, limit = 0;
+    check(cudaGetDevice(&device), "cudaGetDevice");
+    check(cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device), "the shared memory");
+    if (kh <= kMaxTaps && kv <= kMaxTaps && shared <= static_cast<size_t>(limit) && out_width % 4 == 0 &&
+        reinterpret_cast<uintptr_t>(out) % 4 == 0) {
+      if (shared > 48 * 1024) {
+        check(cudaFuncSetAttribute(crop_fused, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared)),
+              "the fused crop's shared memory");
+      }
+      const std::vector<DevicePage> page_list(pages.begin(), pages.end());
+      Buffer<LineRegion> d_regions(regions, s);
+      Buffer<DevicePage> d_pages(page_list, s);
+      const unsigned bx = static_cast<unsigned>((max_w + kThreads - 1) / kThreads);
+      crop_fused<<<dim3(bx, n), kThreads, shared, s>>>(d_regions.get(), d_pages.get(), h, out_width, kv, out);
+      check(cudaMemcpyAsync(widths, width_of.data(), n * sizeof(int32_t), cudaMemcpyHostToDevice, s),
+            "copy the widths");
+      finish<<<n, kFinishThreads, 0, s>>>(widths, h, out_width, rule.flip_margin, rule.flip_needs_dark, out);
+      check(cudaGetLastError(), "crop kernels");
+      // No sync: the buffers are freed in the stream's order, and the pageable copies were taken before they
+      // returned; the caller's next work on the stream follows the crops.
+      return;
+    }
+  }
+
   // The regions and the vertical coefficients on the host (32 rows a line); the
   // horizontal ones, one per output column, on the device.
   std::vector<LineMeta> meta(n);
@@ -320,7 +438,7 @@ void crop_lines(std::span<const DevicePage> pages, std::span<const int32_t> page
   check(cudaMemcpyAsync(widths, width_of.data(), n * sizeof(int32_t), cudaMemcpyHostToDevice, s),
         "copy the widths");
   if (out_width % 4 == 0 && reinterpret_cast<uintptr_t>(out) % 4 == 0) {
-    finish<<<n, kFinishThreads, 0, s>>>(widths, h, out_width, rule.flip_margin, out);
+    finish<<<n, kFinishThreads, 0, s>>>(widths, h, out_width, rule.flip_margin, rule.flip_needs_dark, out);
   } else {
     throw Error("cuda::crop_lines: the rows must be 4-byte aligned (out_width a multiple of 4)");
   }
@@ -344,7 +462,8 @@ void finish_crops(uint8_t* out, int n, int out_width, std::span<const int32_t> w
   }
   const std::vector<int32_t> w(widths.begin(), widths.begin() + n);
   Buffer<int32_t> d_w(w, s);
-  finish<<<n, kFinishThreads, 0, s>>>(d_w.get(), rule.height, out_width, rule.flip_margin, out);
+  finish<<<n, kFinishThreads, 0, s>>>(d_w.get(), rule.height, out_width, rule.flip_margin, rule.flip_needs_dark,
+                                       out);
   check(cudaGetLastError(), "finish_crops");
 }
 

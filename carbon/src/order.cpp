@@ -68,15 +68,16 @@ float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 // means the last pair, the groups scanned in order, each with those after it). Each
 // group keeps its best partner after it, so a merge rescans only the groups whose
 // partner it changed: about O(m^2) in all, where scanning every pair a merge was O(m^3).
-std::vector<std::vector<size_t>> cluster(const std::vector<size_t>& items, std::span<const float> logits, size_t n,
-                                         float join) {
+// logit(a, b): the head's logit between items[a] and items[b]
+template <typename Logit>
+std::vector<std::vector<size_t>> cluster(const std::vector<size_t>& items, const Logit& logit, float join) {
   const size_t m = items.size();
   std::vector<std::vector<size_t>> g;
   for (size_t i : items) g.push_back({i});
   std::vector<double> s(m * m, 0.0);  // the summed probabilities between two groups' members
   for (size_t a = 0; a < m; ++a) {
     for (size_t b = a + 1; b < m; ++b) {
-      s[a * m + b] = (sigmoid(logits[items[a] * n + items[b]]) + sigmoid(logits[items[b] * n + items[a]])) / 2;
+      s[a * m + b] = (sigmoid(logit(a, b)) + sigmoid(logit(b, a))) / 2;
       s[b * m + a] = s[a * m + b];  // the same sum either way round
     }
   }
@@ -201,9 +202,10 @@ std::vector<float> order_features(std::span<const LineBox> boxes, std::span<cons
 PageOrder decode_order(const OrderOutputs& out, std::span<const LineBox> boxes, const OrderRule& rule) {
   const int n = out.n;
   const size_t N = static_cast<size_t>(n), T = N + 1;
-  if (boxes.size() != N || out.successor.size() != T * T || out.same_block.size() != N * N ||
-      out.table_row.size() != N * N || out.table_col.size() != N * N || out.table_cell.size() != N * N ||
-      out.labels.size() != N * kBlockLabels) {
+  const bool whole = !out.pairs;  // the four heads' matrices, else their pairs where read
+  if (boxes.size() != N || out.successor.size() != T * T || out.labels.size() != N * kBlockLabels ||
+      (whole && (out.same_block.size() != N * N || out.table_row.size() != N * N || out.table_col.size() != N * N ||
+                 out.table_cell.size() != N * N))) {
     throw Error("decode_order: outputs not the size of " + std::to_string(n) + " lines");
   }
   PageOrder po;
@@ -279,9 +281,12 @@ PageOrder decode_order(const OrderOutputs& out, std::span<const LineBox> boxes, 
     for (size_t k = 1; k + 1 < chain.size(); ++k) po.order.push_back(chain[k] - 1);
   }
   // blocks: runs of the order whose neighbours share a block
+  const std::vector<float> links = whole ? std::vector<float>{} : out.pairs->chain(0, po.order);
   for (size_t k = 0; k < N; ++k) {
     const size_t i = po.order[k];
-    if (k == 0 || sigmoid(out.same_block[po.order[k - 1] * N + i]) < rule.join) po.blocks.emplace_back();
+    if (k == 0 || sigmoid(whole ? out.same_block[po.order[k - 1] * N + i] : links[k - 1]) < rule.join) {
+      po.blocks.emplace_back();
+    }
     po.blocks.back().lines.push_back(i);
   }
   for (OrderBlock& b : po.blocks) {
@@ -297,7 +302,14 @@ PageOrder decode_order(const OrderOutputs& out, std::span<const LineBox> boxes, 
     b.confidence = static_cast<float>(mean[b.label]);
     if (b.label != block_label("Table")) continue;
     // cells, then rows and columns of cells
-    std::vector<std::vector<size_t>> cells = cluster(b.lines, out.table_cell, N, rule.join);
+    // a head's clusters of these items: from its matrix, or its logits among them
+    auto clusters = [&](const std::vector<size_t>& items, int head, std::span<const float> logits) {
+      if (whole) return cluster(items, [&](size_t a, size_t c) { return logits[items[a] * N + items[c]]; }, rule.join);
+      const std::vector<float> among = out.pairs->among(head, items);
+      const size_t m = items.size();
+      return cluster(items, [&](size_t a, size_t c) { return among[a * m + c]; }, rule.join);
+    };
+    std::vector<std::vector<size_t>> cells = clusters(b.lines, 3, out.table_cell);
     std::vector<size_t> place(N);  // a line's place in the block's order
     for (size_t k = 0; k < b.lines.size(); ++k) place[b.lines[k]] = k;
     for (auto& c : cells) {  // a cell's lines in reading order
@@ -305,8 +317,8 @@ PageOrder decode_order(const OrderOutputs& out, std::span<const LineBox> boxes, 
     }
     std::vector<size_t> heads(cells.size());  // a cell stands for its lines by its first
     for (size_t c = 0; c < cells.size(); ++c) heads[c] = cells[c].front();
-    auto groups = [&](std::span<const float> logits, bool rows) {
-      std::vector<std::vector<size_t>> g = cluster(heads, logits, N, rule.join);
+    auto groups = [&](std::span<const float> logits, int head, bool rows) {
+      std::vector<std::vector<size_t>> g = clusters(heads, head, logits);
       auto at = [&](const std::vector<size_t>& v) {  // the group's mean centre across it
         double s = 0;
         for (size_t i : v) s += rows ? boxes[i].y0 + boxes[i].y1 : boxes[i].x0 + boxes[i].x1;
@@ -319,7 +331,7 @@ PageOrder decode_order(const OrderOutputs& out, std::span<const LineBox> boxes, 
       }
       return of;
     };
-    const std::vector<int> row = groups(out.table_row, true), col = groups(out.table_col, false);
+    const std::vector<int> row = groups(out.table_row, 1, true), col = groups(out.table_col, 2, false);
     for (auto& c : cells) b.cells.push_back({row[c.front()], col[c.front()], std::move(c)});
     std::sort(b.cells.begin(), b.cells.end(),
               [](const TableCell& x, const TableCell& y) { return x.row != y.row ? x.row < y.row : x.col < y.col; });

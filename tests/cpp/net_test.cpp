@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -187,6 +188,73 @@ class ScopedEnv {
   }
   const char* name_;
 };
+
+// The detector's upsamplings read in place by the convolutions whose residual they are, not written: the same
+// bits as with them written (CARBON_NATIVE_UPSAMPLE_IN_PLACE=0), FP32, int8 and FP16 (its tensors FP32 and FP16), on
+// every instruction set.
+TEST(Net, TheUpsamplingReadInPlaceIsTheUpsamplingWritten) {
+  auto io = read_io(data("native-det.io"));
+  std::vector<Tensor> in;
+  in.push_back(std::move(io[0].second));
+  for (const char* file : {"native-det.onnx", "native-det.int8.onnx", "native-det.fp16.onnx"}) {
+    for (const char* act : {"0", "1"}) {
+      const ScopedEnv tensors("CARBON_FP16_ACTIVATIONS", act);
+      for (cpu::Isa isa : cpu::isas_available()) {
+        SessionOptions o;
+        o.isa = cpu::isa_name(isa);
+        std::vector<Tensor> written;
+        {
+          const ScopedEnv off("CARBON_NATIVE_UPSAMPLE_IN_PLACE", "0");
+          written = open_session(Backend::kNative, data(file), o)->run(in);
+        }
+        const std::vector<Tensor> read = open_session(Backend::kNative, data(file), o)->run(in);
+        ASSERT_EQ(read.size(), written.size());
+        for (size_t k = 0; k < read.size(); ++k) {
+          ASSERT_EQ(read[k].shape(), written[k].shape());
+          ASSERT_EQ(std::memcmp(read[k].raw(), written[k].raw(), read[k].bytes()), 0)
+              << file << ", FP16 tensors " << act << ", on " << o.isa;
+        }
+      }
+    }
+  }
+}
+
+// FP16 tensors on an instruction set without FP16 arithmetic, each input row widened once into an FP32 ring:
+// the same bits as a value widened a tap (CARBON_NATIVE_WIDEN_ONCE=0), every network, on every such instruction set,
+// and a second run of other shapes, then the first again, the same.
+TEST(Net, Fp16TensorsWidenedOnceAreWidenedATap) {
+  const ScopedEnv tensors("CARBON_FP16_ACTIVATIONS", "1");
+  for (const char* name : {"native-det", "native-rec", "native-cls"}) {
+    auto io = read_io(data(std::string(name) + ".io"));
+    std::vector<Tensor> in;
+    in.push_back(std::move(io[0].second));
+    const std::filesystem::path file = data(std::string(name) + ".fp16.onnx");
+    for (cpu::Isa isa : cpu::isas_available()) {
+      if (cpu::f16_arithmetic(isa)) continue;
+      SessionOptions o;
+      o.isa = cpu::isa_name(isa);
+      std::vector<Tensor> tap;
+      {
+        const ScopedEnv off("CARBON_NATIVE_WIDEN_ONCE", "0");
+        tap = open_session(Backend::kNative, file, o)->run(in);
+      }
+      auto s = open_session(Backend::kNative, file, o);
+      const std::vector<Tensor> once = s->run(in);
+      Shape other = in[0].shape();
+      other[0] = 1;
+      other[3] += 8;
+      std::vector<Tensor> in2;
+      in2.push_back(Tensor(DType::kFloat32, other));
+      s->run(in2);
+      const std::vector<Tensor> again = s->run(in);
+      ASSERT_EQ(once.size(), tap.size());
+      for (size_t k = 0; k < once.size(); ++k) {
+        ASSERT_EQ(std::memcmp(once[k].raw(), tap[k].raw(), once[k].bytes()), 0) << name << " on " << o.isa;
+        ASSERT_EQ(std::memcmp(again[k].raw(), tap[k].raw(), once[k].bytes()), 0) << name << " again on " << o.isa;
+      }
+    }
+  }
+}
 
 // The decisions the engine takes from an output: the best class along the
 // channels (a recognizer's frames, a classifier's line), or for a detector's
@@ -435,6 +503,88 @@ TEST(Net, TheDetectorCutBeforeItsHeadGivesItsMaps) {
     EXPECT_LE(worst, c.tolerance * most) << c.file << " on " << backend_name(c.backend);
   }
   EXPECT_FALSE(detail::fused_det_head(data("native-rec.onnx")).has_value());  // no detector head there
+}
+
+// The time on a real detector (CARBON_DET_TIME: its det.onnx) at 1024 x 800, one thread: ONNX Runtime from the
+// ink map against the engine's stem and ONNX Runtime from the stride-4 tensor, the head the engine's in both.
+TEST(Net, DetStemTime) {
+  const char* file = std::getenv("CARBON_DET_TIME");
+  if (!file) GTEST_SKIP() << "set CARBON_DET_TIME to a det.onnx to time it";
+  auto head = detail::fused_det_head(file);
+  ASSERT_TRUE(head.has_value());
+  auto stemmed = head;
+  ASSERT_TRUE(detail::with_det_stem(*stemmed));
+  SessionOptions a, b;
+  a.model_bytes = head->cut;
+  b.model_bytes = stemmed->cut;
+  const auto front = open_session(Backend::kOnnxRuntime, file, a), back = open_session(Backend::kOnnxRuntime, file, b);
+  std::mt19937 rng(4);
+  std::uniform_real_distribution<float> u(0.0f, 1.0f);
+  const int H = 1024, Wd = 800;
+  Tensor x = Tensor::empty(DType::kFloat32, {1, 1, H, Wd});
+  for (float& v : x.data<float>()) v = u(rng) < 0.1f ? u(rng) : 0.0f;
+  Tensor s4 = Tensor::empty(DType::kFloat32, {1, stemmed->stem->c2, H / 4, Wd / 4});
+  auto time = [&](const char* what, const auto& fn) {
+    double best = 1e30;
+    for (int round = 0; round < 7; ++round) {
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int r = 0; r < 5; ++r) fn();
+      best = std::min(best, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 5);
+    }
+    std::printf("%s: %.2f ms\n", what, best);
+  };
+  time("ONNX Runtime from the ink map", [&] { front->run(std::span<const Tensor>(&x, 1)); });
+  time("the stem alone", [&] {
+    cpu::det_stem(x.data<float>().data(), H, Wd, stemmed->stem->weights(), s4.data<float>().data(), 0, H / 4);
+  });
+  time("the stem and ONNX Runtime from the stride-4 tensor", [&] {
+    cpu::det_stem(x.data<float>().data(), H, Wd, stemmed->stem->weights(), s4.data<float>().data(), 0, H / 4);
+    back->run(std::span<const Tensor>(&s4, 1));
+  });
+}
+
+// The detector cut at both ends, fed the stride-4 tensor cpu::det_stem makes, its head run by the engine, gives
+// the whole detector's maps within float rounding on ONNX Runtime (FP32 files alone take the stem).
+TEST(Net, TheDetectorFedItsStrideFourTensorGivesItsMaps) {
+  const auto built = compiled_backends();
+  if (std::find(built.begin(), built.end(), Backend::kOnnxRuntime) == built.end()) GTEST_SKIP() << "no ONNX Runtime";
+  std::mt19937 rng(4);
+  std::uniform_real_distribution<float> u(0.0f, 1.0f);
+  Tensor x = Tensor::empty(DType::kFloat32, {1, 1, 64, 48});
+  for (float& v : x.data<float>()) v = u(rng) < 0.3f ? u(rng) : 0.0f;
+  auto head = detail::fused_det_head(data("native-det.onnx"));
+  ASSERT_TRUE(head.has_value());
+  ASSERT_TRUE(detail::with_det_stem(*head));
+  ASSERT_TRUE(head->stem.has_value());
+  EXPECT_EQ(head->stem->c1, 8);
+  EXPECT_EQ(head->stem->c2, 12);
+  EXPECT_FALSE(detail::with_det_stem(*head));  // once
+  const auto whole = open_session(Backend::kOnnxRuntime, data("native-det.onnx"));
+  SessionOptions cut;
+  cut.model_bytes = head->cut;
+  const auto part = open_session(Backend::kOnnxRuntime, data("native-det.onnx"), cut);
+  ASSERT_EQ(part->inputs().size(), 1u);
+  EXPECT_EQ(part->inputs()[0].name, head->stem->output);
+  Tensor s4 = Tensor::empty(DType::kFloat32, {1, 12, 16, 12});
+  cpu::det_stem(x.data<float>().data(), 64, 48, head->stem->weights(), s4.data<float>().data(), 0, 16);
+  const Tensor want = std::move(whole->run(std::span<const Tensor>(&x, 1))[0]);
+  const Tensor y = std::move(part->run(std::span<const Tensor>(&s4, 1))[0]);
+  ASSERT_EQ(y.shape(), (Shape{1, head->in, 16, 12}));
+  Tensor got = Tensor::empty(DType::kFloat32, {1, 4, 32, 24});
+  cpu::det_head(y.data<float>().data(), 16, 12, head->weights(), got.data<float>().data(), 0, 32);
+  float most = 0, worst = 0;
+  const std::span<const float> a = want.data<float>();
+  const std::span<const float> b = std::as_const(got).data<float>();
+  for (size_t i = 0; i < a.size(); ++i) {
+    most = std::max(most, std::abs(a[i]));
+    worst = std::max(worst, std::abs(a[i] - b[i]));
+  }
+  EXPECT_GT(most, 0.0f);
+  EXPECT_LE(worst, 1e-4f * most);
+  // an FP16 file keeps its front
+  auto half = detail::fused_det_head(data("native-det.fp16.onnx"));
+  ASSERT_TRUE(half.has_value());
+  EXPECT_FALSE(detail::with_det_stem(*half));
 }
 
 }  // namespace

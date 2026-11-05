@@ -60,6 +60,32 @@ TEST(CropRule, IdentityResampleKeepsEveryByte) {
 // down- and upscaling, odd sizes, windows wider than 8 taps, rectangles partly or
 // wholly off the image (paper), one-pixel outputs, images and outputs with rows
 // wider than their pixels, and the crop rule's own rectangles.
+// A row range of a resample (resample_gray_rows) is those rows of the whole one, byte for byte, on every
+// instruction set: down and up, ranges at the top, the bottom, inside and one row.
+TEST(CropRule, ARowRangeIsThoseRowsOfTheWholeResample) {
+  std::mt19937 rng(31);
+  auto pick = [&](int a, int b) { return std::uniform_int_distribution<int>(a, b)(rng); };
+  for (int i = 0; i < 60; ++i) {
+    const int w = pick(1, 120), h = pick(1, 120);
+    std::vector<uint8_t> px(static_cast<size_t>(w) * h);
+    for (uint8_t& v : px) v = static_cast<uint8_t>(pick(0, 255));
+    const GrayView im{px.data(), w, h, w};
+    const int ow = i % 2 ? pick(1, w) : pick(w, 3 * w + 4), oh = i % 2 ? pick(1, h) : pick(h, 3 * h + 4);
+    std::vector<uint8_t> whole(static_cast<size_t>(ow) * oh);
+    carbon::resample_gray(im, 0, 0, w, h, ow, oh, whole.data(), ow, carbon::cpu::Isa::kScalar);
+    for (carbon::cpu::Isa isa : carbon::cpu::isas_available()) {
+      for (int k = 0; k < 4; ++k) {
+        const int r0 = k == 0 ? 0 : pick(0, oh - 1), r1 = k == 1 ? oh : k == 2 ? r0 + 1 : pick(r0 + 1, oh);
+        std::vector<uint8_t> part(static_cast<size_t>(ow) * (r1 - r0), 7);
+        carbon::resample_gray_rows(im, 0, 0, w, h, ow, oh, r0, r1, part.data(), ow, isa);
+        ASSERT_TRUE(std::equal(part.begin(), part.end(), whole.begin() + static_cast<size_t>(r0) * ow))
+            << carbon::cpu::isa_name(isa) << ": " << w << " x " << h << " to " << ow << " x " << oh << ", rows " << r0
+            << " to " << r1;
+      }
+    }
+  }
+}
+
 TEST(CropRule, EveryIsaResamplesAsTheReference) {
   using carbon::cpu::Isa;
   std::mt19937 rng(23);
@@ -184,6 +210,26 @@ TEST(CropRule, LightOnDarkIsFlippedAndThenPaddedWithItsGround) {
   EXPECT_FALSE(carbon::light_on_dark(d.data(), 16, 32, 16, rule.flip_margin));
   std::vector<uint8_t> e(32 * 16, 120);
   EXPECT_FALSE(carbon::light_on_dark(e.data(), 16, 32, 16, rule.flip_margin));
+}
+
+// A crop of paper whose border rows land on a table's dark rules reads its ground as dark, and its light paper
+// as light on dark: the ground's test alone flips it; with flip_needs_dark it stays, being mostly light.
+TEST(CropRule, AFlipNeedsADarkCropWhereAsked) {
+  const int w = 16, h = 32;
+  std::vector<uint8_t> c(static_cast<size_t>(w) * h, 230);  // paper
+  for (int x = 0; x < w; ++x) c[x] = c[static_cast<size_t>(h - 1) * w + x] = 20;  // rules along both padding rows
+  for (int y = 0; y < h; ++y) c[static_cast<size_t>(y) * w + w - 1] = 20;         // and the last column
+  for (int y = 12; y < 20; ++y) c[static_cast<size_t>(y) * w + 5] = 40;           // a stroke of text
+  carbon::CropRule rule;
+  rule.height = h;
+  EXPECT_TRUE(rule.flip_needs_dark) << "the default (graded)";
+  std::vector<uint8_t> a = c, b = c;
+  rule.flip_needs_dark = false;
+  carbon::finish_crop(a.data(), w, w, rule);
+  EXPECT_NE(a, c) << "the ground's test alone flips it";
+  rule.flip_needs_dark = true;
+  carbon::finish_crop(b.data(), w, w, rule);
+  EXPECT_EQ(b, c) << "mostly light, so kept as it is";
 }
 
 TEST(CropRule, CropLinesFlipsALightOnDarkLine) {

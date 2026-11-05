@@ -78,7 +78,7 @@ TEST(CudaLines, CropsAreTheCpuBytes) {
     carbon::crop_lines(v, {&boxes[i], 1}, out_w, kept.data() + i * plane, {&cpu_w[i], 1}, keep);
     flipped += !std::equal(cpu.begin() + i * plane, cpu.begin() + (i + 1) * plane, kept.begin() + i * plane);
   }
-  EXPECT_GT(flipped, n / 4);  // the inverted page's lines
+  EXPECT_GT(flipped, n / 6);  // the inverted page's mostly dark lines (flip_needs_dark, the default)
 
   Device<uint8_t> d0(pages[0]), d1(pages[1]), out(n * plane);
   Device<int32_t> widths(n);
@@ -89,6 +89,23 @@ TEST(CudaLines, CropsAreTheCpuBytes) {
   size_t diff = 0;
   for (size_t i = 0; i < gpu.size(); ++i) diff += gpu[i] != cpu[i];
   EXPECT_EQ(diff, 0u) << "bytes that differ from the CPU crop";
+
+  // A flip needs a dark crop too by default (CropRule::flip_needs_dark); the ground's test alone, the other
+  // rule: the same bytes on both devices either way
+  carbon::CropRule dark;
+  dark.flip_needs_dark = false;
+  std::vector<uint8_t> cpu_dark(n * plane);
+  for (int i = 0; i < n; ++i) {
+    const int p = page_of[i];
+    const carbon::GrayView v{pages[p].data(), pw[p], ph[p], pw[p]};
+    carbon::crop_lines(v, {&boxes[i], 1}, out_w, cpu_dark.data() + i * plane, {&cpu_w[i], 1}, dark);
+  }
+  EXPECT_NE(cpu_dark, cpu);  // some light-on-dark crops are not mostly dark: flipped by the ground's test alone
+  carbon::cuda::crop_lines(dev, page_of, boxes, out_w, out.p, widths.p, dark);
+  const std::vector<uint8_t> gpu_dark = out.get(n * plane);
+  size_t diff_dark = 0;
+  for (size_t i = 0; i < gpu_dark.size(); ++i) diff_dark += gpu_dark[i] != cpu_dark[i];
+  EXPECT_EQ(diff_dark, 0u) << "bytes that differ from the CPU crop, the ground's test alone";
 }
 
 TEST(CudaLines, CtcMatchesTheCpu) {

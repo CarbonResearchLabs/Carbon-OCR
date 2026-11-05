@@ -26,6 +26,8 @@
 #include "carbon/strips.h"
 #include "det_head.h"
 #include "engine_steps.h"
+#include "escape_scan.h"
+#include "net/net.h"
 #include "net/onnx.h"
 
 namespace carbon {
@@ -106,73 +108,96 @@ std::string json_string(const std::string& s, size_t& i) {
 double lo(const LineBox& b, int axis) { return axis ? b.y0 : b.x0; }
 double hi(const LineBox& b, int axis) { return axis ? b.y1 : b.x1; }
 
-// The widest gap along an axis (0: x, 1: y) that no box crosses, and where it is.
-std::pair<double, double> widest_gap(std::vector<size_t>& idx, std::span<const LineBox> b, int axis) {
-  std::sort(idx.begin(), idx.end(), [&](size_t p, size_t q) { return lo(b[p], axis) < lo(b[q], axis); });
-  double end = hi(b[idx[0]], axis), best = 0, at = 0;
-  for (size_t k = 1; k < idx.size(); ++k) {
-    const double start = lo(b[idx[k]], axis);
+// The widest gap along an axis (0: x, 1: y) that no box crosses, and where it is, over boxes sorted by their low
+// edge on that axis.
+std::pair<double, double> widest_gap(std::span<const size_t> sorted, std::span<const LineBox> b, int axis) {
+  double end = hi(b[sorted[0]], axis), best = 0, at = 0;
+  for (size_t k = 1; k < sorted.size(); ++k) {
+    const double start = lo(b[sorted[k]], axis);
     if (start > end && start - end > best) {
       best = start - end;
       at = (start + end) / 2;
     }
-    end = std::max(end, hi(b[idx[k]], axis));
+    end = std::max(end, hi(b[sorted[k]], axis));
   }
   return {best, at};
 }
 
-void xy_cut(std::vector<size_t> idx, std::span<const LineBox> b, std::vector<size_t>& out) {
+// The XY-cut: the boxes sorted once by each axis's low edge, then, level by level, the widest gap of each axis
+// found by a linear scan and both sorted arrays partitioned stably at the gap chosen, so each part stays sorted. A
+// part with no gap is read top to bottom, then left to right. `choose(gx, gy)` picks the axis (0: x, 1: y) of two
+// gaps of which one at least is open. Iterative, the first part before the second, so a page of thousands of lines
+// recurses nowhere; ties broken by the boxes' order, so equal boxes keep it.
+template <class Choose>
+void xy_cut_order(std::span<const size_t> idx, std::span<const LineBox> b, Choose choose, std::vector<size_t>& out) {
   if (idx.size() <= 1) {
     out.insert(out.end(), idx.begin(), idx.end());
     return;
   }
-  const auto [gx, atx] = widest_gap(idx, b, 0);
-  const auto [gy, aty] = widest_gap(idx, b, 1);
-  if (gx > 0 || gy > 0) {
-    const int axis = gx > gy ? 0 : 1;  // a column gutter before the space between lines
-    const double at = axis ? aty : atx;
-    std::vector<size_t> before, after;
-    for (size_t i : idx) (hi(b[i], axis) <= at ? before : after).push_back(i);
-    xy_cut(std::move(before), b, out);
-    xy_cut(std::move(after), b, out);
-    return;
+  auto by = [&](int axis) {
+    std::vector<size_t> v(idx.begin(), idx.end());
+    std::sort(v.begin(), v.end(), [&](size_t p, size_t q) {
+      return lo(b[p], axis) != lo(b[q], axis) ? lo(b[p], axis) < lo(b[q], axis) : p < q;
+    });
+    return v;
+  };
+  std::vector<size_t> xs = by(0), ys = by(1);
+  std::vector<std::pair<size_t, size_t>> todo{{0, xs.size()}};  // parts [a, z) of both arrays, the next on top
+  while (!todo.empty()) {
+    const auto [a, z] = todo.back();
+    todo.pop_back();
+    const std::span<size_t> x(xs.data() + a, z - a), y(ys.data() + a, z - a);
+    if (z - a <= 1) {
+      out.insert(out.end(), x.begin(), x.end());
+      continue;
+    }
+    const auto [gx, atx] = widest_gap(x, b, 0);
+    const auto [gy, aty] = widest_gap(y, b, 1);
+    if (gx > 0 || gy > 0) {
+      const int axis = choose(gx, gy);
+      const double at = axis ? aty : atx;
+      auto before = [&](size_t i) { return hi(b[i], axis) <= at; };
+      const size_t m = static_cast<size_t>(std::stable_partition(x.begin(), x.end(), before) - x.begin());
+      if (m > 0 && m < x.size()) {
+        std::stable_partition(y.begin(), y.end(), before);
+        todo.push_back({a + m, z});  // after the first part
+        todo.push_back({a, a + m});
+        continue;
+      }
+      // the gap parts nothing (a box past it ends before it: an inverted box, x1 < x0): the part is a leaf, not
+      // cut again and again (x, partitioned stably to one side, keeps its order)
+    }
+    std::vector<size_t> leaf(y.begin(), y.end());
+    std::sort(leaf.begin(), leaf.end(), [&](size_t p, size_t q) {
+      if (b[p].y0 != b[q].y0) return b[p].y0 < b[q].y0;
+      return b[p].x0 != b[q].x0 ? b[p].x0 < b[q].x0 : p < q;
+    });
+    out.insert(out.end(), leaf.begin(), leaf.end());
   }
-  std::sort(idx.begin(), idx.end(), [&](size_t p, size_t q) {
-    return b[p].y0 != b[q].y0 ? b[p].y0 < b[q].y0 : b[p].x0 < b[q].x0;
-  });
-  out.insert(out.end(), idx.begin(), idx.end());
+}
+
+void xy_cut(std::vector<size_t> idx, std::span<const LineBox> b, std::vector<size_t>& out) {
+  // a column gutter before the space between lines
+  xy_cut_order(idx, b, [](double gx, double gy) { return gx > gy ? 0 : 1; }, out);
 }
 
 // The XY-cut over blocks, its gaps in the page's own units: a gap across the page (a gutter) in median character
 // widths `cw`, a gap down it in median line heights `lh`. The gutter wins where it is at least as wide in its units,
 // so a page's columns are cut before the space between its paragraphs, which in raw pixels is often the wider.
 void unit_xy_cut(std::vector<size_t> idx, std::span<const LineBox> b, double cw, double lh, std::vector<size_t>& out) {
-  if (idx.size() <= 1) {
-    out.insert(out.end(), idx.begin(), idx.end());
-    return;
-  }
-  const auto [gx, atx] = widest_gap(idx, b, 0);
-  const auto [gy, aty] = widest_gap(idx, b, 1);
-  if (gx > 0 || gy > 0) {
-    const int axis = gx > 0 && gx / cw >= gy / lh ? 0 : 1;
-    const double at = axis ? aty : atx;
-    std::vector<size_t> before, after;
-    for (size_t i : idx) (hi(b[i], axis) <= at ? before : after).push_back(i);
-    unit_xy_cut(std::move(before), b, cw, lh, out);
-    unit_xy_cut(std::move(after), b, cw, lh, out);
-    return;
-  }
-  std::sort(idx.begin(), idx.end(), [&](size_t p, size_t q) {
-    return b[p].y0 != b[q].y0 ? b[p].y0 < b[q].y0 : b[p].x0 < b[q].x0;
-  });
-  out.insert(out.end(), idx.begin(), idx.end());
+  xy_cut_order(idx, b, [&](double gx, double gy) { return gx > 0 && gx / cw >= gy / lh ? 0 : 1; }, out);
 }
 
 // ---------------------------------------------------------------- output
 
 void json_escape(std::string& out, const std::string& s) {
   out += '"';
-  for (unsigned char c : s) {
+  for (size_t i = 0; i < s.size();) {
+    const size_t j = detail::special_from(s, i);
+    out.append(s, i, j - i);  // the run that is written as itself
+    if (j == s.size()) break;
+    i = j + 1;
+    const unsigned char c = static_cast<unsigned char>(s[j]);
     switch (c) {
       case '"': out += "\\\""; break;
       case '\\': out += "\\\\"; break;
@@ -181,21 +206,48 @@ void json_escape(std::string& out, const std::string& s) {
       case '\t': out += "\\t"; break;
       default:
         if (c < 0x20) {
-          char buf[8];
-          std::snprintf(buf, sizeof buf, "\\u%04x", c);
-          out += buf;
+          static constexpr char kHex[] = "0123456789abcdef";
+          out += "\\u00";
+          out += kHex[c >> 4];
+          out += kHex[c & 15];
         } else {
-          out += static_cast<char>(c);
+          out += static_cast<char>(c);  // ' & < >: JSON writes them as themselves
         }
     }
   }
   out += '"';
 }
 
+// A number in fixed notation with `digits` decimals, as printf's "%.Nf" writes it where the C library rounds the
+// exact binary value: std::to_chars, with no format to parse and no locale.
+void put_fixed(std::string& out, double v, int digits) {
+#if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
+  char buf[48];
+  const auto r = std::to_chars(buf, buf + sizeof buf, v, std::chars_format::fixed, digits);
+  out.append(buf, r.ptr);
+#else
+  char buf[64];
+  std::snprintf(buf, sizeof buf, "%.*f", digits, v);
+  out += buf;
+#endif
+}
+
+void put_box(std::string& out, const LineBox& b) {
+  out += '[';
+  put_fixed(out, b.x0, 1);
+  out += ", ";
+  put_fixed(out, b.y0, 1);
+  out += ", ";
+  put_fixed(out, b.x1, 1);
+  out += ", ";
+  put_fixed(out, b.y1, 1);
+  out += ']';
+}
+
 std::string box_json(const LineBox& b) {
-  char buf[96];
-  std::snprintf(buf, sizeof buf, "[%.1f, %.1f, %.1f, %.1f]", b.x0, b.y0, b.x1, b.y1);
-  return buf;
+  std::string s;
+  put_box(s, b);
+  return s;
 }
 
 std::vector<Tensor> one(Tensor t) {
@@ -281,24 +333,53 @@ CropRule model_crop(const std::filesystem::path& set, const std::string& rec, Cr
   return rule;
 }
 
-// How sure the set's orientation model must be to turn a page: its ONNX file's
-// carbon.orient.turn_probability (calibrated on held-out pages at export), else 0.95.
+// A number of a model file's metadata, in [lo, hi], into v; v untouched where the file has none.
+void metadata_number(const std::filesystem::path& file, const std::map<std::string, std::string>& meta,
+                     const char* key, double lo, double hi, double& v) {
+  const auto it = meta.find(key);
+  if (it == meta.end()) return;
+  const char* const end = it->second.data() + it->second.size();
+  double x = 0;
+  const auto [at, ec] = std::from_chars(it->second.data(), end, x);
+  if (ec != std::errc() || at != end || !(x >= lo && x <= hi)) {
+    throw Error(file.string() + ": " + key + " is \"" + it->second + "\"");
+  }
+  v = x;
+}
+
+// How sure an orientation model's file must be to turn a page: its carbon.orient.turn_probability (calibrated on
+// held-out pages at export), else 0.95. The file the engine runs, so an FP16 or int8 file carries its own.
+float model_turn_probability_of(const std::filesystem::path& file) {
+  double x = 0.95;
+  metadata_number(file, onnx::metadata(file), "carbon.orient.turn_probability", 0.5, 1.0, x);
+  return static_cast<float>(x);
+}
+
+// The set's: its first orientation file's.
 float model_turn_probability(const std::filesystem::path& set) {
   for (const char* kind : {"", ".fp16", ".int8", ".int8-sym"}) {
     const std::filesystem::path file = set / (std::string("orient") + kind + ".onnx");
-    if (!std::filesystem::is_regular_file(file)) continue;
-    const std::map<std::string, std::string> meta = onnx::metadata(file);
-    const auto it = meta.find("carbon.orient.turn_probability");
-    if (it == meta.end()) return 0.95f;
-    const char* const end = it->second.data() + it->second.size();
-    double x = 0;
-    const auto [at, ec] = std::from_chars(it->second.data(), end, x);
-    if (ec != std::errc() || at != end || !(x >= 0.5 && x <= 1.0)) {
-      throw Error(file.string() + ": carbon.orient.turn_probability is \"" + it->second + "\"");
-    }
-    return static_cast<float>(x);
+    if (std::filesystem::is_regular_file(file)) return model_turn_probability_of(file);
   }
   return 0.95f;
+}
+
+// The detector's decoding thresholds from the file it runs (carbon.det.core_threshold, picture_threshold,
+// min_core_pixels, edge_quantile, merge_iou, which an export stamps where it calibrated them on held-out pages),
+// over `rule`; a file without them decodes by `rule`.
+DetRule model_det_rule(const std::filesystem::path& file, DetRule rule) {
+  const std::map<std::string, std::string> meta = onnx::metadata(file);
+  double core = rule.core_threshold, picture = rule.picture_threshold, pixels = rule.min_core_pixels;
+  metadata_number(file, meta, "carbon.det.core_threshold", 0.01, 0.99, core);
+  metadata_number(file, meta, "carbon.det.picture_threshold", 0.01, 0.99, picture);
+  metadata_number(file, meta, "carbon.det.min_core_pixels", 1, 64, pixels);
+  metadata_number(file, meta, "carbon.det.edge_quantile", 0, 0.5, rule.edge_quantile);
+  metadata_number(file, meta, "carbon.det.merge_iou", 0.05, 0.95, rule.merge_iou);
+  if (pixels != std::floor(pixels)) throw Error(file.string() + ": carbon.det.min_core_pixels is not whole");
+  rule.core_threshold = static_cast<float>(core);
+  rule.picture_threshold = static_cast<float>(picture);
+  rule.min_core_pixels = static_cast<int>(pixels);
+  return rule;
 }
 
 }  // namespace detail
@@ -357,8 +438,11 @@ std::vector<OcrLine> split_lines(std::vector<OcrLine> lines, const SplitRule& ru
     if (!small.empty()) {
       std::nth_element(small.begin(), small.begin() + static_cast<int64_t>(small.size() / 2), small.end());
       space = small[small.size() / 2];
+    } else if (rule.justified) {  // every gap wide: the line's own smallest is its space
+      space = *std::min_element(gaps.begin(), gaps.end());
     }
-    const double cut = std::max(rule.min_gap, rule.ratio * space);
+    const double cut = rule.justified && small.empty() && gaps.size() == 1 ? rule.always
+                                                                          : std::max(rule.min_gap, rule.ratio * space);
     size_t from = 0;
     auto piece = [&](size_t a, size_t b) {  // words [a, b)
       if (a == 0 && b == l.words.size()) {
@@ -366,7 +450,11 @@ std::vector<OcrLine> split_lines(std::vector<OcrLine> lines, const SplitRule& ru
         return;
       }
       OcrLine p;
-      p.box = {l.words[a].box.x0, l.box.y0, l.words[b - 1].box.x1, l.box.y1};
+      p.box = {l.words[a].box.x0, l.box.y0, l.words[a].box.x1, l.box.y1};  // the words' extent, whatever their order
+      for (size_t i = a + 1; i < b; ++i) {
+        p.box.x0 = std::min(p.box.x0, l.words[i].box.x0);
+        p.box.x1 = std::max(p.box.x1, l.words[i].box.x1);
+      }
       p.det_score = l.det_score;
       p.least = l.least;  // the whole line's: its words keep no least of their own
       double conf = 0;
@@ -593,9 +681,9 @@ LineBox box_as_given(const LineBox& b, const OcrPage& read) {
 }
 
 std::string skew_text(double degrees) {
-  char buf[32];
-  std::snprintf(buf, sizeof buf, "%.2f", degrees);
-  return buf;
+  std::string s;
+  put_fixed(s, degrees, 2);
+  return s;
 }
 
 std::string OcrPage::json() const {
@@ -611,38 +699,44 @@ std::string OcrPage::json() const {
     json_escape(s, text_layer);
   }
   s += ", \"lines\": [";
-  char buf[256];
   for (size_t i = 0; i < lines.size(); ++i) {
     const OcrLine& l = lines[i];
     s += i ? ", {\"box\": " : "{\"box\": ";
-    s += box_json(l.box);
+    put_box(s, l.box);
     s += ", \"text\": ";
     json_escape(s, l.text);
-    std::snprintf(buf, sizeof buf, ", \"confidence\": %.4f, \"det_score\": %.4f, \"words\": [", l.confidence,
-                  l.det_score);
-    s += buf;
+    s += ", \"confidence\": ";
+    put_fixed(s, l.confidence, 4);
+    s += ", \"det_score\": ";
+    put_fixed(s, l.det_score, 4);
+    s += ", \"words\": [";
     for (size_t w = 0; w < l.words.size(); ++w) {
       s += w ? ", {\"box\": " : "{\"box\": ";
-      s += box_json(l.words[w].box);
+      put_box(s, l.words[w].box);
       s += ", \"text\": ";
       json_escape(s, l.words[w].text);
-      std::snprintf(buf, sizeof buf, ", \"confidence\": %.4f}", l.words[w].confidence);
-      s += buf;
+      s += ", \"confidence\": ";
+      put_fixed(s, l.words[w].confidence, 4);
+      s += '}';
     }
     s += "]}";
   }
   s += "], \"pictures\": [";
-  for (size_t i = 0; i < pictures.size(); ++i) s += (i ? ", " : "") + box_json(pictures[i]);
+  for (size_t i = 0; i < pictures.size(); ++i) {
+    if (i) s += ", ";
+    put_box(s, pictures[i]);
+  }
   s += "]";
   if (!dropped.empty()) {  // the lines the gate took for something other than text, and why
     s += ", \"dropped\": [";
     for (size_t i = 0; i < dropped.size(); ++i) {
       s += i ? ", {\"box\": " : "{\"box\": ";
-      s += box_json(dropped[i].line.box);
+      put_box(s, dropped[i].line.box);
       s += ", \"text\": ";
       json_escape(s, dropped[i].line.text);
-      std::snprintf(buf, sizeof buf, ", \"confidence\": %.4f, \"why\": ", dropped[i].line.confidence);
-      s += buf;
+      s += ", \"confidence\": ";
+      put_fixed(s, dropped[i].line.confidence, 4);
+      s += ", \"why\": ";
       json_escape(s, dropped[i].why);
       s += "}";
     }
@@ -658,8 +752,9 @@ std::string OcrPage::json() const {
     for (size_t b = 0; b < blocks.size(); ++b) {
       s += b ? ", {\"label\": " : "{\"label\": ";
       json_escape(s, blocks[b].label);
-      std::snprintf(buf, sizeof buf, ", \"confidence\": %.4f, \"lines\": ", blocks[b].confidence);
-      s += buf + ints(blocks[b].lines);
+      s += ", \"confidence\": ";
+      put_fixed(s, blocks[b].confidence, 4);
+      s += ", \"lines\": " + ints(blocks[b].lines);
       if (!blocks[b].cells.empty()) {
         s += ", \"cells\": [";
         for (size_t c = 0; c < blocks[b].cells.size(); ++c) {
@@ -676,11 +771,17 @@ std::string OcrPage::json() const {
     }
     s += "]";
   }
-  std::snprintf(buf, sizeof buf,
-                ", \"ms\": {\"orient\": %.2f, \"detect\": %.2f, \"decode\": %.2f, \"second_pass\": %.2f, "
-                "\"recognize\": %.2f, \"total\": %.2f}}",
-                ms.orient, ms.detect, ms.decode, ms.second_pass, ms.recognize, ms.total);
-  s += buf;
+  const std::pair<const char*, double> times[] = {{", \"ms\": {\"orient\": ", ms.orient},
+                                                  {", \"detect\": ", ms.detect},
+                                                  {", \"decode\": ", ms.decode},
+                                                  {", \"second_pass\": ", ms.second_pass},
+                                                  {", \"recognize\": ", ms.recognize},
+                                                  {", \"total\": ", ms.total}};
+  for (const auto& [key, v] : times) {
+    s += key;
+    put_fixed(s, v, 2);
+  }
+  s += "}}";
   return s;
 }
 
@@ -752,6 +853,7 @@ struct Engine::Impl {
   // The detector's head, where its file has fullerene's (det_head.h): the workers' detectors and the wide ones
   // then run their file cut before it, and the engine runs the head (cpu::det_head).
   std::optional<detail::FusedHead> head, wide_head;
+  std::optional<detail::RecHead> rec_head;
   struct Job {
     GrayView page{};
     std::shared_ptr<const void> keep;  // what holds the page's pixels, for a page of the stream
@@ -801,26 +903,40 @@ struct Engine::Impl {
       : o(std::move(options)), pool(engine_pool(o.pool)) {
     vocab = load_vocab(set / (o.rec + ".vocab.json"));
     o.crop = detail::model_crop(set, o.rec, o.crop);
-    if (!o.turn_probability) o.turn_probability = detail::model_turn_probability(set);
+    if (!o.turn_probability) {  // the orient file this engine runs
+      o.turn_probability = detail::model_turn_probability_of(choose_set_model(set, "orient", o.backend, o.precision).file);
+    }
     w.resize(pool.size());
     SessionOptions single;
     single.threads = 1;
     const detail::OrderModel order_model = detail::choose_order(set, o);
     choose_set_model(set, "orient", o.backend, o.precision);  // its file first: a missing one is named first, as before
     const SetModel det = choose_set_model(set, "det", o.backend, o.precision);
+    o.det = detail::model_det_rule(det.file, o.det);  // its thresholds, where its file carries them
     head = detail::fused_det_head(det.file);
+    if (head && o.det_stem && det.backend == Backend::kOnnxRuntime) detail::with_det_stem(*head);
     SessionOptions det_options = single;
     if (head) det_options.model_bytes = head->cut;
     // With share_sessions an ONNX Runtime model is opened by worker 0 alone and its session given to every worker
     // (each run is still the caller's, on its own thread); a native one stays each worker's own. Each file is
     // chosen just before it is opened, so a missing or unopenable one is named in that order.
     auto own = [&](int k, Backend b) { return k == 0 || !o.share_sessions || b != Backend::kOnnxRuntime; };
+    if (o.fused_rec_head && cpu::isa_available(cpu::Isa::kAvx2)) {  // where the head has its kernel
+      const SetModel rec_m = choose_set_model(set, o.rec, o.backend, o.precision);
+      if (rec_m.backend == Backend::kOnnxRuntime) rec_head = detail::fused_rec_head(rec_m.file);
+      if (rec_head && rec_head->head.classes != static_cast<int>(vocab.size())) {
+        throw Error(o.rec + "'s head gives " + std::to_string(rec_head->head.classes) + " classes, its vocabulary " +
+                    std::to_string(vocab.size()));
+      }
+    }
     pool.on_each_worker([&](int k) {
       const SetModel orient_m = choose_set_model(set, "orient", o.backend, o.precision);
       if (own(k, orient_m.backend)) w[k].orient = open_session(orient_m.backend, orient_m.file, single);
       if (own(k, det.backend)) w[k].det = open_session(det.backend, det.file, det_options);
       const SetModel rec_m = choose_set_model(set, o.rec, o.backend, o.precision);
-      if (own(k, rec_m.backend)) w[k].rec = open_session(rec_m.backend, rec_m.file, single);
+      SessionOptions rec_options = single;
+      if (rec_head) rec_options.model_bytes = rec_head->cut;
+      if (own(k, rec_m.backend)) w[k].rec = open_session(rec_m.backend, rec_m.file, rec_options);
       if (!order_model.file.empty() && own(k, order_model.backend)) {
         w[k].order = open_session(order_model.backend, order_model.file, single);
       }
@@ -837,7 +953,11 @@ struct Engine::Impl {
                   std::to_string(o.crop.height));
     }
     const Shape& logits = w[0].rec->outputs().at(0).shape;
-    if (logits.size() != 3 || (logits[1] > 0 && logits[1] != static_cast<int64_t>(vocab.size()))) {
+    if (rec_head) {  // the cut file's features, [N, k, 1, T]
+      if (logits.size() != 4 || (logits[1] > 0 && logits[1] != rec_head->head.k)) {
+        throw Error(o.rec + " cut before its head gives " + shape_string(logits));
+      }
+    } else if (logits.size() != 3 || (logits[1] > 0 && logits[1] != static_cast<int64_t>(vocab.size()))) {
       throw Error(o.rec + " gives " + shape_string(logits) + " but its vocabulary has " +
                   std::to_string(vocab.size()) + " classes");
     }
@@ -857,6 +977,7 @@ struct Engine::Impl {
     }
     if (ort && o.backend != Backend::kNative && fp32_det && pool.fast() >= 2) {
       wide_head = det.file == set / "det.onnx" ? head : detail::fused_det_head(set / "det.onnx");
+      if (wide_head && o.det_stem && !wide_head->stem) detail::with_det_stem(*wide_head);
     }
     for (int t : {6, 4, 2}) {
       if (t > pool.fast() || !ort || o.backend == Backend::kNative || !fp32_det) continue;
@@ -1001,7 +1122,7 @@ void Engine::Impl::page(Job& j, int k) {
 
   // The page at the detector's scale, once; orientation reads a thumbnail of it,
   // and turns the page only by a quarter turn, only when sure.
-  GrayImage small = detail::det_scale(j.page, o.det_long_side);
+  GrayImage small = detail::det_scale(j.page, o.det_long_side, o.det_area);
   const int side = o.orient_side;
   const auto orient = [&] {
     Tensor thumb = Tensor::empty(DType::kFloat32, {1, 1, side, side});
@@ -1027,22 +1148,47 @@ void Engine::Impl::page(Job& j, int k) {
   // Detection: the page at its scale, padded to a multiple of 32, on threads
   // when fast cores are idle (the same bytes as on one).
   auto t = Clock::now();
+  if (o.det_pitch > 0) {  // a page of large text at the scale that makes its pitch det_pitch
+    const double pitch = detail::line_pitch(j.up.small.view());
+    if (pitch > o.det_pitch) {
+      const double f = std::max(0.5, o.det_pitch / pitch);
+      const GrayView s0 = j.up.small.view();
+      j.up.small = resize_gray(s0, std::max(1, static_cast<int>(std::lround(s0.width * f))),
+                               std::max(1, static_cast<int>(std::lround(s0.height * f))));
+    }
+  }
   const GrayView sv = j.up.small.view();
   const int dw = sv.width, dh = sv.height;
   const int pw = round_up(dw, 32), ph = round_up(dh, 32);
   Tensor input = Tensor::empty(DType::kFloat32, {1, 1, ph, pw});
   ink_input(sv, dw, dh, pw, ph, input.data<float>().data());
+  // A head with the stem fused takes the stride-4 tensor, made here from the ink map in row bands (on idle
+  // fast cores where there are some)
+  const auto fed = [&](const Tensor& x, const detail::FusedHead& h) {
+    const detail::FusedStem& s = *h.stem;
+    const Shape& xs = x.shape();  // [1, 1, ph, pw]
+    const int xh = static_cast<int>(xs[2]), xw = static_cast<int>(xs[3]);
+    Tensor s4 = Tensor::empty(DType::kFloat32, {1, s.c2, xh / 4, xw / 4});
+    const cpu::DetStemWeights sw = s.weights();
+    const float* px = x.data<float>().data();
+    float* ps = s4.data<float>().data();
+    split_rows(xh / 4, [&](int r0, int r1) { cpu::det_stem(px, xh, xw, sw, ps, r0, r1); });
+    return s4;
+  };
   const detail::DetectRun run = [&](const Tensor& x) {
-    const std::span<const Tensor> in(&x, 1);
     for (auto& wd : wides) {
       if (wd->threads > free_fast(k)) continue;
       std::unique_lock lk(wd->m, std::try_to_lock);
       if (!lk) continue;
+      const Tensor s4 = wide_head && wide_head->stem ? fed(x, *wide_head) : Tensor{};
+      const std::span<const Tensor> in(wide_head && wide_head->stem ? &s4 : &x, 1);
       if (!wide_head) return std::move(wd->session->run(in)[0]);
       Tensor maps;
       wd->session->run(in, [&](std::span<const Session::OutputView> y) { maps = head_maps(y[0], *wide_head); });
       return maps;
     }
+    const Tensor s4 = head && head->stem ? fed(x, *head) : Tensor{};
+    const std::span<const Tensor> in(head && head->stem ? &s4 : &x, 1);
     if (!head) return std::move(w[k].det->run(in)[0]);
     Tensor maps;
     w[k].det->run(in, [&](std::span<const Session::OutputView> y) { maps = head_maps(y[0], *head); });
@@ -1115,6 +1261,22 @@ void Engine::Impl::read_lines(Job& j, std::span<const size_t> lines, int k) {
     const std::vector<Tensor> in = one(std::move(x));
     w[k].rec->run(in, [&](std::span<const Session::OutputView> out) {
       const Session::OutputView& v = out[0];
+      if (rec_head) {  // the head and the argmax a line at a time, on its own frames
+        if (v.dtype != DType::kFloat32 || v.shape.size() != 4 || v.shape[0] != m || v.shape[1] != rec_head->head.k) {
+          throw Error(o.rec + " gives features " + shape_string(v.shape) + " for " + std::to_string(m) + " lines");
+        }
+        const int kk = static_cast<int>(v.shape[1]), frames = static_cast<int>(v.shape[3]);
+        std::vector<int32_t> ids(static_cast<size_t>(m) * frames, 0);
+        std::vector<float> probs(static_cast<size_t>(m) * frames, 0.0f);
+        const float* fv = v.as<float>();
+        for (int i = 0; i < m; ++i) {
+          lengths[i] = std::min<int32_t>(frames, widths[i] / o.crop.frame_px);
+          cpu::ctc_head(fv + static_cast<size_t>(i) * kk * frames, kk, frames, lengths[i], rec_head->head,
+                        ids.data() + static_cast<size_t>(i) * frames, probs.data() + static_cast<size_t>(i) * frames);
+        }
+        decoded = ctc_collapse(ids.data(), probs.data(), m, frames, lengths);
+        return;
+      }
       if (v.dtype != DType::kFloat32 || v.shape.size() != 3 || v.shape[0] != m) {
         throw Error(o.rec + " gives logits " + shape_string(v.shape) + " for " + std::to_string(m) + " lines");
       }
@@ -1123,16 +1285,20 @@ void Engine::Impl::read_lines(Job& j, std::span<const size_t> lines, int k) {
       }
       decoded = ctc_greedy(v.as<float>(), m, static_cast<int>(v.shape[1]), static_cast<int>(v.shape[2]), lengths);
     });
-    if (o.spaces) {  // each crop's columns of ink, for its spaces (SpaceRule)
+    if (o.spaces || o.word_boxes_at_ink) {  // each crop's columns of ink, for its spaces and its words' boxes
       std::vector<uint8_t> ink(static_cast<size_t>(bw));
       for (int i = 0; i < m; ++i) {
         const uint8_t* c = crops.data() + static_cast<size_t>(i) * h * bw;
         const bool has = detail::ink_columns(c, widths[i], h, bw, o.crop, ink.data());
         detail::read_line(j.out.lines[lines[a + i]], decoded[i], lengths[i], o.crop, vocab,
-                          has ? ink.data() : nullptr, widths[i], &*o.spaces);
+                          has ? ink.data() : nullptr, widths[i], o.spaces ? &*o.spaces : nullptr, o.char_confidence,
+                          o.word_boxes_at_ink);
       }
     } else {
-      for (int i = 0; i < m; ++i) detail::read_line(j.out.lines[lines[a + i]], decoded[i], lengths[i], o.crop, vocab);
+      for (int i = 0; i < m; ++i) {
+        detail::read_line(j.out.lines[lines[a + i]], decoded[i], lengths[i], o.crop, vocab, nullptr, 0, nullptr,
+                          o.char_confidence);
+      }
     }
     a = b;
   }
@@ -1209,9 +1375,15 @@ int fit_side(int side, int longest, int to) {
   return std::max(1, static_cast<int>(std::lround(1.0 * side * to / longest)));
 }
 
-GrayImage det_scale(const GrayView& page, int long_side) {
+GrayImage det_scale(const GrayView& page, int long_side, int64_t area) {
   const int longest = std::max(page.width, page.height);
-  return resize_gray(page, fit_side(page.width, longest, long_side), fit_side(page.height, longest, long_side));
+  int w = fit_side(page.width, longest, long_side), h = fit_side(page.height, longest, long_side);
+  if (area > 0 && 2 * static_cast<int64_t>(w) * h < area) {  // a tall or wide page, by its area
+    const double f = std::min(1.0, std::sqrt(static_cast<double>(area) / (1.0 * page.width * page.height)));
+    w = std::max(1, static_cast<int>(std::lround(page.width * f)));
+    h = std::max(1, static_cast<int>(std::lround(page.height * f)));
+  }
+  return resize_gray(page, w, h);
 }
 
 void thumbnail_input(const GrayView& small, int page_w, int page_h, int side, float* out) {
@@ -1249,6 +1421,43 @@ void make_upright(const GrayView& page, int rotation, GrayImage small, const Eng
   }
 }
 
+double line_pitch(const GrayView& page) {
+  const int h = page.height;
+  if (h < 16 || page.width <= 0) return 0;
+  std::vector<double> c(static_cast<size_t>(h));
+  double mean = 0;
+  for (int y = 0; y < h; ++y) {
+    const uint8_t* r = page.data + static_cast<int64_t>(y) * page.stride;
+    int n = 0;
+    for (int x = 0; x < page.width; ++x) n += r[x] <= 160;
+    c[static_cast<size_t>(y)] = n;
+    mean += n;
+  }
+  mean /= h;
+  for (double& v : c) v -= mean;
+  auto at = [&](int lag) {
+    double s = 0;
+    for (int y = 0; y + lag < h; ++y) s += c[static_cast<size_t>(y)] * c[static_cast<size_t>(y + lag)];
+    return s / (h - lag);
+  };
+  const double r0 = at(0);
+  if (r0 <= 0) return 0;
+  const int most = std::min(64, h / 2);
+  std::vector<double> r(static_cast<size_t>(most) + 2, 0.0);
+  double top = 0;
+  for (int lag = 3; lag <= most + 1; ++lag) {
+    r[static_cast<size_t>(lag)] = at(lag);
+    if (lag >= 4 && lag <= most) top = std::max(top, r[static_cast<size_t>(lag)]);
+  }
+  if (top < 0.3 * r0) return 0;
+  // a periodic profile peaks again at twice its pitch: the smallest lag that is a peak within 90% of the largest
+  for (int lag = 4; lag <= most; ++lag) {
+    const double v = r[static_cast<size_t>(lag)];
+    if (v >= 0.9 * top && v >= r[static_cast<size_t>(lag - 1)] && v >= r[static_cast<size_t>(lag + 1)]) return lag;
+  }
+  return 0;
+}
+
 Detection on_page(const Detection& d, int vw, int vh, int dw, int dh) {
   const double sx = 1.0 * vw / dw, sy = 1.0 * vh / dh;
   auto to_page = [&](DetBox b) {
@@ -1267,21 +1476,105 @@ Detection on_page(const Detection& d, int vw, int vh, int dw, int dh) {
 }
 
 std::optional<Detection> second_pass(const GrayView& upright, int dw, int dh, const EngineOptions& o,
-                                     const DetectRun& run) {
-  const double f = std::min(o.det.second_pass_scale, 1.0 * o.second_pass_long_side / std::max(dw, dh));
+                                     const DetectRun& run, const Detection& first) {
+  double f = std::min(o.det.second_pass_scale, 1.0 * o.second_pass_long_side / std::max(dw, dh));
+  if (o.det.second_pass_target > 0) {  // the tiny lines to that height, within the page's own pixels
+    std::vector<double> tiny;
+    for (const DetBox& l : first.lines) {
+      const double lh = l.box.y1 - l.box.y0;
+      if (lh < o.det.second_pass_below) tiny.push_back(lh);
+    }
+    if (!tiny.empty()) {
+      std::nth_element(tiny.begin(), tiny.begin() + tiny.size() / 2, tiny.end());
+      const double cap = std::max(o.det.second_pass_scale, 1.0 * upright.width / std::max(1, dw));
+      f = std::min(o.det.second_pass_target / std::max(1.0, tiny[tiny.size() / 2]), cap);
+    }
+  }
   const int w = std::max(1, static_cast<int>(std::lround(dw * f)));
   const int h = std::max(1, static_cast<int>(std::lround(dh * f)));
   if (w <= dw && h <= dh) return std::nullopt;
-  const GrayImage page = resize_gray(upright, w, h);
+  const StripRule rule{StripRule{}.halo, StripRule{}.align, o.det.stride};
+  const int64_t side = round_up(o.det_long_side, 32);
   const int pw = round_up(w, 32), ph = round_up(h, 32);
+  if (o.det.second_pass_bands && first.median_line_height() >= o.det.second_pass_below) {
+    // The tiny lines' bands alone. Their rows at the second scale, widened either side by the tiny lines'
+    // median spacing (at least two of their heights): the first pass misses tiny lines, often every other one, so
+    // a missed one lies within a spacing of a found one ...
+    const double sy = 1.0 * h / dh;
+    std::vector<const DetBox*> tiny;
+    for (const DetBox& l : first.lines) {
+      if (l.box.y1 - l.box.y0 < o.det.second_pass_below) tiny.push_back(&l);
+    }
+    std::vector<double> centres, steps, heights;
+    for (const DetBox* l : tiny) {
+      centres.push_back((l->box.y0 + l->box.y1) / 2);
+      heights.push_back(l->box.y1 - l->box.y0);
+    }
+    std::sort(centres.begin(), centres.end());
+    for (size_t i = 1; i < centres.size(); ++i) {
+      if (centres[i] - centres[i - 1] > 0) steps.push_back(centres[i] - centres[i - 1]);
+    }
+    auto median = [](std::vector<double> v) {
+      if (v.empty()) return 0.0;
+      std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(v.size() / 2), v.end());
+      return v[v.size() / 2];
+    };
+    const double margin = std::max(2 * median(heights), median(steps));
+    std::vector<std::pair<int, int>> cores;
+    for (const DetBox* l : tiny) {
+      const int c0 = std::max(0, static_cast<int>(std::floor((l->box.y0 - margin) * sy)));
+      const int c1 = std::min(h, static_cast<int>(std::ceil((l->box.y1 + margin) * sy)));
+      if (c1 > c0) cores.emplace_back(c0, c1);
+    }
+    std::sort(cores.begin(), cores.end());
+    std::vector<std::pair<int, int>> joined;  // ... joined where closer than second_pass_join rows
+    for (const auto& c : cores) {
+      if (!joined.empty() && c.first - joined.back().second < o.det.second_pass_join) {
+        joined.back().second = std::max(joined.back().second, c.second);
+      } else {
+        joined.push_back(c);
+      }
+    }
+    Detection second;
+    for (const auto& [c0, c1] : joined) {
+      // the band: its core and a halo either side, aligned, within the padded page; its rows of the page at the
+      // second scale as the whole page's resample makes them, paper below the page
+      const int b0 = std::max(0, (c0 - rule.halo) / rule.align * rule.align);
+      const int b1 = std::min(ph, round_up(c1 + rule.halo, rule.align));
+      const int rows = std::min(b1, h) - b0;
+      GrayImage band;
+      band.width = w;
+      band.height = rows;
+      band.pixels.resize(static_cast<size_t>(w) * rows);
+      resample_gray_rows(upright, 0, 0, upright.width, upright.height, w, h, b0, b0 + rows, band.pixels.data(), w);
+      Tensor x = Tensor::empty(DType::kFloat32, {1, 1, b1 - b0, pw});
+      ink_input(band.view(), w, rows, pw, b1 - b0, x.data<float>().data());
+      const int64_t by_pixels = (static_cast<int64_t>(b1 - b0) * pw + side * side - 1) / (side * side);
+      const int strips = static_cast<int>(std::clamp<int64_t>(by_pixels, 1, std::max(1, (b1 - b0) / (2 * rule.halo))));
+      const Tensor maps = run_in_strips(x, strips, run, rule);
+      const Shape& s = maps.shape();
+      const Detection d = decode_det(maps.data<float>().data(), static_cast<int>(s[2]), static_cast<int>(s[3]), 1.0, o.det);
+      auto keep = [&](const std::vector<DetBox>& from, std::vector<DetBox>& to) {  // centre in the core, moved to the page
+        for (DetBox b : from) {
+          const double cy = (b.box.y0 + b.box.y1) / 2 + b0;
+          if (cy < c0 || cy >= c1) continue;
+          b.box.y0 += b0;
+          b.box.y1 += b0;
+          to.push_back(b);
+        }
+      };
+      keep(d.lines, second.lines);
+      keep(d.pictures, second.pictures);
+    }
+    return on_page(second, upright.width, upright.height, w, h);
+  }
+  const GrayImage page = resize_gray(upright, w, h);
   Tensor x = Tensor::empty(DType::kFloat32, {1, 1, ph, pw});
   ink_input(page.view(), w, h, pw, ph, x.data<float>().data());
   // Strips of about a first pass's pixels (the detector's long side squared), so
   // the detector's memory, which keeps its largest run's, stays about a first
   // pass's; their cores at least two halos high, so the halos at most double
   // their rows.
-  const StripRule rule{StripRule{}.halo, StripRule{}.align, o.det.stride};
-  const int64_t side = round_up(o.det_long_side, 32);
   const int64_t by_pixels = (static_cast<int64_t>(ph) * pw + side * side - 1) / (side * side);
   const int strips = static_cast<int>(std::clamp<int64_t>(by_pixels, 1, std::max(1, ph / (2 * rule.halo))));
   const Tensor maps = run_in_strips(x, strips, run, rule);
@@ -1295,7 +1588,7 @@ void place_detection(const Detection& first, const GrayView& upright, int dw, in
   Detection d = on_page(first, upright.width, upright.height, dw, dh);
   if (run && takes_second_pass(first, o.det)) {
     const auto t = Clock::now();
-    if (const std::optional<Detection> second = second_pass(upright, dw, dh, o, run)) {
+    if (const std::optional<Detection> second = second_pass(upright, dw, dh, o, run, first)) {
       d = merge_passes(d, *second, 1.0 * upright.height / dh, o.det);
       out.second_pass = true;
       out.ms.second_pass = ms_since(t);
@@ -1342,7 +1635,8 @@ bool ink_columns(const uint8_t* crop, int width, int h, int64_t stride, const Cr
 }
 
 void read_line(OcrLine& line, const CtcLine& d, int32_t length, const CropRule& crop,
-               const std::vector<std::string>& vocab, const uint8_t* ink, int ink_width, const SpaceRule* spaces) {
+               const std::vector<std::string>& vocab, const uint8_t* ink, int ink_width, const SpaceRule* spaces,
+               bool char_confidence, bool words_at_ink) {
   auto is_space = [&](size_t c) {
     const int32_t id = d.ids[c];
     return id > 0 && static_cast<size_t>(id) < vocab.size() &&
@@ -1398,14 +1692,22 @@ void read_line(OcrLine& line, const CtcLine& d, int32_t length, const CropRule& 
   const CropRegion r = crop_region(line.box, crop);
   const double per_px = (r.x1 - r.x0) / std::max(1, r.width);
   auto page_x = [&](int frame) { return std::clamp(r.x0 + frame * crop.frame_px * per_px, line.box.x0, line.box.x1); };
-  double sum = 0, word_sum = 0;
-  int word_chars = 0;
+  auto page_cx = [&](int cx) { return std::clamp(r.x0 + cx * per_px, line.box.x0, line.box.x1); };
+  const bool snap = ink && words_at_ink;
+  double sum = 0, word_sum = 0, char_sum = 0;
+  int word_chars = 0, word_cx0 = 0;
+  int64_t chars = 0;
   float least = 1;
   bool any = false;
   OcrWord word;
   auto end_word = [&](int frame) {
     if (word.text.empty()) return;
     word.box.x1 = std::max(word.box.x0, page_x(frame));
+    if (snap) {  // back from the gap to the word's last ink
+      int cx = std::clamp(frame * crop.frame_px, 0, ink_width);
+      while (cx > word_cx0 + 1 && !ink[cx - 1]) --cx;
+      word.box.x1 = std::max(word.box.x0, page_cx(cx));
+    }
     word.confidence = static_cast<float>(word_sum / std::max(1, word_chars));
     line.words.push_back(std::move(word));
     word = OcrWord{};
@@ -1424,15 +1726,26 @@ void read_line(OcrLine& line, const CtcLine& d, int32_t length, const CropRule& 
       continue;
     }
     line.text += ch;
-    if (word.text.empty()) word.box = {page_x(d.frames[c]), line.box.y0, line.box.x1, line.box.y1};
+    if (word.text.empty()) {
+      word.box = {page_x(d.frames[c]), line.box.y0, line.box.x1, line.box.y1};
+      if (snap) {  // out of the first glyph to the blank before it
+        int cx = std::clamp(d.frames[c] * crop.frame_px, 0, ink_width);
+        while (cx > 0 && ink[cx - 1]) --cx;
+        word_cx0 = cx;
+        word.box.x0 = page_cx(cx);
+      }
+    }
     word.text += ch;
     word_sum += d.probs[c];
+    char_sum += d.probs[c];
+    ++chars;
     ++word_chars;
     least = std::min(least, d.probs[c]);
     any = true;
   }
   end_word(length);
   line.confidence = d.ids.empty() ? 0.0f : static_cast<float>(sum / d.ids.size());
+  if (char_confidence) line.confidence = chars ? static_cast<float>(char_sum / static_cast<double>(chars)) : 0.0f;
   line.least = any ? least : 0.0f;
 }
 
@@ -1665,10 +1978,14 @@ void order_page(OcrPage& page, Session* model, const EngineOptions& o) {
     Tensor x = Tensor::empty(DType::kFloat32, {1, static_cast<int64_t>(n), kOrderFeatures});
     const std::vector<float> f = order_features(boxes, texts, pw, ph);
     std::copy(f.begin(), f.end(), x.data<float>().begin());
-    const std::vector<Tensor> y = model->run(one(std::move(x)));
-    if (y.size() != 6) throw Error("the order model gives " + std::to_string(y.size()) + " outputs, not 6");
-    auto at = [&](size_t i) { return std::span<const float>(y[i].data<float>()); };
-    const OrderOutputs outs{static_cast<int>(n), at(0), at(1), at(2), at(3), at(4), at(5)};
+    std::vector<Tensor> y;
+    OrderOutputs outs;
+    if (!net::run_order_pairs(*model, f, static_cast<int>(n), outs)) {  // the native model's pairs where read
+      y = model->run(one(std::move(x)));
+      if (y.size() != 6) throw Error("the order model gives " + std::to_string(y.size()) + " outputs, not 6");
+      auto at = [&](size_t i) { return std::span<const float>(y[i].data<float>()); };
+      outs = OrderOutputs{static_cast<int>(n), at(0), at(1), at(2), at(3), at(4), at(5)};
+    }
     PageOrder po = decode_order(outs, boxes, o.order);
     if (!po.fallback && o.blocks_by_geometry) blocks_by_geometry(po, boxes, texts);
     order = po.order;

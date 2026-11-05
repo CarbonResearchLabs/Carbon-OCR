@@ -509,7 +509,53 @@ struct Server::Impl {
     feeder_done();
   }
 
-  // The pages as they finish, each answered as soon as it is.
+  // ------------------------------------------------ the writers: each finished page's answer written in its
+  // format (a PDF's deflate, an hOCR's XML) on a thread of their own, so the collect thread only takes pages.
+  struct Done {
+    Work w;
+    OcrPage page;
+    std::exception_ptr error;
+    bool unreadable = false;
+  };
+  std::mutex w_m;
+  std::condition_variable w_cv;
+  std::deque<Done> to_write;
+  bool writing_done = false;
+
+  void hand_to_writers(Done d) {
+    {
+      std::lock_guard lk(w_m);
+      to_write.push_back(std::move(d));
+    }
+    w_cv.notify_one();
+  }
+
+  void write_answers() {
+    for (;;) {
+      Done d;
+      {
+        std::unique_lock lk(w_m);
+        w_cv.wait(lk, [&] { return writing_done || !to_write.empty(); });
+        if (to_write.empty()) return;  // collect is done and every answer written
+        d = std::move(to_write.front());
+        to_write.pop_front();
+      }
+      answer(d.w, d.error ? nullptr : &d.page, d.error, d.unreadable);
+    }
+  }
+
+  // collect, then the writers told that no more pages come.
+  void collect_then_done() {
+    collect();
+    {
+      std::lock_guard lk(w_m);
+      writing_done = true;
+    }
+    w_cv.notify_all();
+  }
+
+  // The pages as they finish, each handed to the writers as soon as it is: the CPU engine's next_finished, and the
+  // GPU pipeline's (a slow page holds back no other).
   void collect() {
     for (;;) {
       {
@@ -529,13 +575,23 @@ struct Server::Impl {
         error = f->error;
         unreadable = f->unreadable;
       } else {
+        std::optional<Pipeline::Finished> f;
         try {
-          std::optional<OcrPage> p = pipe->next();
-          if (p) page = std::move(*p);
-        } catch (...) {
+          f = pipe->next_finished();
+        } catch (...) {  // the pipeline stopped (a broken device): the oldest page waiting takes its error
           error = std::current_exception();
+          std::lock_guard lk(given_m);
+          if (given.empty()) continue;
+          n = std::min_element(given.begin(), given.end(),
+                               [](const auto& a, const auto& b) { return a.first < b.first; })->first;
         }
-        n = taken;  // the pipeline's pages come out as given
+        if (f) {
+          n = f->number;
+          page = std::move(f->page);
+          error = f->error;
+        } else if (!error) {
+          continue;
+        }
       }
       Work w;
       {
@@ -546,7 +602,7 @@ struct Server::Impl {
         given.erase(it);
         ++taken;
       }
-      answer(w, error ? nullptr : &page, error, unreadable);
+      hand_to_writers({std::move(w), std::move(page), error, unreadable});
     }
   }
 
@@ -707,7 +763,9 @@ struct Server::Impl {
     for (int i = 0; i < feeders; ++i) {
       threads.emplace_back([this] { o.cuda ? feed_pipeline() : feed_engine(); });
     }
-    threads.emplace_back([this] { collect(); });
+    threads.emplace_back([this] { collect_then_done(); });
+    const int writers = o.writers > 0 ? o.writers : (o.cuda ? std::max(2, feeders / 2) : 2);
+    for (int i = 0; i < writers; ++i) threads.emplace_back([this] { write_answers(); });
 
     std::vector<PollFd> fds;
     std::vector<uint64_t> ids;

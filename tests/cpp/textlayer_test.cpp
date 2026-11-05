@@ -120,6 +120,70 @@ TEST(TextLayer, ChecksWhatItWouldTrust) {
   EXPECT_FALSE(read_text_layer(few, page.view()).check.usable);
 }
 
+// Ink by contrast: gray text (#AAAAAA, luma 170) and light blue (164) on white pass; white on white, and a
+// box of one tone however dark, does not.
+TEST(TextLayer, InkIsContrastNotALevel) {
+  std::vector<PdfChar> good;
+  put_line(good, U"A sentence of plain text", 0, 20);
+  for (uint8_t tone : {uint8_t{170}, uint8_t{164}}) {
+    GrayImage page = inked(good, 300, 40);
+    for (uint8_t& v : page.pixels) v = v == 0 ? tone : v;
+    EXPECT_TRUE(read_text_layer(good, page.view()).check.usable) << int{tone};
+  }
+  GrayImage flat = inked({}, 300, 40);
+  for (uint8_t& v : flat.pixels) v = 40;  // dark, but one tone: nothing drawn there
+  EXPECT_FALSE(read_text_layer(good, flat.view()).check.usable);
+}
+
+// Coverage: ink outside the layer's characters and the pictures, two line heights tall or more, is found (a
+// chart's labels drawn as paths); ink under the characters, and a short speck, is not.
+TEST(TextLayer, InkTheLayerDoesNotHoldIsFound) {
+  std::vector<PdfChar> chars;
+  put_line(chars, U"A line of the layer", 10, 30);
+  put_line(chars, U"and another of it", 10, 60);
+  GrayImage page = inked(chars, 400, 300);
+  for (int y = 150; y < 200; ++y) {  // a drawn label, 50 rows tall (lines 20 high): outside every character
+    for (int x = 200; x < 260; x += 3) page.pixels[static_cast<size_t>(y) * 400 + x] = 0;
+  }
+  for (int x = 300; x < 320; ++x) page.pixels[static_cast<size_t>(250) * 400 + x] = 0;  // a rule, one row
+  const TextLayer layer = read_text_layer(chars, page.view());
+  ASSERT_TRUE(layer.check.usable);
+  const std::vector<LineBox> found = uncovered_ink(page.view(), layer, chars, {});
+  ASSERT_EQ(found.size(), 1u);
+  EXPECT_NEAR(found[0].x0, 200, 1);
+  EXPECT_NEAR(found[0].y0, 150, 1);
+  EXPECT_NEAR(found[0].y1, 200, 1);
+  const LineBox picture{190, 140, 270, 210};  // under a picture: the hybrid path reads it already
+  EXPECT_TRUE(uncovered_ink(page.view(), layer, chars, std::span<const LineBox>(&picture, 1)).empty());
+}
+
+// A character past U+FFFF given as its UTF-16 surrogates reads as itself, in four bytes of UTF-8; a lone half
+// is unreadable; a page with a few invisible characters (a watermark) is still read from its layer.
+TEST(TextLayer, SurrogatesPairAndAFewInvisibleCharactersPass) {
+  std::vector<PdfChar> chars;
+  put_line(chars, U"Bold x", 0, 20);
+  chars[5].code = 0xD835;  // U+1D431, a mathematical bold x, as two UTF-16 units
+  put_line(chars, U"!", 60, 20);
+  chars.back().code = 0xDC31;
+  const GrayImage page = inked(chars, 300, 40);
+  const TextLayer t = read_text_layer(chars, page.view());
+  EXPECT_EQ(t.check.chars, 6);
+  EXPECT_EQ(t.check.bad, 0);
+  ASSERT_EQ(t.lines.size(), 1u);
+  EXPECT_EQ(t.lines[0].text, "Bold \xF0\x9D\x90\xB1");
+  std::vector<PdfChar> lone = chars;
+  lone.pop_back();  // the high half alone
+  EXPECT_EQ(read_text_layer(lone, page.view()).check.bad, 1);
+
+  std::vector<PdfChar> marked;
+  for (int r = 0; r < 10; ++r) put_line(marked, U"twenty characters ok", 0, 20 + 30.0f * r);
+  marked[7].invisible = true;  // one of 200
+  const GrayImage mp = inked(marked, 300, 340);
+  const TextLayerCheck k = read_text_layer(marked, mp.view()).check;
+  EXPECT_TRUE(k.usable) << k.reason;
+  EXPECT_EQ(k.invisible, 1);
+}
+
 // A table row the layer reads as one line, split into its cells.
 TEST(TextLayer, APageSplitsItsLinesAtWideGaps) {
   std::vector<PdfChar> chars;
@@ -134,9 +198,69 @@ TEST(TextLayer, APageSplitsItsLinesAtWideGaps) {
   EXPECT_EQ(page.lines[1].text, "Age");
   EXPECT_EQ(page.lines[2].text, "City");
   EXPECT_EQ(page.lines[1].box.x0, 200);
+  // a justified line: every space stretched to about 0.7 of its height (14 px of 20), none under the split's
+  // least gap; one line still, not a row of cells
+  std::vector<PdfChar> wide;
+  float x = 10;
+  for (const std::u32string w : {U"justified ", U"text ", U"stretched ", U"across ", U"its ", U"column"}) {
+    put_line(wide, w, x, 50);  // each word's space drawn, 10 px, then 4 more: gaps of 14 px
+    x += 10 * static_cast<float>(w.size()) + 4;
+  }
+  const OcrPage just = page_from_text_layer(read_text_layer(wide, GrayView{nullptr, 0, 0, 0}), 800, 100);
+  ASSERT_EQ(just.lines.size(), 1u);
+  EXPECT_EQ(just.lines[0].text, "justified text stretched across its column");
 }
 
-// The bounds of an image's dark pixels.
+// A tagged page reads in its structure tree's order, not the page's geometry, its blocks the elements' roles;
+// an untagged or barely tagged one as before.
+TEST(TextLayer, ATaggedPageTakesItsTreesOrder) {
+  std::vector<PdfChar> chars;
+  put_line(chars, U"Second", 10, 30);  // drawn first, top of the page, but the tree reads it second
+  for (PdfChar& c : chars) c.mcid = 2;
+  std::vector<PdfChar> head;
+  put_line(head, U"Heading", 10, 80);
+  for (PdfChar& c : head) c.mcid = 1;
+  chars.insert(chars.end(), head.begin(), head.end());
+  const TextLayer layer = read_text_layer(chars, GrayView{nullptr, 0, 0, 0});
+  ASSERT_EQ(layer.lines.size(), 2u);
+  EXPECT_EQ(layer.mcids, (std::vector<int>{2, 1}));
+  PdfStructure tree;
+  tree.elements = {{"H1", -1}, {"P", -1}};
+  tree.runs = {{0, 1}, {1, 2}};  // the heading's content, then the paragraph's
+  const OcrPage tagged = page_from_tagged_layer(layer, tree, 400, 100);
+  EXPECT_EQ(tagged.order, "tagged");
+  ASSERT_EQ(tagged.lines.size(), 2u);
+  EXPECT_EQ(tagged.lines[0].text, "Heading");
+  EXPECT_EQ(tagged.lines[1].text, "Second");
+  ASSERT_EQ(tagged.blocks.size(), 2u);
+  EXPECT_EQ(tagged.blocks[0].label, "Section-Header");
+  EXPECT_EQ(tagged.blocks[1].label, "Text");
+  const OcrPage plain = page_from_tagged_layer(layer, PdfStructure{}, 400, 100);
+  EXPECT_NE(plain.order, "tagged");
+  EXPECT_EQ(plain.lines[0].text, "Second");  // the XY-cut's: top first
+  PdfStructure half;
+  half.elements = {{"P", -1}};
+  half.runs = {{0, 1}};  // the heading alone: 7 of 13 characters, under 75%
+  EXPECT_NE(page_from_tagged_layer(layer, half, 400, 100).order, "tagged");
+}
+
+// A word broken at a line's end: PDFium's U+0002 (and a soft hyphen, U+00AD) reads as the hyphen the page prints,
+// not a control character (it counted as unreadable text and left "gov ernment" once the writers joined the lines).
+TEST(TextLayer, ALineEndHyphenIsAHyphen) {
+  std::vector<PdfChar> chars;
+  put_line(chars, U"However, gov\x02", 10, 30);
+  put_line(chars, U"ernment spends", 10, 60);
+  chars.insert(chars.begin() + 13, generated(U'\n'));
+  const TextLayer layer = read_text_layer(chars, GrayView{nullptr, 0, 0, 0});
+  EXPECT_EQ(layer.check.bad, 0);
+  ASSERT_EQ(layer.lines.size(), 2u);
+  EXPECT_EQ(layer.lines[0].text, "However, gov-");
+  std::vector<PdfChar> soft;
+  put_line(soft, U"glob\u00ADally", 10, 30);
+  EXPECT_EQ(read_text_layer(soft, GrayView{nullptr, 0, 0, 0}).lines[0].text, "glob-ally");
+}
+
+// The bounds of an image's dark pixels.// The bounds of an image's dark pixels.
 LineBox dark_bounds(const GrayImage& img) {
   LineBox b{1e9, 1e9, -1, -1};
   for (int y = 0; y < img.height; ++y) {

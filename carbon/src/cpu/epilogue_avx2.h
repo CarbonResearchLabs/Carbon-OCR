@@ -25,6 +25,7 @@ inline void epilogue_avx2(const S* s, int ld, int rows, int64_t i0, int j0, int 
   const uint8_t* const res_u8 = e.residual_u8;
   const uint16_t* const res_f16 = e.residual_f16;
   const int64_t res_ld = e.residual_ld, out_ld = e.out_ld;
+  const int rshift = e.residual_shift;
   const bool relu = e.relu;
   float* const out_f32 = e.out_f32;
   uint8_t* const out_u8 = e.out_u8;
@@ -48,14 +49,14 @@ inline void epilogue_avx2(const S* s, int ld, int rows, int64_t i0, int j0, int 
       }
       if (scale) v = _mm256_mul_ps(v, sc);
       if (bias) v = _mm256_add_ps(v, bi);
-      if (res_f32) v = _mm256_add_ps(v, _mm256_loadu_ps(res_f32 + i * res_ld + j));
+      if (res_f32) v = _mm256_add_ps(v, _mm256_loadu_ps(res_f32 + (i >> rshift) * res_ld + j));
       if (res_u8) {
-        const __m128i r8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(res_u8 + i * res_ld + j));
+        const __m128i r8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(res_u8 + (i >> rshift) * res_ld + j));
         const __m256i rv = _mm256_sub_epi32(_mm256_cvtepu8_epi32(r8), rzero);
         v = _mm256_add_ps(v, _mm256_mul_ps(_mm256_cvtepi32_ps(rv), rscale));
       }
       if (res_f16) {
-        const __m128i r16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(res_f16 + i * res_ld + j));
+        const __m128i r16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(res_f16 + (i >> rshift) * res_ld + j));
         v = _mm256_add_ps(v, _mm256_cvtph_ps(r16));
       }
       if (relu) v = _mm256_max_ps(v, _mm256_setzero_ps());
@@ -91,17 +92,17 @@ inline void epilogue_avx2(const S* s, int ld, int rows, int64_t i0, int j0, int 
     }
     if (scale) v = _mm256_mul_ps(v, sc);
     if (bias) v = _mm256_add_ps(v, bi);
-    if (res_f32) v = _mm256_add_ps(v, _mm256_maskload_ps(res_f32 + i * res_ld + j, mask));
+    if (res_f32) v = _mm256_add_ps(v, _mm256_maskload_ps(res_f32 + (i >> rshift) * res_ld + j, mask));
     if (res_u8) {
       uint8_t r8[8] = {};
-      std::memcpy(r8, res_u8 + i * res_ld + j, left);
+      std::memcpy(r8, res_u8 + (i >> rshift) * res_ld + j, left);
       const __m128i r8v = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(r8));
       const __m256i rv = _mm256_sub_epi32(_mm256_cvtepu8_epi32(r8v), rzero);
       v = _mm256_add_ps(v, _mm256_mul_ps(_mm256_cvtepi32_ps(rv), rscale));
     }
     if (res_f16) {
       uint16_t r16[8] = {};
-      std::memcpy(r16, res_f16 + i * res_ld + j, 2 * left);
+      std::memcpy(r16, res_f16 + (i >> rshift) * res_ld + j, 2 * left);
       v = _mm256_add_ps(v, _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(r16))));
     }
     if (relu) v = _mm256_max_ps(v, _mm256_setzero_ps());

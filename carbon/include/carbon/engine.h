@@ -50,6 +50,10 @@ struct SplitRule {
   double ratio = 2.5;    // a gap this many times the line's word spaces splits it
   double space = 0.25;
   double always = 1.5;   // a gap this wide splits it whatever its spaces
+  // A justified line: where none of a line's gaps is under min_gap, its word space is its smallest gap, not
+  // `space`, and a line of one gap splits only at `always`, so a narrow justified column's wide spaces do not
+  // split its lines. False: `space` (the default).
+  bool justified = false;
 };
 
 // Tables from geometry, for a page the order model gave no blocks: lines (split at
@@ -104,6 +108,10 @@ struct EngineOptions {
   Precision precision = Precision::kAuto;  // the models' files (open_set_model)
   std::string rec = "rec-latin";  // the recognizer: <set>/<rec>.onnx and <rec>.vocab.json
   int det_long_side = 1024;       // the page's long side at detection, padded to a multiple of 32
+  // A page whose long side fit (det_long_side) leaves it under half this many pixels (a page over about 2.5:1,
+  // a receipt, a strip) is detected at this many pixels instead, at most its own; letter and A4 pages as before.
+  // 0: by the long side alone (the default). The CPU engine's; the batched pipeline's sizes are fixed.
+  int64_t det_area = 0;
   // The second detection pass's page (det.second_pass_below and second_pass_scale, carbon/detect.h): its long
   // side at most this, run in strips of about a first pass's pixels (det_long_side squared; carbon/strips.h)
   // where it has more, so a worker's detector never holds much more than a first pass's memory.
@@ -150,6 +158,26 @@ struct EngineOptions {
   std::optional<TableRule> tables = TableRule{};  // tables from geometry without the order model; none: not
   std::optional<GateRule> gate = GateRule{};      // lines that are not text dropped; none: every line kept
   std::optional<SpaceRule> spaces;                // unsure spaces the ink does not bear out dropped; none (default)
+  // A line's confidence the mean of its characters' probabilities, its spaces left out, the scale its split
+  // pieces have: on by default (graded). False: over every id the decoder kept, spaces too.
+  bool char_confidence = true;
+  // Each word's box at its ink (the crop's columns of ink): its x0 out of its first glyph to the blank before it,
+  // its x1 back from the gap to its last ink. False: from its first character's frame to the next space's (the
+  // default). The CPU engine's: the GPU's crops give no ink columns back.
+  bool word_boxes_at_ink = false;
+  // The recognizer's head (its last 1x1 convolution) and CTC's argmax fused on the CPU's vectors, the logits
+  // never written; each line's own frames, not its bucket's padding. An FP32 file on a CPU with AVX2; else the
+  // file whole. The logits are the engine's sums, not ONNX Runtime's. False: the file whole (the default).
+  bool fused_rec_head = false;
+  // The detector's stem and first downsampling run by the engine in row bands (cpu::det_stem, the stride-2
+  // tensor never whole) and ONNX Runtime fed the stride-4 tensor: an FP32 detector whose head the engine fuses.
+  // The stem's sums are the engine's, not ONNX Runtime's. False: the detector as it is (the default).
+  bool det_stem = false;
+  // Pixels that follow the text's size. A page whose line pitch at the detector's scale (line_pitch: the
+  // autocorrelation of its rows' ink) is over det_pitch px is detected at the scale that makes it det_pitch, at
+  // least half the detector's side (slides, posters: 1.8 to 4 times fewer pixels). 0: every page at det_long_side
+  // (the default).
+  double det_pitch = 0;
   DetRule det;
   // The crop rule the recognizer reads lines by. A recognizer that carries its own (its ONNX
   // file's carbon.crop.height, pad_v and pad_h, written at export) sets those three.
@@ -201,9 +229,10 @@ struct OcrPage {
   };
   std::vector<Dropped> dropped;
   PictureMask picture_mask;   // the detector's, for the gate while the page is read; cleared once it is
-  std::string order = "xy-cut";  // the reading order's: "model" (the order model's), or the XY-cut's
+  std::string order = "xy-cut";  // the reading order's: "model" (the order model's), the XY-cut's, or "tagged" (a
+                                 // tagged PDF page's structure tree's: page_from_tagged_layer)
   bool second_pass = false;      // detected again at a larger scale, its median line tiny (carbon/detect.h)
-  std::vector<OcrBlock> blocks;  // the order model's; none without it
+  std::vector<OcrBlock> blocks;  // the order model's, or a tagged page's by its roles; none without them
   std::string source = "ocr";  // or "text layer": a born-digital page read from its own text (carbon/textlayer.h);
                                // "hybrid": from its text, and its pictures' text by OCR
   std::string text_layer;      // a PDF page read by OCR: why its text layer was not used

@@ -37,6 +37,16 @@ find_package(Threads REQUIRED)
 # images and the PNG pages (src/png.cpp)
 target_include_directories(carbon SYSTEM PRIVATE ${CARBON_STB_INCLUDE_DIR})
 target_link_libraries(carbon PUBLIC Threads::Threads PRIVATE libdeflate::libdeflate_static)
+# MSVC builds libdeflate's BMI2 decoder without AVX2's code generation (no per-function target): a second
+# copy of the decoder in a file compiled with /arch:AVX2, which png.cpp calls where the CPU has AVX2 and BMI2
+# (x64 only: MSVC for Arm64 has no /arch:AVX2).
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _carbon_inflate_cpu)
+if(MSVC AND NOT CMAKE_C_COMPILER_ID STREQUAL "Clang" AND _carbon_inflate_cpu MATCHES "^(x86_64|amd64)$")
+  target_sources(carbon PRIVATE src/inflate_avx2.c)
+  set_source_files_properties(src/inflate_avx2.c PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/W0"
+                              INCLUDE_DIRECTORIES "${libdeflate_SOURCE_DIR}")
+  target_compile_definitions(carbon PRIVATE CARBON_INFLATE_AVX2=1)
+endif()
 carbon_warnings(carbon)
 carbon_cpu_kernels(carbon)
 # The crop rule's coefficients must round as they do on the GPU: no fused multiply-adds (MSVC does

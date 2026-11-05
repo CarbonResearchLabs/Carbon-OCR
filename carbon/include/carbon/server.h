@@ -44,7 +44,10 @@ struct ServerOptions {
   EngineOptions engine;
   bool cuda = false;          // the batched pipeline on the GPU, with `pipeline`'s options
   PipelineOptions pipeline;   // its engine options are `engine`
-  int decoders = 0;           // on a GPU, the threads that decode the pages (0: 4, at most the cores)
+  int decoders = 0;  // on a GPU, the threads that decode the pages (0: half the physical cores, at least 4)
+  // The threads that write the pages' answers in their formats, off the thread that takes the pages as they
+  // finish (0: 2 on the CPU, half the decoders on a GPU, at least 2).
+  int writers = 0;
   double image_dpi = 300;     // format=pdf: the page's image at this dpi
   std::function<void(const std::string&)> log;  // a line a request, where given (called on several threads)
 };

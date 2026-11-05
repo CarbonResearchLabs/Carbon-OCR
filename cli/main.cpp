@@ -3,16 +3,16 @@
 //
 //   carbon-ocr ocr IMAGE|PDF... --set DIR [--rec rec-latin] [--backend ort|native]
 //                           [--precision auto|fp32|fp16|int8]
-//                           [--dpi 200] [--text-layer auto|off] [--hybrid auto|off] [--second-pass auto|off]
+//                           [--dpi 200|auto] [--text-layer auto|off] [--hybrid auto|off] [--second-pass auto|off]
 //                           [--gate auto|off] [--block-order geometry|model]
 //                           [--format text|json|hocr|alto|page|markdown|html|pdf] [--out-dir DIR]
 //                           [--output FILE] [--text-out FILE] [--text-only] [--image-dpi 300] [--as-given]
 //                           [--workers N] [--no-pin] [--device cpu|cuda] [--batch 8] [--in-flight N]
-//                           [--engine-cache DIR]
+//                           [--engine-cache DIR] [--head-accumulate fp32|fp16]
 //   carbon-ocr serve --set DIR [--host 127.0.0.1] [--port 8080] [--max-body-mb 64] [--queue 64] [--quiet]
 //                           [--decoders N] [--image-dpi 300] [and ocr's --rec --backend --precision
 //                           --second-pass --as-given --workers --no-pin --device --batch --in-flight
-//                           --engine-cache]
+//                           --engine-cache --head-accumulate]
 //   carbon-ocr version
 //   carbon-ocr cpus [--gemm]
 //   carbon-ocr info  MODEL [--backend ort|trt|native] [--shape NAME=1x1x32x256 ...]
@@ -105,6 +105,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <condition_variable>
 #include <cstring>
 #include <ctime>
 #include <exception>
@@ -163,6 +164,7 @@ struct Args {
   std::string second_pass = "auto";  // ocr: auto, tiny text detected again at twice the scale; off
   std::string gate = "auto";         // ocr, serve: auto, lines that are not text dropped (carbon::GateRule); off
   std::string prefetch = "on";       // serve on the GPU: the next group's pages uploaded while the current is read
+  std::string head_accumulate = "fp32";  // the GPU's fused head: its products summed in fp32 or fp16
   std::string table_spans = "on";       // ocr, serve: the order model's tables laid out again with spans
   std::string spaces = "model";         // ocr, serve: spaces as the recognizer reads them, or borne out by the ink
   std::string block_order = "geometry";  // ocr, serve: the order model's blocks by geometry, or as the model gave them
@@ -171,6 +173,7 @@ struct Args {
   std::string output;                // ocr: the file to write (pdf needs one); empty: standard output
   std::string text_out;              // ocr: also the pages' text, to this file
   bool text_only = false;            // ocr --format pdf: the text layer alone, no images
+  bool json_html = false, json_markdown = false;  // ocr --format json: each page's html body and markdown in it
   double image_dpi = 300;            // ocr --format pdf: an image's page at this dpi
   bool as_given = false;             // ocr: no quarter turns, no deskew: the boxes the given page's
   std::string device = "cpu";        // ocr: cpu, the engine's workers; cuda, the batched pipeline on the GPU
@@ -189,14 +192,15 @@ struct Args {
                "carbon-ocr: %s\n"
                "usage: carbon-ocr ocr IMAGE|PDF... --set DIR [--rec NAME] [--workers N]\n"
                "                        [--no-pin] [--backend ort|native] [--precision auto|fp32|fp16|int8]\n"
-               "                        [--dpi N] [--text-layer auto|off]\n"
+               "                        [--dpi N|auto] [--text-layer auto|off]\n"
                "                        [--hybrid auto|off] [--second-pass auto|off] [--gate auto|off]\n"
                "                        [--block-order geometry|model] [--second-pass-share F] [--single-pixel F]\n"
                "                        [--table-spans on|off] [--spaces model|ink]\n"
                "                        [--format text|json|hocr|alto|page|markdown|html|pdf] [--out-dir DIR]\n"
                "                        [--output FILE] [--text-out FILE] [--text-only] [--image-dpi N]\n"
                "                        [--as-given] [--device cpu|cuda] [--batch N] [--in-flight N]\n"
-               "                        [--engine-cache DIR]\n"
+               "                        [--engine-cache DIR] [--head-accumulate fp32|fp16]\n"
+               "                        [--json-html] [--json-markdown]\n"
                "       carbon-ocr serve --set DIR [--host ADDR] [--port N] [--max-body-mb N] [--queue N] [--quiet]\n"
                "                        [--decoders N] [--image-dpi N] [ocr's model, worker and device options]\n"
                "       carbon-ocr version\n"
@@ -340,6 +344,9 @@ Args parse(int argc, char** argv) {
     } else if (arg == "--prefetch") {
       a.prefetch = value();
       if (a.prefetch != "on" && a.prefetch != "off") usage("--prefetch takes on or off");
+    } else if (arg == "--head-accumulate") {
+      a.head_accumulate = value();
+      if (a.head_accumulate != "fp32" && a.head_accumulate != "fp16") usage("--head-accumulate takes fp32 or fp16");
     } else if (arg == "--gate") {
       a.gate = value();
       if (a.gate != "auto" && a.gate != "off") usage("--gate takes auto or off");
@@ -359,7 +366,8 @@ Args parse(int argc, char** argv) {
       if (end == v.c_str() || *end || !(x >= 0 && x <= 1)) usage(arg + " takes a number from 0 to 1");
       (arg == "--single-pixel" ? a.single_pixel : a.second_pass_share) = x;
     } else if (arg == "--dpi") {
-      a.dpi = to_int(arg, value(), 36);
+      const std::string v = value();
+      a.dpi = v == "auto" ? 0 : to_int(arg, v, 36);  // auto: each PDF page's own
     } else if (arg == "--format") {
       a.format = value();
       if (a.format != "text" && a.format != "json" && a.format != "hocr" && a.format != "alto" &&
@@ -370,6 +378,10 @@ Args parse(int argc, char** argv) {
       a.output = value();
     } else if (arg == "--text-out") {
       a.text_out = value();
+    } else if (arg == "--json-html") {
+      a.json_html = true;
+    } else if (arg == "--json-markdown") {
+      a.json_markdown = true;
     } else if (arg == "--text-only") {
       a.text_only = true;
     } else if (arg == "--image-dpi") {
@@ -1116,6 +1128,28 @@ std::string quoted(const std::string& v) {
   return q + "\"";
 }
 
+// A JSON string: quotes, backslashes and control characters escaped (html and markdown hold newlines).
+std::string json_text(const std::string& v) {
+  std::string q = "\"";
+  for (const char ch : v) {
+    const unsigned char c = static_cast<unsigned char>(ch);
+    if (c == '"' || c == '\\') {
+      q += '\\';
+      q += ch;
+    } else if (c == '\n') {
+      q += "\\n";
+    } else if (c < 0x20) {
+      static constexpr char kHex[] = "0123456789abcdef";
+      q += "\\u00";
+      q += kHex[c >> 4];
+      q += kHex[c & 15];
+    } else {
+      q += ch;
+    }
+  }
+  return q + "\"";
+}
+
 // The engine's options as ocr and serve take them.
 carbon::EngineOptions engine_options(const Args& a) {
   carbon::EngineOptions o;
@@ -1140,154 +1174,212 @@ carbon::EngineOptions engine_options(const Args& a) {
 
 int ocr(const Args& a) {
   const carbon::EngineOptions o = engine_options(a);
-  carbon::Engine engine(a.set, o);
-  // Each image a page; each page of a PDF rendered at --dpi (carbon/pdf.h) in the
-  // helper processes (carbon-pdf, beside this program), many at once.
-  std::vector<carbon::GrayImage> images;
-  std::vector<std::pair<std::string, int>> sources;  // a page's file, and its page in a PDF (from 1; 0: an image)
-  std::vector<size_t> pdf_pages;                     // the pages of `images` still to render
-  std::vector<size_t> image_files;                   // the pages of `images` still to decode
-  std::unique_ptr<carbon::PdfPool> pdf_pool;
-  // Each page's slot, made before the renderers start, so each writes its own pages'
-  // alone: those read from their text layers, and for PDF pages read by OCR why not.
-  std::vector<std::optional<carbon::OcrPage>> text_pages;
-  std::vector<std::optional<carbon::GrayImage>> picture_pages;  // a text page's pictures alone, for OCR
-  std::vector<std::string> notes;
-  for (const std::string& f : a.images) {
-    std::string ext = std::filesystem::path(f).extension().string();
-    for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    if (ext != ".pdf") {
-      image_files.push_back(images.size());
-      images.emplace_back();
-      sources.emplace_back(f, 0);
-      continue;
-    }
-#if defined(CARBON_WITH_PDFIUM)
-    if (!pdf_pool) pdf_pool = std::make_unique<carbon::PdfPool>(o.pool.workers);
-    const int n = pdf_pool->pages(f);  // UTF-8, as every path here (carbon-ocr.manifest)
-    for (int p = 0; p < n; ++p) {
-      pdf_pages.push_back(images.size());
-      images.emplace_back();
-      sources.emplace_back(f, p + 1);
-    }
-#else
-    throw carbon::Error(f + ": this build reads no PDFs (CMake option CARBON_WITH_PDFIUM)");
-#endif
-  }
-  text_pages.resize(images.size());
-  picture_pages.resize(images.size());
-  notes.resize(images.size());
-  // The image files decoded side by side, a thread a worker (one after another, 17 ms each for a 7 MP PNG, was the
-  // serial start of every run); the first file that cannot be read stops the run, as before.
-  if (!image_files.empty()) {
-    std::atomic<size_t> next{0};
-    std::exception_ptr failed;
-    std::mutex failed_m;
-    std::vector<std::thread> decoders;
-    const int threads = std::max(1, std::min(engine.workers(), static_cast<int>(image_files.size())));
-    for (int t = 0; t < threads; ++t) {
-      decoders.emplace_back([&] {
-        for (size_t k; (k = next++) < image_files.size();) {
-          const size_t i = image_files[k];
-          try {
-            images[i] = carbon::load_image(sources[i].first);
-          } catch (...) {
-            std::lock_guard<std::mutex> g(failed_m);
-            if (!failed) failed = std::current_exception();
-          }
-        }
-      });
-    }
-    for (auto& d : decoders) d.join();
-    if (failed) std::rethrow_exception(failed);
-  }
-#if defined(CARBON_WITH_PDFIUM)
-  if (!pdf_pages.empty()) {
-    const double scale = a.dpi / 72.0;
-    {
-      std::atomic<size_t> next{0};
-      std::vector<std::thread> renderers;
-      std::exception_ptr failed;
-      std::mutex failed_m;
-      for (int t = 0; t < pdf_pool->processes(); ++t) {
-        renderers.emplace_back([&] {
-          for (size_t k; (k = next++) < pdf_pages.size();) {
-            const size_t i = pdf_pages[k];
-            try {
-              const std::string& file = sources[i].first;
-              const int page = sources[i].second - 1;
-              images[i] = pdf_pool->render(file, page, scale);
-              if (a.text_layer == "auto") {  // a page whose own text passes the checks is read from it
-                const carbon::TextLayer layer =
-                    carbon::read_text_layer(pdf_pool->chars(file, page, scale), images[i].view());
-                if (layer.check.usable) {
-                  text_pages[i] = carbon::page_from_text_layer(layer, images[i].width, images[i].height);
-                  if (a.hybrid == "auto") {  // its pictures' own text, which the layer does not hold
-                    text_pages[i]->pictures = pdf_pool->pictures(file, page, scale);
-                    const std::vector<carbon::LineBox> read =
-                        carbon::pictures_to_read(text_pages[i]->pictures, images[i].width, images[i].height);
-                    if (!read.empty()) picture_pages[i] = carbon::pictures_only(images[i].view(), read);
-                  }
-                } else {
-                  notes[i] = layer.check.reason;
-                }
-              }
-            } catch (...) {
-              std::lock_guard<std::mutex> g(failed_m);
-              if (!failed) failed = std::current_exception();
-            }
-          }
-        });
-      }
-      for (auto& r : renderers) r.join();
-      if (failed) std::rethrow_exception(failed);
-    }
-  }
-#endif
-  // OCR for every page its text layer did not read, then for the pictures of those it did.
-  std::vector<carbon::GrayView> views;
-  std::vector<size_t> by_ocr, hybrid;
-  for (size_t i = 0; i < images.size(); ++i) {
-    if (text_pages[i]) continue;
-    by_ocr.push_back(i);
-    views.push_back(images[i].view());
-  }
-  for (size_t i = 0; i < images.size(); ++i) {
-    if (!picture_pages[i]) continue;
-    hybrid.push_back(i);
-    views.push_back(picture_pages[i]->view());
-  }
-  const auto t0 = std::chrono::steady_clock::now();
-  std::vector<carbon::OcrPage> read;
-  if (a.device == "cuda") {  // the batched pipeline on the GPU (carbon/pipeline.h)
+  const bool cuda = a.device == "cuda";
+  // The pages stream. Producer threads decode the images and render the PDFs' pages (each page's image, text
+  // layer and pictures from one request) and give the engine (or the GPU's pipeline) each page its text layer
+  // does not read, while this thread takes the results; so rendering runs beside the reading, and only the pages
+  // in flight are held (the pdf format, whose writer draws every page, keeps them all). The GPU's pipeline is made
+  // before the clock starts, and no CPU engine is made for it unless its text layers' pages need their order.
+  std::unique_ptr<carbon::Engine> cpu_engine;
+  std::unique_ptr<carbon::Pipeline> pipe;
+  if (cuda) {  // the batched pipeline on the GPU (carbon/pipeline.h)
     carbon::PipelineOptions po;
     po.engine = o;
     po.device = carbon::Device::kCuda;
     po.page_batch = a.batch;
     if (a.in_flight) po.in_flight = a.in_flight;
     po.engine_cache = a.engine_cache;
-    carbon::Pipeline pipe(a.set, po);
-    read = pipe.ocr(views);
+    po.head_fp16_accumulate = a.head_accumulate == "fp16";
+    pipe = std::make_unique<carbon::Pipeline>(a.set, po);
   } else {
-    read = engine.ocr(views);
+    cpu_engine = std::make_unique<carbon::Engine>(a.set, o);
+  }
+  const int workers = cpu_engine ? cpu_engine->workers() : std::max(1, carbon::cpu_topology().default_workers());
+  // Each image a page; each page of a PDF rendered at --dpi (carbon/pdf.h) in the
+  // helper processes (carbon-pdf, beside this program), many at once.
+  std::vector<std::pair<std::string, int>> sources;  // a page's file, and its page in a PDF (from 1; 0: an image)
+  std::unique_ptr<carbon::PdfPool> pdf_pool;
+  bool any_pdf = false;
+  for (const std::string& f : a.images) {
+    std::string ext = std::filesystem::path(f).extension().string();
+    for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (ext != ".pdf") {
+      sources.emplace_back(f, 0);
+      continue;
+    }
+#if defined(CARBON_WITH_PDFIUM)
+    if (!pdf_pool) pdf_pool = std::make_unique<carbon::PdfPool>(o.pool.workers);
+    const int n = pdf_pool->pages(f);  // UTF-8, as every path here (carbon-ocr.manifest)
+    for (int p = 0; p < n; ++p) sources.emplace_back(f, p + 1);
+    any_pdf = true;
+#else
+    throw carbon::Error(f + ": this build reads no PDFs (CMake option CARBON_WITH_PDFIUM)");
+#endif
+  }
+  const size_t n_pages = sources.size();
+  // Each page's slot, written by the one thread that takes the page: those read from their text layers, the
+  // pictures of those to read, why a PDF page went to OCR, and (the pdf format) its image.
+  const bool keep_images = a.format == "pdf";
+  std::vector<std::optional<carbon::OcrPage>> text_pages(n_pages), read(n_pages);
+  std::vector<std::optional<carbon::GrayImage>> picture_pages(n_pages);  // a text page's pictures alone, for OCR
+  std::vector<std::shared_ptr<const carbon::GrayImage>> kept(n_pages);
+  std::vector<std::string> notes(n_pages);
+  // The stream: page_of[k] the page submitted k-th (the results come back in that order), under m.
+  std::mutex m;
+  std::condition_variable more;
+  std::vector<size_t> page_of;
+  int producing = 0;
+  std::exception_ptr failed;  // the first page that could not be read, rendered or OCR'd: the run stops on it
+  std::atomic<bool> stop{false};
+  auto fail = [&](std::exception_ptr e) {
+    std::lock_guard<std::mutex> g(m);
+    if (!failed) failed = e;
+    stop = true;
+  };
+  // Submits one at a time (submit_m), so page_of's order is the numbers'; m is not held while submit waits at
+  // in_flight, so this thread can take a result meanwhile.
+  std::mutex submit_m;
+  auto taken_by = [&](size_t i) {
+    {
+      std::lock_guard<std::mutex> g(m);
+      page_of.push_back(i);
+    }
+    more.notify_one();
+  };
+  auto submit = [&](size_t i, carbon::GrayImage img) {
+    std::lock_guard<std::mutex> s(submit_m);
+    std::shared_ptr<const carbon::GrayImage> own;
+    if (keep_images) {
+      own = std::make_shared<const carbon::GrayImage>(std::move(img));
+      kept[i] = own;
+    }
+    if (pipe) {
+      pipe->submit(own ? carbon::GrayImage(*own) : std::move(img));  // the pipeline owns its pages: a copy if kept
+    } else if (own) {
+      cpu_engine->submit(own->view(), own);
+    } else {
+      cpu_engine->submit(std::move(img));
+    }
+    taken_by(i);
+  };
+  auto submit_file = [&](size_t i) {  // the engine's worker decodes it
+    std::lock_guard<std::mutex> s(submit_m);
+    cpu_engine->submit(std::filesystem::path(sources[i].first));
+    taken_by(i);
+  };
+  const double scale = a.dpi / 72.0;  // 0: each page's own (--dpi auto)
+  std::vector<double> dpis(n_pages, any_pdf && a.dpi > 0 ? a.dpi : a.image_dpi);  // each page's, for the pdf format
+  const unsigned want = carbon::kPdfImage |
+                        (a.text_layer == "auto" ? carbon::kPdfChars | carbon::kPdfStructure : 0u) |
+                        (a.text_layer == "auto" && a.hybrid == "auto" ? carbon::kPdfPictures : 0u);
+  std::atomic<size_t> next_page{0};
+  auto produce = [&] {
+    for (size_t i; !stop && (i = next_page++) < n_pages;) {
+      try {
+        const auto& [file, number] = sources[i];
+        if (number == 0) {  // an image file
+          if (!pipe && !keep_images) {
+            submit_file(i);
+          } else {
+            submit(i, carbon::load_image(file));
+          }
+          continue;
+        }
+#if defined(CARBON_WITH_PDFIUM)
+        carbon::PdfPage pg = pdf_pool->page(file, number - 1, scale, want);
+        dpis[i] = a.dpi > 0 ? a.dpi : pg.scale * 72.0;  // the dpi asked as given (the same bytes), else auto's
+        if (a.text_layer == "auto") {  // a page whose own text passes the checks is read from it
+          const carbon::TextLayer layer = carbon::read_text_layer(pg.chars, pg.image.view());
+          if (layer.check.usable) {
+            // a tagged page in its tree's order and roles, else the XY-cut's, the order model's after
+            text_pages[i] = carbon::page_from_tagged_layer(layer, pg.structure, pg.image.width, pg.image.height);
+            if (a.hybrid == "auto") {  // its pictures' own text, which the layer does not hold
+              text_pages[i]->pictures = std::move(pg.pictures);
+              std::vector<carbon::LineBox> to_read =
+                  carbon::pictures_to_read(text_pages[i]->pictures, pg.image.width, pg.image.height);
+              // And its ink the layer and the pictures do not account for (text drawn as paths, in a form)
+              for (const carbon::LineBox& b :
+                   carbon::uncovered_ink(pg.image.view(), layer, pg.chars, text_pages[i]->pictures)) {
+                to_read.push_back(b);
+              }
+              if (!to_read.empty()) picture_pages[i] = carbon::pictures_only(pg.image.view(), to_read);
+            }
+            if (keep_images) kept[i] = std::make_shared<const carbon::GrayImage>(std::move(pg.image));
+            continue;
+          }
+          notes[i] = layer.check.reason;
+        }
+        submit(i, std::move(pg.image));
+#endif
+      } catch (...) {
+        fail(std::current_exception());
+      }
+    }
+    std::lock_guard<std::mutex> g(m);
+    --producing;
+    more.notify_one();
+  };
+  // Producers: a PDF's helpers each kept busy; image files decoded on as many threads as workers where this
+  // thread decodes them (the GPU's, or the pdf format's), else handed to the engine's workers by one.
+  const int threads = std::max({1, pdf_pool ? pdf_pool->processes() : 0, pipe || keep_images ? workers : 1});
+  const auto t0 = std::chrono::steady_clock::now();
+  std::vector<std::thread> producers;
+  producing = threads;
+  for (int t = 0; t < threads; ++t) producers.emplace_back(produce);
+  // The results, in submission order, while the producers go on.
+  for (size_t taken = 0;; ++taken) {
+    size_t i = 0;
+    {
+      std::unique_lock<std::mutex> g(m);
+      more.wait(g, [&] { return taken < page_of.size() || producing == 0; });
+      if (taken == page_of.size()) break;  // every producer done, every page taken
+      i = page_of[taken];
+    }
+    try {
+      std::optional<carbon::OcrPage> r = pipe ? pipe->next() : cpu_engine->next();
+      if (r) read[i] = std::move(*r);
+    } catch (...) {
+      fail(std::current_exception());
+    }
+  }
+  for (auto& p : producers) p.join();
+  if (pipe) pipe->close();
+  if (failed) std::rethrow_exception(failed);
+  std::vector<size_t> hybrid;
+  std::vector<carbon::GrayView> pictures;  // the hybrid pages' pictures, read as given (below)
+  for (size_t i = 0; i < n_pages; ++i) {
+    if (!picture_pages[i]) continue;
+    hybrid.push_back(i);
+    pictures.push_back(picture_pages[i]->view());
+  }
+  std::vector<carbon::OcrPage> picture_read;
+  if (!pictures.empty()) {  // a page's pictures alone, as given: orientation and deskew read whole pages
+    carbon::EngineOptions given = o;
+    given.turn_probability = 2.0f;
+    given.deskew = false;
+    picture_read = carbon::Engine(a.set, given).ocr(pictures);
   }
   const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-  std::vector<carbon::OcrPage> pages(images.size());
-  for (size_t k = 0; k < by_ocr.size(); ++k) {
-    pages[by_ocr[k]] = std::move(read[k]);
-    pages[by_ocr[k]].text_layer = notes[by_ocr[k]];
+  std::vector<carbon::OcrPage> pages(n_pages);
+  size_t by_ocr = 0;
+  for (size_t i = 0; i < n_pages; ++i) {
+    if (!read[i]) continue;
+    pages[i] = std::move(*read[i]);
+    pages[i].text_layer = notes[i];
+    ++by_ocr;
   }
-  for (size_t k = 0; k < hybrid.size(); ++k) carbon::add_picture_lines(*text_pages[hybrid[k]], read[by_ocr.size() + k]);
+  for (size_t k = 0; k < hybrid.size(); ++k) carbon::add_picture_lines(*text_pages[hybrid[k]], picture_read[k]);
   std::vector<size_t> from_text;
-  for (size_t i = 0; i < images.size(); ++i) {
+  for (size_t i = 0; i < n_pages; ++i) {
     if (!text_pages[i]) continue;
     pages[i] = std::move(*text_pages[i]);
-    from_text.push_back(i);
+    if (pages[i].order != "tagged") from_text.push_back(i);  // a tagged page keeps its tree's order
   }
   if (!from_text.empty()) {  // the text layer's pages in the order model's order too, or their tables from geometry
     std::vector<carbon::OcrPage> ordered;
     for (size_t i : from_text) ordered.push_back(std::move(pages[i]));
-    engine.order(ordered);
+    if (!cpu_engine) cpu_engine = std::make_unique<carbon::Engine>(a.set, o);  // the GPU's run: its order model
+    cpu_engine->order(ordered);
     for (size_t k = 0; k < from_text.size(); ++k) pages[from_text[k]] = std::move(ordered[k]);
   }
   if (!a.text_out.empty()) {  // the pages' text beside the format asked for, a form feed between pages
@@ -1304,8 +1396,8 @@ int ocr(const Args& a) {
     std::string out;
     if (a.format == "pdf") {  // each page's image at the dpi it was read at (a PDF's --dpi; an image's 300)
       std::vector<carbon::GrayView> views_all;
-      for (const auto& img : images) views_all.push_back(img.view());
-      out = carbon::to_pdf(pages, views_all, pdf_pages.empty() ? a.image_dpi : a.dpi, a.text_only);
+      for (const auto& img : kept) views_all.push_back(img->view());
+      out = carbon::to_pdf(pages, views_all, dpis, a.text_only);
     } else {
       out = a.format == "hocr" ? carbon::to_hocr(pages, names)
             : a.format == "alto" ? carbon::to_alto(pages, names)
@@ -1331,7 +1423,12 @@ int ocr(const Args& a) {
   } else if (a.format == "json") {
     std::printf("{\"pages\": [");
     for (size_t i = 0; i < pages.size(); ++i) {
-      const std::string page = pages[i].json();  // {"width": ...}: the file goes first
+      std::string page = pages[i].json();  // {"width": ...}: the file goes first
+      // Its html body (as the server's html=1) and markdown, for a bench of the CLI's own path
+      if (a.json_html) page.insert(page.size() - 1, ", \"html\": " + json_text(carbon::to_html_body(pages[i])));
+      if (a.json_markdown) {
+        page.insert(page.size() - 1, ", \"markdown\": " + json_text(carbon::to_markdown(std::span(&pages[i], 1))));
+      }
       const auto& [file, number] = sources[i];
       std::printf("%s{\"file\": %s, %s%s", i ? ", " : "", quoted(file).c_str(),
                   number ? ("\"page\": " + std::to_string(number) + ", ").c_str() : "", page.c_str() + 1);
@@ -1340,11 +1437,11 @@ int ocr(const Args& a) {
   } else {
     for (size_t i = 0; i < pages.size(); ++i) std::printf("%s%s", i ? "\f\n" : "", pages[i].text().c_str());
   }
-  const std::string on = a.device == "cuda" ? "the GPU" : std::to_string(engine.workers()) + " workers";
+  const std::string on = cuda ? "the GPU" : std::to_string(workers) + " workers";
   std::fprintf(stderr,
                "%zu page%s (%zu from their text layers, %zu of those with pictures read) in %.2f s, %.2f pages a "
                "second, on %s\n",
-               pages.size(), pages.size() == 1 ? "" : "s", images.size() - by_ocr.size(), hybrid.size(), secs,
+               pages.size(), pages.size() == 1 ? "" : "s", n_pages - by_ocr, hybrid.size(), secs,
                pages.size() / secs, on.c_str());
   return 0;
 }
@@ -1364,6 +1461,7 @@ int serve(const Args& a) {
   so.cuda = a.device == "cuda";
   so.pipeline.page_batch = a.batch;
   so.pipeline.prefetch = a.prefetch != "off";
+  so.pipeline.head_fp16_accumulate = a.head_accumulate == "fp16";
   if (a.in_flight) so.pipeline.in_flight = a.in_flight;
   so.pipeline.engine_cache = a.engine_cache;
   if (!a.quiet) {

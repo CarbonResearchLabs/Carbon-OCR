@@ -308,3 +308,38 @@ def test_the_batched_pipeline_reads_as_the_engine_does():
         [page], html=True)[0]["html"]
     with pytest.raises(Exception):
         carbon_ocr.Pipeline(str(DATA / "fake-set"), device="tpu")
+
+
+def test_the_pipeline_streams_pages_while_python_runs():
+    # Pipeline.submit and next: pages in, results out in the order given, each as ocr() gives it, the writers'
+    # strings made without the GIL, so a Python thread runs meanwhile; None after close() once every page is out
+    import threading
+    page = carbon_ocr.load_image(str(DATA / "fake-set" / "page.png"))
+    blank = np.full((300, 400), 255, np.uint8)
+    pages = [page, blank, page, page]
+    p = carbon_ocr.Pipeline(str(DATA / "fake-set"), device="cpu", page_batch=2, threads=2, model_threads=1,
+                            gate=False, block_order="model", table_spans=False)
+    ticks = []
+    stop = threading.Event()
+    beat = threading.Thread(target=lambda: [ticks.append(1) or stop.wait(0.001) for _ in iter(stop.is_set, True)])
+    beat.start()
+    got = []
+
+    def take():
+        while (r := p.next(html=True, markdown=True)) is not None:
+            got.append(r)
+
+    reader = threading.Thread(target=take)
+    reader.start()
+    assert [p.submit(x) for x in pages] == [0, 1, 2, 3]
+    p.close()
+    reader.join(60)
+    stop.set()
+    beat.join()
+    want = carbon_ocr.Engine(str(DATA / "fake-set"), workers=1).ocr(pages, html=True, markdown=True)
+    assert [g["text"] for g in got] == [w["text"] for w in want]
+    assert [g["html"] for g in got] == [w["html"] for w in want]
+    assert [g["markdown"] for g in got] == [w["markdown"] for w in want]
+    assert ticks, "the Python thread ran while the pipeline read"
+    with pytest.raises(Exception, match="block_order"):
+        carbon_ocr.Pipeline(str(DATA / "fake-set"), device="cpu", block_order="sideways")

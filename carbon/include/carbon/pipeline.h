@@ -71,6 +71,10 @@ struct PipelineOptions {
   bool fused_head = true;  // the recognizer's trunk and cuda::ctc_head_argmax where the set has
                            // <rec>.features.fp16.onnx and <rec>.head.bin; else <rec>.onnx and cuda::ctc_greedy
   bool prefetch = true;    // the next group's pages given to the models while the current one is read (prefetch_pages)
+  // The fused head's products summed in FP16 by the tensor cores, 64 at a time (cuda::ctc_head_argmax's
+  // fp16_accumulate): twice the FP32-accumulating rate on GeForce cards (sm_86, sm_89). The logits move by about
+  // 1e-3, so it is off until graded.
+  bool head_fp16_accumulate = false;
 };
 
 // What the pipeline has done: its runs and what they held.
@@ -150,6 +154,17 @@ class Pipeline {
   // Engine::next does; an error outside every page's work ends the pipeline, and
   // every call throws it.
   std::optional<OcrPage> next();
+  // A page as it finishes: its number, and its result or its error.
+  struct Finished {
+    size_t number = 0;
+    OcrPage page;
+    std::exception_ptr error;
+  };
+  // The next page to finish, the first given among those done, waiting for one; nullopt once close() was called
+  // and every page given is out. For a caller with pages from many sources at once (a server): a slow page holds
+  // back no other. A stream takes its results by next or by next_finished, not both (next throws once
+  // next_finished has taken one). An error outside every page's work throws, as next's.
+  std::optional<Finished> next_finished();
   // Every page through, and their results in their order (copies the pages).  Throws
   // the first page's error, once every page is through, so the pipeline goes on.
   std::vector<OcrPage> ocr(std::span<const GrayView> pages);

@@ -83,6 +83,38 @@ void dwconv_f32_neon(Rows<float>, const float*, int, int, const Epilogue&);
 void dwconv_u8s8_neon(Rows<uint8_t>, int32_t, const int8_t*, int, int, const Epilogue&);
 void ctc_argmax_avx2(const float*, int, int, int, int32_t*, float*);
 ByteCounts count_beyond_avx2(const uint8_t*, int, int, int64_t, int, int);
+void bgrx_to_gray_avx2(const uint8_t*, int64_t, int, int, uint8_t*, int64_t);
+void softmax_rows_avx2(float* rows, int n_rows, int n, float scale);
+void det_stem_avx2(const float* x, int h, int w, const DetStemWeights& sw, float* out, int row0, int row1);
+void dot_chains_avx2(const float* a, const float* b, const int32_t* ia, const int32_t* ib, int pairs, int d,
+                     float* out);
+void gelu_avx2(float* v, size_t n);
+// erf(x) as gelu takes it: Eigen's float rational, x clamped to [-4, 4], each multiply and add on its own
+constexpr float kErfA1 = -1.60960333262415e-02f, kErfA3 = -2.95459980854025e-03f, kErfA5 = -7.34990630326855e-04f,
+                kErfA7 = -5.69250639462346e-05f, kErfA9 = -2.10102402082508e-06f, kErfA11 = 2.77068142495902e-08f,
+                kErfA13 = -2.72614225801306e-10f;
+constexpr float kErfB0 = -1.42647390514189e-02f, kErfB2 = -7.37332916720468e-03f, kErfB4 = -1.68282697438203e-03f,
+                kErfB6 = -2.13374055278905e-04f, kErfB8 = -1.45660718464996e-05f;
+inline float erf_of(float x) {
+  x = x < 4.0f ? x : 4.0f;
+  x = x > -4.0f ? x : -4.0f;
+  const float x2 = x * x;
+  float p = x2 * kErfA13 + kErfA11;
+  p = x2 * p + kErfA9;
+  p = x2 * p + kErfA7;
+  p = x2 * p + kErfA5;
+  p = x2 * p + kErfA3;
+  p = x2 * p + kErfA1;
+  p = x * p;
+  float q = x2 * kErfB8 + kErfB6;
+  q = x2 * q + kErfB4;
+  q = x2 * q + kErfB2;
+  q = x2 * q + kErfB0;
+  return p / q;
+}
+// a tile of kHeadFrames frames from t0 (all within `frames`): its logits [classes][kHeadFrames] into `tile`
+void head_tile_avx2(const float* features, int k, int frames, int t0, const float* w, const float* b, int classes,
+                    float* tile);
 void skew_rows_avx2(const float*, const float*, int64_t, double, double, double, int, int32_t*);
 void above_bits_avx2(const float*, int, float, uint32_t*);
 // det_head's band: its working memory (scratch kA) the head's row, three upsampled rows and a row of zeros.
@@ -322,12 +354,12 @@ inline void epilogue_scalar(const S* s, int64_t i, int j0, int w, const Epilogue
     float v = static_cast<float>(s[t]);
     if (e.scale) v = v * e.scale[j];
     if (e.bias) v = v + e.bias[j];
-    if (e.residual_f32) v = v + e.residual_f32[i * e.residual_ld + j];
+    const int64_t ri = (i >> e.residual_shift) * e.residual_ld + j;
+    if (e.residual_f32) v = v + e.residual_f32[ri];
     if (e.residual_u8) {
-      v = v + static_cast<float>(static_cast<int32_t>(e.residual_u8[i * e.residual_ld + j]) - e.residual_zero) *
-                  e.residual_scale;
+      v = v + static_cast<float>(static_cast<int32_t>(e.residual_u8[ri]) - e.residual_zero) * e.residual_scale;
     }
-    if (e.residual_f16) v = v + half_to_float(e.residual_f16[i * e.residual_ld + j]);
+    if (e.residual_f16) v = v + half_to_float(e.residual_f16[ri]);
     if (e.relu) v = v > 0 ? v : 0.0f;
     if (e.out_u8) {
       float q = v * e.out_inv_scale;
