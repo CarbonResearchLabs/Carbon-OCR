@@ -36,8 +36,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <string>
 #include <utility>
 #include <vector>
@@ -264,6 +267,7 @@ class CudaModels final : public PipelineModels {
       logits_.reserve(static_cast<size_t>(lines_max_) * classes_ * frames * sizeof(float));
     }
     widths_host_.reserve(crop_widths_.bytes);
+    uploader_ = std::thread([this] { uploader(); });
   }
 
   Device device() const override { return Device::kCuda; }
@@ -335,6 +339,27 @@ class CudaModels final : public PipelineModels {
   }
 
   bool second_pass() const override { return det2_ != nullptr; }
+  // A sticky error: the context can run nothing more, every later call fails with it (CUDA's own list of them).
+  bool broken() override {
+    cudaSetDevice(gpu_);
+    switch (cudaDeviceSynchronize()) {
+      case cudaErrorIllegalAddress:
+      case cudaErrorLaunchFailure:
+      case cudaErrorHardwareStackError:
+      case cudaErrorIllegalInstruction:
+      case cudaErrorMisalignedAddress:
+      case cudaErrorInvalidAddressSpace:
+      case cudaErrorInvalidPc:
+      case cudaErrorLaunchTimeout:
+      case cudaErrorECCUncorrectable:
+      case cudaErrorDevicesUnavailable:
+      case cudaErrorContextIsDestroyed:
+      case cudaErrorUnknown:
+        return true;
+      default:
+        return false;
+    }
+  }
 
   // A second pass's run (the detect stage's thread, on its stream): the page's or strip's ink map, [1, 1, h, w]
   // float32 from the CPU, uploaded (made float16 for a float16 input), det's file, and the maps back as float32,
@@ -378,30 +403,51 @@ class CudaModels final : public PipelineModels {
     return out;
   }
 
-  // The group's upright pages on the device, once for all its runs.
-  void set_pages(std::span<const GrayView> pages) override {
+  // The group's upright pages on the device, once for all its runs: the pages prefetch_pages is uploading or
+  // uploaded already where they are these (waited for on the host only until their copies are queued), else
+  // uploaded now. Either way the recognize stream waits for its slot's upload alone.
+  void set_pages(std::span<const GrayView> pages, std::span<const RowRuns> rows) override {
     check(cudaSetDevice(gpu_), "cudaSetDevice");
-    size_t total = 0;
-    for (const GrayView& g : pages) total += static_cast<size_t>(g.width) * g.height;
-    rec_s_.sync();  // the last group's crops are done with the buffer
-    host_pages_.assign(pages.begin(), pages.end());  // for lines wider than every bucket, read on the CPU
-    pages_.reserve(total);
-    device_pages_.clear();
-    size_t at = 0;
-    for (const GrayView& g : pages) {
-      uint8_t* d = pages_.as<uint8_t>() + at;
-      check(cudaMemcpy2DAsync(d, g.width, g.data, g.stride, g.width, g.height, cudaMemcpyHostToDevice, rec_s_.s),
-            "page");
-      device_pages_.push_back({d, g.width, g.height, g.width});
-      at += static_cast<size_t>(g.width) * g.height;
+    PageSlot& next = slots_[1 - cur_];
+    wait_uploader();
+    if (!(next.ready && same_pages(next.views, pages))) upload(next, pages, rows);
+    next.ready = false;
+    cur_ = 1 - cur_;
+    check(cudaStreamWaitEvent(rec_s_.s, next.done, 0), "cudaStreamWaitEvent");
+    host_pages_ = next.views;  // for lines wider than every bucket, read on the CPU
+    device_pages_ = next.device;
+  }
+
+  // The next group's pages into the slot the current group does not use, by the uploader thread on the copy
+  // stream: the recognize thread goes straight on to the current group's runs, and the bus works beside them.
+  void prefetch_pages(std::span<const GrayView> pages, std::span<const RowRuns> rows) override {
+    wait_uploader();
+    PageSlot& next = slots_[1 - cur_];
+    next.views.assign(pages.begin(), pages.end());  // what set_pages compares; the upload writes the same
+    next.ready = true;
+    {
+      std::lock_guard lk(up_m_);
+      up_job_ = {&next, std::vector<GrayView>(pages.begin(), pages.end()),
+                 std::vector<RowRuns>(rows.begin(), rows.end())};
+      up_busy_ = true;
     }
+    up_cv_.notify_all();
+  }
+
+  ~CudaModels() override {
+    {
+      std::lock_guard lk(up_m_);
+      up_stop_ = true;
+    }
+    up_cv_.notify_all();
+    if (uploader_.joinable()) uploader_.join();
   }
 
   void recognize(std::span<const int32_t> page_of, std::span<const LineBox> boxes, int bw, const CropRule& crop,
                  std::vector<CtcLine>& lines, std::vector<int32_t>& lengths) override {
     if (bw > widths_.back()) {  // wider than every bucket: the CPU device's crop, recognizer and decoding
       if (!cpu_) cpu_ = cpu_pipeline_models(set_, cpu_o_, std::clamp(cpu_topology().default_workers(), 1, 4));
-      cpu_->set_pages(host_pages_);
+      cpu_->set_pages(host_pages_, {});
       cpu_->recognize(page_of, boxes, bw, crop, lines, lengths);
       return;
     }
@@ -452,6 +498,111 @@ class CudaModels final : public PipelineModels {
     for (int i = 0; i < m; ++i) lengths[i] = std::min<int32_t>(frames, w[i] / crop.frame_px);
   }
 
+  // A group's pages on the device: two of them, the current group's and the next's, each its
+  // pages' bytes in pinned memory (copied at memory speed, then sent by the copy engine while the recognize stream
+  // reads the other slot's) and an event its upload records.
+  struct PageSlot {
+    DeviceMem dev;
+    Pinned host;
+    std::vector<GrayView> views;
+    std::vector<cuda::DevicePage> device;
+    cudaEvent_t done = nullptr;
+    bool ready = false;  // a prefetch_pages' upload, not yet taken by set_pages
+    PageSlot() { check(cudaEventCreateWithFlags(&done, cudaEventDisableTiming), "cudaEventCreate"); }
+    ~PageSlot() {
+      if (done) cudaEventDestroy(done);
+    }
+  };
+
+  static bool same_pages(const std::vector<GrayView>& a, std::span<const GrayView> b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+      if (a[i].data != b[i].data || a[i].width != b[i].width || a[i].height != b[i].height ||
+          a[i].stride != b[i].stride) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // The slot was last read two groups ago (every run of it synchronized since) or by a prefetch not taken: its
+  // last upload is waited for before its pinned bytes are written again. Each page keeps its whole layout on the
+  // device, but only the rows its crops read (rows[i], where given) are copied and sent, in chunks of kChunk,
+  // each sent (asynchronously, from pinned memory) as soon as it is copied, so the copy engine sends one chunk while
+  // the host copies the next, as CUDA's own staging of pageable memory overlaps them.
+  void upload(PageSlot& slot, std::span<const GrayView> pages, std::span<const RowRuns> rows) {
+    constexpr size_t kChunk = size_t{1} << 20;
+    check(cudaEventSynchronize(slot.done), "cudaEventSynchronize");
+    size_t total = 0;
+    for (const GrayView& g : pages) total += static_cast<size_t>(g.width) * g.height;
+    if (total > slot.dev.bytes) {  // grown by half again, so a few larger groups do not each reallocate
+      const size_t grown = std::max(total, slot.dev.bytes + slot.dev.bytes / 2);
+      slot.dev.reserve(grown);
+      slot.host.reserve(grown);
+    }
+    slot.views.assign(pages.begin(), pages.end());
+    slot.device.clear();
+    uint8_t* h = slot.host.as<uint8_t>();
+    uint8_t* d = slot.dev.as<uint8_t>();
+    size_t from = 0, to = 0;  // the bytes copied and not yet sent, [from, to)
+    auto flush = [&] {
+      if (to > from) check(cudaMemcpyAsync(d + from, h + from, to - from, cudaMemcpyHostToDevice, copy_s_.s), "pages");
+      from = to;
+    };
+    size_t base = 0;
+    auto copy_rows = [&](const GrayView& g, int y0, int y1) {
+      const size_t w = static_cast<size_t>(g.width);
+      const size_t at = base + static_cast<size_t>(y0) * w;
+      if (at != to) {  // a gap: what is copied so far goes on its own
+        flush();
+        from = to = at;
+      }
+      for (int y = y0; y < y1; ++y) {
+        std::memcpy(h + to, g.data + static_cast<int64_t>(y) * g.stride, w);
+        to += w;
+        if (to - from >= kChunk) flush();
+      }
+    };
+    for (size_t i = 0; i < pages.size(); ++i) {
+      const GrayView& g = pages[i];
+      slot.device.push_back({d + base, g.width, g.height, g.width});
+      if (i < rows.size() && !rows[i].empty()) {
+        for (const auto& [y0, y1] : rows[i]) copy_rows(g, std::max(0, y0), std::min(g.height, y1));
+      } else {
+        copy_rows(g, 0, g.height);
+      }
+      base += static_cast<size_t>(g.width) * g.height;
+    }
+    flush();
+    check(cudaEventRecord(slot.done, copy_s_.s), "cudaEventRecord");
+  }
+
+  // The uploader thread: a prefetch's upload at a time.
+  void uploader() {
+    cudaSetDevice(gpu_);
+    std::unique_lock lk(up_m_);
+    for (;;) {
+      up_cv_.wait(lk, [&] { return up_stop_ || (up_busy_ && up_job_.slot); });
+      if (up_stop_) return;
+      UpJob job = std::move(up_job_);
+      up_job_ = {};
+      lk.unlock();
+      try {
+        upload(*job.slot, job.pages, job.rows);
+      } catch (...) {  // the group's set_pages uploads it again, and meets the error itself if it lasts
+        job.slot->ready = false;
+      }
+      lk.lock();
+      up_busy_ = false;
+      up_cv_.notify_all();
+    }
+  }
+  // Until the uploader holds no prefetch: its slot's copies queued (its event recorded), or its error met.
+  void wait_uploader() {
+    std::unique_lock lk(up_m_);
+    up_cv_.wait(lk, [&] { return !up_busy_; });
+  }
+
   int gpu_, side_, long_, lines_max_;
   CropRule crop_;
   std::vector<int> batches_, widths_;
@@ -477,7 +628,20 @@ class CudaModels final : public PipelineModels {
   Pinned orient_host_, orient_logits_;
   Pinned det_host_;
   DeviceMem det_u8_, det_in_, det_maps_;
-  DeviceMem pages_, crops_, rec_in_, crop_widths_, features_, ids_, probs_, logits_;
+  DeviceMem crops_, rec_in_, crop_widths_, features_, ids_, probs_, logits_;
+  Stream copy_s_;          // the pages' uploads
+  PageSlot slots_[2];
+  int cur_ = 1;            // the current group's slot (set_pages takes the other, 0, first)
+  struct UpJob {
+    PageSlot* slot = nullptr;
+    std::vector<GrayView> pages;
+    std::vector<RowRuns> rows;
+  };
+  std::mutex up_m_;
+  std::condition_variable up_cv_;
+  UpJob up_job_;
+  bool up_busy_ = false, up_stop_ = false;
+  std::thread uploader_;  // started last in the constructor, so a constructor that throws has none to join
   Pinned ids_host_, probs_host_, widths_host_;
   std::vector<cuda::DevicePage> device_pages_;
 };

@@ -3,6 +3,7 @@
 #include "carbon/engine.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <charconv>
@@ -142,6 +143,31 @@ void xy_cut(std::vector<size_t> idx, std::span<const LineBox> b, std::vector<siz
   out.insert(out.end(), idx.begin(), idx.end());
 }
 
+// The XY-cut over blocks, its gaps in the page's own units: a gap across the page (a gutter) in median character
+// widths `cw`, a gap down it in median line heights `lh`. The gutter wins where it is at least as wide in its units,
+// so a page's columns are cut before the space between its paragraphs, which in raw pixels is often the wider.
+void unit_xy_cut(std::vector<size_t> idx, std::span<const LineBox> b, double cw, double lh, std::vector<size_t>& out) {
+  if (idx.size() <= 1) {
+    out.insert(out.end(), idx.begin(), idx.end());
+    return;
+  }
+  const auto [gx, atx] = widest_gap(idx, b, 0);
+  const auto [gy, aty] = widest_gap(idx, b, 1);
+  if (gx > 0 || gy > 0) {
+    const int axis = gx > 0 && gx / cw >= gy / lh ? 0 : 1;
+    const double at = axis ? aty : atx;
+    std::vector<size_t> before, after;
+    for (size_t i : idx) (hi(b[i], axis) <= at ? before : after).push_back(i);
+    unit_xy_cut(std::move(before), b, cw, lh, out);
+    unit_xy_cut(std::move(after), b, cw, lh, out);
+    return;
+  }
+  std::sort(idx.begin(), idx.end(), [&](size_t p, size_t q) {
+    return b[p].y0 != b[q].y0 ? b[p].y0 < b[q].y0 : b[p].x0 < b[q].x0;
+  });
+  out.insert(out.end(), idx.begin(), idx.end());
+}
+
 // ---------------------------------------------------------------- output
 
 void json_escape(std::string& out, const std::string& s) {
@@ -179,6 +205,48 @@ std::vector<Tensor> one(Tensor t) {
 }
 
 int round_up(int v, int step) { return (v + step - 1) / step * step; }
+
+// ---------------------------------------------------------------- the gate's reading of a text
+
+// A text's characters, spaces aside, by kind: letters and digits; rules and marks (_ - — – . | = ~ · • / \); the
+// rest (punctuation, symbols).
+struct TextKinds {
+  int alnum = 0, marks = 0, other = 0;
+  int chars() const { return alnum + marks + other; }
+};
+
+TextKinds kinds_of(const std::string& t) {
+  TextKinds k;
+  for (size_t i = 0; i < t.size();) {
+    const unsigned char c = static_cast<unsigned char>(t[i]);
+    size_t n = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 1;
+    if (i + n > t.size()) n = 1;
+    uint32_t cp = n == 1 ? c : c & (0x7Fu >> n);
+    for (size_t j = 1; j < n; ++j) cp = cp << 6 | (static_cast<unsigned char>(t[i + j]) & 0x3Fu);
+    i += n;
+    if (cp == ' ' || cp == '\t') continue;
+    switch (cp) {
+      case '_': case '-': case '.': case '|': case '=': case '~': case '/': case '\\':
+      case 0x2014: case 0x2013: case 0xB7: case 0x2022:
+        ++k.marks;
+        continue;
+      default: break;
+    }
+    const bool ascii_alnum = cp < 0x80 && std::isalnum(static_cast<int>(cp));
+    const bool letter = cp >= 0xC0 && cp != 0xD7 && cp != 0xF7 && !(cp >= 0x2B0 && cp <= 0x36F) &&
+                        !(cp >= 0x2000 && cp <= 0x2BFF) && !(cp >= 0x3000 && cp <= 0x303F) &&
+                        !(cp >= 0xFF00 && cp <= 0xFF20);
+    ++(ascii_alnum || letter ? k.alnum : k.other);
+  }
+  return k;
+}
+
+// The characters of a text, by code points.
+int code_points(const std::string& s) {
+  int n = 0;
+  for (unsigned char c : s) n += (c & 0xC0) != 0x80;
+  return n;
+}
 
 }  // namespace
 
@@ -300,6 +368,7 @@ std::vector<OcrLine> split_lines(std::vector<OcrLine> lines, const SplitRule& ru
       OcrLine p;
       p.box = {l.words[a].box.x0, l.box.y0, l.words[b - 1].box.x1, l.box.y1};
       p.det_score = l.det_score;
+      p.least = l.least;  // the whole line's: its words keep no least of their own
       double conf = 0;
       int64_t n = 0;
       for (size_t i = a; i < b; ++i) {
@@ -466,6 +535,14 @@ int find_tables(OcrPage& page, const TableRule& rule) {
   return static_cast<int>(tables.size());
 }
 
+int width_bucket(int crop_width, double ratio) {
+  for (int b = 32;;) {
+    if (crop_width <= b) return b;
+    if (b >= 2048) return round_up(crop_width, 8);
+    b = std::min(2048, std::max(b + 8, round_up(static_cast<int>(std::ceil(b * ratio)), 8)));
+  }
+}
+
 int width_bucket(int crop_width) {
   for (int b = 32;;) {
     if (crop_width <= b) return b;
@@ -481,6 +558,38 @@ std::string OcrPage::text() const {
     s += '\n';
   }
   return s;
+}
+
+std::array<std::array<double, 2>, 4> corners_as_given(const LineBox& b, const OcrPage& read) {
+  const bool across = read.rotation == 90 || read.rotation == 270;
+  const double w = across ? read.height : read.width, h = across ? read.width : read.height;  // upright
+  std::array<std::array<double, 2>, 4> p = {{{b.x0, b.y0}, {b.x1, b.y0}, {b.x1, b.y1}, {b.x0, b.y1}}};
+  if (read.skew != 0) {  // levelled by rotate_page: where each corner was before, inside the page
+    constexpr double kPi = 3.14159265358979323846;
+    const double a = read.skew * kPi / 180.0, s = std::sin(a), c = std::cos(a);
+    for (auto& q : p) {
+      const double dx = q[0] - w / 2, dy = q[1] - h / 2;
+      q = {std::clamp(dx * c - dy * s + w / 2, 0.0, w), std::clamp(dx * s + dy * c + h / 2, 0.0, h)};
+    }
+  }
+  for (auto& q : p) {  // turned back clockwise: the upright page's (x, y) on the page as given
+    const double x = q[0], y = q[1];
+    switch (read.rotation) {
+      case 90: q = {h - y, x}; break;
+      case 180: q = {w - x, h - y}; break;
+      case 270: q = {y, w - x}; break;
+      default: break;
+    }
+  }
+  return p;
+}
+
+LineBox box_as_given(const LineBox& b, const OcrPage& read) {
+  if (read.rotation == 0 && read.skew == 0) return b;
+  const auto p = corners_as_given(b, read);
+  LineBox u{p[0][0], p[0][1], p[0][0], p[0][1]};
+  for (const auto& q : p) u = {std::min(u.x0, q[0]), std::min(u.y0, q[1]), std::max(u.x1, q[0]), std::max(u.y1, q[1])};
+  return u;
 }
 
 std::string skew_text(double degrees) {
@@ -525,6 +634,20 @@ std::string OcrPage::json() const {
   s += "], \"pictures\": [";
   for (size_t i = 0; i < pictures.size(); ++i) s += (i ? ", " : "") + box_json(pictures[i]);
   s += "]";
+  if (!dropped.empty()) {  // the lines the gate took for something other than text, and why
+    s += ", \"dropped\": [";
+    for (size_t i = 0; i < dropped.size(); ++i) {
+      s += i ? ", {\"box\": " : "{\"box\": ";
+      s += box_json(dropped[i].line.box);
+      s += ", \"text\": ";
+      json_escape(s, dropped[i].line.text);
+      std::snprintf(buf, sizeof buf, ", \"confidence\": %.4f, \"why\": ", dropped[i].line.confidence);
+      s += buf;
+      json_escape(s, dropped[i].why);
+      s += "}";
+    }
+    s += "]";
+  }
   auto ints = [](const std::vector<int>& v) {
     std::string r = "[";
     for (size_t i = 0; i < v.size(); ++i) r += (i ? ", " : "") + std::to_string(v[i]);
@@ -542,7 +665,10 @@ std::string OcrPage::json() const {
         for (size_t c = 0; c < blocks[b].cells.size(); ++c) {
           const OcrCell& cell = blocks[b].cells[c];
           s += (c ? ", {\"row\": " : "{\"row\": ") + std::to_string(cell.row) + ", \"col\": " +
-               std::to_string(cell.col) + ", \"lines\": " + ints(cell.lines) + "}";
+               std::to_string(cell.col) + ", \"lines\": " + ints(cell.lines);
+          if (cell.row_span != 1) s += ", \"row_span\": " + std::to_string(cell.row_span);
+          if (cell.col_span != 1) s += ", \"col_span\": " + std::to_string(cell.col_span);
+          s += "}";
         }
         s += "]";
       }
@@ -616,7 +742,7 @@ std::unique_ptr<Session> open_set_model(const std::filesystem::path& set, const 
 
 struct Engine::Impl {
   struct Worker {
-    std::unique_ptr<Session> orient, det, rec, order;
+    std::shared_ptr<Session> orient, det, rec, order;  // a worker's own, or shared (share_sessions)
   };
   struct Wide {  // a multi-threaded detector, for a page that finds fast cores idle
     int threads = 0;
@@ -685,12 +811,26 @@ struct Engine::Impl {
     head = detail::fused_det_head(det.file);
     SessionOptions det_options = single;
     if (head) det_options.model_bytes = head->cut;
+    // With share_sessions an ONNX Runtime model is opened by worker 0 alone and its session given to every worker
+    // (each run is still the caller's, on its own thread); a native one stays each worker's own. Each file is
+    // chosen just before it is opened, so a missing or unopenable one is named in that order.
+    auto own = [&](int k, Backend b) { return k == 0 || !o.share_sessions || b != Backend::kOnnxRuntime; };
     pool.on_each_worker([&](int k) {
-      w[k].orient = open_set_model(set, "orient", o.backend, single, o.precision);
-      w[k].det = open_session(det.backend, det.file, det_options);
-      w[k].rec = open_set_model(set, o.rec, o.backend, single, o.precision);
-      if (!order_model.file.empty()) w[k].order = open_session(order_model.backend, order_model.file, single);
+      const SetModel orient_m = choose_set_model(set, "orient", o.backend, o.precision);
+      if (own(k, orient_m.backend)) w[k].orient = open_session(orient_m.backend, orient_m.file, single);
+      if (own(k, det.backend)) w[k].det = open_session(det.backend, det.file, det_options);
+      const SetModel rec_m = choose_set_model(set, o.rec, o.backend, o.precision);
+      if (own(k, rec_m.backend)) w[k].rec = open_session(rec_m.backend, rec_m.file, single);
+      if (!order_model.file.empty() && own(k, order_model.backend)) {
+        w[k].order = open_session(order_model.backend, order_model.file, single);
+      }
     });
+    for (size_t k = 1; k < w.size(); ++k) {
+      if (!w[k].orient) w[k].orient = w[0].orient;
+      if (!w[k].det) w[k].det = w[0].det;
+      if (!w[k].rec) w[k].rec = w[0].rec;
+      if (!w[k].order) w[k].order = w[0].order;
+    }
     const Shape& lines_in = w[0].rec->inputs().at(0).shape;  // [N, 1, height, W]
     if (lines_in.size() == 4 && lines_in[2] > 0 && lines_in[2] != o.crop.height) {
       throw Error(o.rec + " reads lines " + std::to_string(lines_in[2]) + " px high, but its crop rule makes them " +
@@ -930,7 +1070,7 @@ void Engine::Impl::page(Job& j, int k) {
     return;
   }
   const detail::LineTasks plan = detail::line_tasks(out.lines, o.crop, pool.idle() > 0 ? free_fast(k) : 0,
-                                                    o.line_batch);
+                                                    o.line_batch, o.bucket_ratio);
   auto lines = std::make_shared<std::vector<size_t>>(std::move(plan.lines));
   const int tasks = static_cast<int>(plan.starts.size()) - 1;
   j.left.store(tasks);
@@ -954,10 +1094,11 @@ void Engine::Impl::read_lines(Job& j, std::span<const size_t> lines, int k) {
   const int h = o.crop.height;
   for (size_t a = 0; a < lines.size();) {
     // one batch for each width bucket the task's lines fall in
-    const int bw = width_bucket(crop_region(j.out.lines[lines[a]].box, o.crop).width);
+    const int bw = width_bucket(crop_region(j.out.lines[lines[a]].box, o.crop).width, o.bucket_ratio);
     size_t b = a;
     std::vector<LineBox> boxes;
-    while (b < lines.size() && width_bucket(crop_region(j.out.lines[lines[b]].box, o.crop).width) == bw) {
+    while (b < lines.size() &&
+           width_bucket(crop_region(j.out.lines[lines[b]].box, o.crop).width, o.bucket_ratio) == bw) {
       boxes.push_back(j.out.lines[lines[b]].box);
       ++b;
     }
@@ -982,7 +1123,17 @@ void Engine::Impl::read_lines(Job& j, std::span<const size_t> lines, int k) {
       }
       decoded = ctc_greedy(v.as<float>(), m, static_cast<int>(v.shape[1]), static_cast<int>(v.shape[2]), lengths);
     });
-    for (int i = 0; i < m; ++i) detail::read_line(j.out.lines[lines[a + i]], decoded[i], lengths[i], o.crop, vocab);
+    if (o.spaces) {  // each crop's columns of ink, for its spaces (SpaceRule)
+      std::vector<uint8_t> ink(static_cast<size_t>(bw));
+      for (int i = 0; i < m; ++i) {
+        const uint8_t* c = crops.data() + static_cast<size_t>(i) * h * bw;
+        const bool has = detail::ink_columns(c, widths[i], h, bw, o.crop, ink.data());
+        detail::read_line(j.out.lines[lines[a + i]], decoded[i], lengths[i], o.crop, vocab,
+                          has ? ink.data() : nullptr, widths[i], &*o.spaces);
+      }
+    } else {
+      for (int i = 0; i < m; ++i) detail::read_line(j.out.lines[lines[a + i]], decoded[i], lengths[i], o.crop, vocab);
+    }
     a = b;
   }
 }
@@ -990,8 +1141,7 @@ void Engine::Impl::read_lines(Job& j, std::span<const size_t> lines, int k) {
 void Engine::Impl::finish(Job& j, int k) {
   OcrPage& out = j.out;
   out.ms.recognize = ms_since(j.lines_start);
-  if (o.split) out.lines = split_lines(std::move(out.lines), *o.split);
-  order_page(out, k);
+  detail::finish_page(out, w[k].order.get(), o);
   out.ms.total = ms_since(j.start);
 }
 
@@ -999,10 +1149,10 @@ void Engine::Impl::finish(Job& j, int k) {
 
 namespace detail {
 
-LineTasks line_tasks(std::span<const OcrLine> lines, const CropRule& crop, int parts, int line_batch) {
+LineTasks line_tasks(std::span<const OcrLine> lines, const CropRule& crop, int parts, int line_batch, double ratio) {
   const size_t n = lines.size();
   std::vector<int> bucket(n);
-  for (size_t i = 0; i < n; ++i) bucket[i] = width_bucket(crop_region(lines[i].box, crop).width);
+  for (size_t i = 0; i < n; ++i) bucket[i] = width_bucket(crop_region(lines[i].box, crop).width, ratio);
   std::vector<size_t> order(n);
   std::iota(order.begin(), order.end(), size_t{0});
   std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return bucket[a] < bucket[b]; });
@@ -1110,6 +1260,9 @@ Detection on_page(const Detection& d, int vw, int vh, int dw, int dh) {
   p.lines.reserve(d.lines.size());
   for (const DetBox& l : d.lines) p.lines.push_back(to_page(l));
   for (const DetBox& b : d.pictures) p.pictures.push_back(to_page(b));
+  p.picture_mask = d.picture_mask;  // its map pixels now cover the page's
+  p.picture_mask.px_x *= sx;
+  p.picture_mask.px_y *= sy;
   return p;
 }
 
@@ -1153,10 +1306,93 @@ void place_detection(const Detection& first, const GrayView& upright, int dw, in
     if (b.x1 - b.x0 >= 1 && b.y1 - b.y0 >= 1) out.lines.push_back({b, "", 0.0f, l.score});
   }
   for (const DetBox& p : d.pictures) out.pictures.push_back(p.box);
+  out.picture_mask = std::move(d.picture_mask);
+}
+
+bool ink_columns(const uint8_t* crop, int width, int h, int64_t stride, const CropRule& rule, uint8_t* out) {
+  if (width <= 0 || h <= 0) return false;
+  // the text's rows: the crop less its padding above and below (pad_v of the text's height each)
+  const int pad = static_cast<int>(std::lround(h * rule.pad_v / (1 + 2 * rule.pad_v)));
+  const int r0 = std::min(pad, h - 1), r1 = std::max(r0 + 1, h - pad);
+  std::array<int32_t, 256> hist{};
+  std::vector<uint8_t> low(static_cast<size_t>(width), 255);  // each column's darkest, in the text's rows
+  for (int y = r0; y < r1; ++y) {
+    const uint8_t* row = crop + y * stride;
+    for (int x = 0; x < width; ++x) {  // a loop the compiler takes to pminub
+      low[static_cast<size_t>(x)] = std::min(low[static_cast<size_t>(x)], row[x]);
+      ++hist[row[x]];
+    }
+  }
+  const int64_t n = static_cast<int64_t>(r1 - r0) * width;
+  int darkest = 0;
+  while (darkest < 255 && hist[static_cast<size_t>(darkest)] == 0) ++darkest;
+  int64_t seen = 0;
+  int p90 = 255;
+  for (int v = 0; v < 256; ++v) {
+    seen += hist[static_cast<size_t>(v)];
+    if (seen * 10 >= n * 9) {
+      p90 = v;
+      break;
+    }
+  }
+  if (p90 - darkest < 32) return false;
+  const int t = (darkest + p90) / 2;
+  for (int x = 0; x < width; ++x) out[x] = low[static_cast<size_t>(x)] < t;
+  return true;
 }
 
 void read_line(OcrLine& line, const CtcLine& d, int32_t length, const CropRule& crop,
-               const std::vector<std::string>& vocab) {
+               const std::vector<std::string>& vocab, const uint8_t* ink, int ink_width, const SpaceRule* spaces) {
+  auto is_space = [&](size_t c) {
+    const int32_t id = d.ids[c];
+    return id > 0 && static_cast<size_t>(id) < vocab.size() &&
+           vocab[static_cast<size_t>(id)].find_first_not_of(" \t") == std::string::npos;
+  };
+  auto is_char = [&](size_t c) {
+    const int32_t id = d.ids[c];
+    return id > 0 && static_cast<size_t>(id) < vocab.size() && !is_space(c);
+  };
+  // The line's median blank run between inks, in crop columns (SpaceRule::wider), found at the first unsure space.
+  double median_gap = -1;
+  auto line_gap = [&] {
+    if (median_gap >= 0) return median_gap;
+    std::vector<int> runs;
+    int run = 0;
+    bool inked = false;
+    for (int x = 0; x < ink_width; ++x) {
+      if (!ink[x]) {
+        ++run;
+        continue;
+      }
+      if (inked && run > 0) runs.push_back(run);
+      run = 0;
+      inked = true;
+    }
+    median_gap = 0;
+    if (!runs.empty()) {
+      std::nth_element(runs.begin(), runs.begin() + runs.size() / 2, runs.end());
+      median_gap = runs[runs.size() / 2];
+    }
+    return median_gap;
+  };
+  // Whether the ink bears out the space at c: a blank run of the crop's columns, between its two neighbouring
+  // characters' frames, `wider` times the line's median and min_gap of the text's height (no neighbour on a side:
+  // kept).
+  auto parted = [&](size_t c) {
+    size_t a = c, b = c;
+    while (a > 0 && !is_char(a - 1)) --a;
+    while (b + 1 < d.ids.size() && !is_char(b + 1)) ++b;
+    if (a == 0 || b + 1 >= d.ids.size()) return true;
+    const int x0 = std::clamp(d.frames[a - 1] * crop.frame_px, 0, ink_width);
+    const int x1 = std::clamp(d.frames[b + 1] * crop.frame_px, 0, ink_width);
+    const double text_h = crop.height / (1 + 2 * crop.pad_v);
+    int run = 0, longest = 0;
+    for (int x = x0; x < x1; ++x) {
+      run = ink[x] ? 0 : run + 1;
+      longest = std::max(longest, run);
+    }
+    return longest >= std::max(spaces->min_gap * text_h, spaces->wider * line_gap());
+  };
   // A frame's place on the page: frame f starts at crop x f * frame_px, and the
   // crop is its region of the page resampled to the crop's own width.
   const CropRegion r = crop_region(line.box, crop);
@@ -1164,6 +1400,8 @@ void read_line(OcrLine& line, const CtcLine& d, int32_t length, const CropRule& 
   auto page_x = [&](int frame) { return std::clamp(r.x0 + frame * crop.frame_px * per_px, line.box.x0, line.box.x1); };
   double sum = 0, word_sum = 0;
   int word_chars = 0;
+  float least = 1;
+  bool any = false;
   OcrWord word;
   auto end_word = [&](int frame) {
     if (word.text.empty()) return;
@@ -1179,18 +1417,232 @@ void read_line(OcrLine& line, const CtcLine& d, int32_t length, const CropRule& 
     sum += d.probs[c];
     if (id <= 0 || static_cast<size_t>(id) >= vocab.size()) continue;
     const std::string& ch = vocab[id];
-    line.text += ch;
-    if (ch.find_first_not_of(" \t") == std::string::npos) {  // a space ends a word
+    if (ch.find_first_not_of(" \t") == std::string::npos) {  // a space ends a word, unless the ink belies it
+      if (ink && spaces && d.probs[c] < spaces->sure && !parted(c)) continue;
+      line.text += ch;
       end_word(d.frames[c]);
       continue;
     }
+    line.text += ch;
     if (word.text.empty()) word.box = {page_x(d.frames[c]), line.box.y0, line.box.x1, line.box.y1};
     word.text += ch;
     word_sum += d.probs[c];
     ++word_chars;
+    least = std::min(least, d.probs[c]);
+    any = true;
   }
   end_word(length);
   line.confidence = d.ids.empty() ? 0.0f : static_cast<float>(sum / d.ids.size());
+  line.least = any ? least : 0.0f;
+}
+
+// ---------------------------------------------------------------- the gate (GateRule)
+
+void gate_whole_lines(OcrPage& page, const GateRule& rule) {
+  std::vector<OcrLine> kept;
+  kept.reserve(page.lines.size());
+  for (OcrLine& l : page.lines) {
+    const TextKinds k = kinds_of(l.text);
+    const double w = l.box.x1 - l.box.x0, h = l.box.y1 - l.box.y0;
+    const char* why = k.chars() == 0                                                   ? "empty"
+                      : k.alnum == 0 && k.other == 0                                   ? "rules"
+                      : h > rule.sliver * w && k.chars() <= rule.sliver_chars           ? "sliver"
+                                                                                        : nullptr;
+    if (why) {
+      page.dropped.push_back({std::move(l), why});
+    } else {
+      kept.push_back(std::move(l));
+    }
+  }
+  page.lines = std::move(kept);
+}
+
+void gate_pieces(OcrPage& page, const GateRule& rule) {
+  const size_t n = page.lines.size();
+  std::vector<const char*> why(n, nullptr);
+  for (size_t i = 0; i < n; ++i) {  // read out of a picture, unsurely
+    const OcrLine& l = page.lines[i];
+    if ((l.confidence < rule.picture_sure || l.least < rule.picture_least) &&
+        page.picture_mask.share(l.box) >= rule.picture_share) {
+      why[i] = "picture";
+    }
+  }
+  for (size_t i = 0; i < n; ++i) {  // a few unsure characters with nothing beside them on their row
+    const OcrLine& l = page.lines[i];
+    if (why[i] || l.confidence >= rule.lone_sure || kinds_of(l.text).alnum > rule.lone_chars) continue;
+    const double h = std::max(1.0, l.box.y1 - l.box.y0);
+    bool beside = false;
+    for (size_t j = 0; j < n && !beside; ++j) {
+      if (j == i || why[j]) continue;
+      const LineBox& b = page.lines[j].box;
+      const double over = std::min(l.box.y1, b.y1) - std::max(l.box.y0, b.y0);
+      const double gap = std::max(b.x0, l.box.x0) - std::min(b.x1, l.box.x1);
+      beside = over >= 0.5 * std::min(h, b.y1 - b.y0) && gap <= h;
+    }
+    if (!beside) why[i] = "lone";
+  }
+  std::vector<OcrLine> kept;
+  kept.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    if (why[i]) {
+      page.dropped.push_back({std::move(page.lines[i]), why[i]});
+    } else {
+      kept.push_back(std::move(page.lines[i]));
+    }
+  }
+  page.lines = std::move(kept);
+}
+
+void blocks_by_geometry(PageOrder& po, std::span<const LineBox> boxes, std::span<const std::string> texts) {
+  if (po.blocks.size() <= 1) return;
+  std::vector<double> hs, cws;
+  for (size_t i = 0; i < boxes.size(); ++i) {
+    const double h = boxes[i].y1 - boxes[i].y0, w = boxes[i].x1 - boxes[i].x0;
+    const int c = code_points(texts[i]);
+    if (h > 0) hs.push_back(h);
+    if (c > 0 && w > 0) cws.push_back(w / c);
+  }
+  auto median = [](std::vector<double>& v, double none) {
+    if (v.empty()) return none;
+    std::nth_element(v.begin(), v.begin() + static_cast<int64_t>(v.size() / 2), v.end());
+    return v[v.size() / 2];
+  };
+  const double lh = std::max(1.0, median(hs, 1.0));
+  const double cw = std::max(1.0, median(cws, lh / 2));
+  std::vector<LineBox> bb;
+  for (const OrderBlock& b : po.blocks) {
+    LineBox u = boxes[b.lines.front()];
+    for (size_t i : b.lines) {
+      u = {std::min(u.x0, boxes[i].x0), std::min(u.y0, boxes[i].y0), std::max(u.x1, boxes[i].x1),
+           std::max(u.y1, boxes[i].y1)};
+    }
+    bb.push_back(u);
+  }
+  std::vector<size_t> idx(bb.size()), order;
+  std::iota(idx.begin(), idx.end(), size_t{0});
+  unit_xy_cut(std::move(idx), bb, cw, lh, order);
+  std::vector<OrderBlock> blocks;
+  po.order.clear();
+  for (size_t k : order) {
+    po.order.insert(po.order.end(), po.blocks[k].lines.begin(), po.blocks[k].lines.end());
+    blocks.push_back(std::move(po.blocks[k]));
+  }
+  po.blocks = std::move(blocks);
+}
+
+void table_spans(OcrPage& page) {
+  for (OcrBlock& b : page.blocks) {
+    const size_t m = b.cells.size();
+    if (b.label != "Table" || m < 2) continue;
+    std::vector<LineBox> box(m);
+    for (size_t k = 0; k < m; ++k) {
+      LineBox u{1e300, 1e300, -1e300, -1e300};
+      for (int i : b.cells[k].lines) {
+        const LineBox& l = page.lines[static_cast<size_t>(i)].box;
+        u = {std::min(u.x0, l.x0), std::min(u.y0, l.y0), std::max(u.x1, l.x1), std::max(u.y1, l.y1)};
+      }
+      box[k] = u;
+    }
+    auto over = [](double a0, double a1, double b0, double b1) { return std::min(a1, b1) - std::max(a0, b0); };
+    // A cell is wide where it covers more than half of two cells that lie apart across the page (a header over
+    // columns); every other cell keeps the model's row and column.
+    std::vector<bool> wide(m, false);
+    std::vector<size_t> covered;
+    for (size_t a = 0; a < m; ++a) {
+      covered.clear();
+      for (size_t c = 0; c < m; ++c) {
+        if (c != a && over(box[a].x0, box[a].x1, box[c].x0, box[c].x1) > 0.5 * (box[c].x1 - box[c].x0)) {
+          covered.push_back(c);
+        }
+      }
+      for (size_t x = 0; x < covered.size() && !wide[a]; ++x) {
+        for (size_t y = x + 1; y < covered.size(); ++y) {
+          const LineBox &p = box[covered[x]], &q = box[covered[y]];
+          if (over(p.x0, p.x1, q.x0, q.x1) <= 0) {
+            wide[a] = true;
+            break;
+          }
+        }
+      }
+    }
+    if (std::find(wide.begin(), wide.end(), true) == wide.end()) continue;  // no span: the model's grid as it is
+    // The model's columns by their narrow cells' extents; a column of wide cells alone (the model gave a header a
+    // column of its own) goes, the rest numbered left to right.
+    int cols = 0;
+    for (const OcrCell& c : b.cells) cols = std::max(cols, c.col + 1);
+    std::vector<std::pair<double, double>> extent(static_cast<size_t>(cols), {1e300, -1e300});
+    for (size_t k = 0; k < m; ++k) {
+      if (wide[k]) continue;
+      auto& e = extent[static_cast<size_t>(b.cells[k].col)];
+      e = {std::min(e.first, box[k].x0), std::max(e.second, box[k].x1)};
+    }
+    std::vector<int> kept;  // the model's columns that hold a narrow cell, by their left edge
+    for (int c = 0; c < cols; ++c) {
+      if (extent[static_cast<size_t>(c)].first <= extent[static_cast<size_t>(c)].second) kept.push_back(c);
+    }
+    if (kept.empty()) continue;
+    std::stable_sort(kept.begin(), kept.end(),
+                     [&](int x, int y) { return extent[static_cast<size_t>(x)].first < extent[static_cast<size_t>(y)].first; });
+    std::vector<int> renumber(static_cast<size_t>(cols), -1);
+    for (size_t t = 0; t < kept.size(); ++t) renumber[static_cast<size_t>(kept[t])] = static_cast<int>(t);
+    for (size_t k = 0; k < m; ++k) {
+      OcrCell& c = b.cells[k];
+      if (!wide[k]) {
+        c.col = renumber[static_cast<size_t>(c.col)];
+        continue;
+      }
+      int f = -1, n = 0;  // the kept columns it covers more than half of
+      for (size_t t = 0; t < kept.size(); ++t) {
+        const auto& e = extent[static_cast<size_t>(kept[t])];
+        if (over(box[k].x0, box[k].x1, e.first, e.second) > 0.5 * (e.second - e.first)) {
+          if (f < 0) f = static_cast<int>(t);
+          ++n;
+        }
+      }
+      if (f < 0) {  // none by half: the column its centre is nearest
+        const double x = (box[k].x0 + box[k].x1) / 2;
+        double best = 1e300;
+        for (size_t t = 0; t < kept.size(); ++t) {
+          const auto& e = extent[static_cast<size_t>(kept[t])];
+          const double d = x < e.first ? e.first - x : x > e.second ? x - e.second : 0;
+          if (d < best) {
+            best = d;
+            f = static_cast<int>(t);
+          }
+        }
+        n = 1;
+      }
+      c.col = f;
+      c.col_span = std::max(1, n);
+    }
+    std::stable_sort(b.cells.begin(), b.cells.end(),
+                     [](const OcrCell& x, const OcrCell& y) { return x.row != y.row ? x.row < y.row : x.col < y.col; });
+  }
+}
+
+void text_tables_as_text(OcrPage& page, int max_cell_chars) {
+  for (OcrBlock& b : page.blocks) {
+    if (b.label != "Table" || b.cells.empty()) continue;
+    std::vector<int> chars;
+    for (const OcrCell& c : b.cells) {
+      int n = 0;
+      for (int i : c.lines) n += code_points(page.lines[static_cast<size_t>(i)].text);
+      chars.push_back(n);
+    }
+    std::nth_element(chars.begin(), chars.begin() + static_cast<int64_t>(chars.size() / 2), chars.end());
+    if (chars[chars.size() / 2] > max_cell_chars) {
+      b.label = "Text";
+      b.cells.clear();
+    }
+  }
+}
+
+void finish_page(OcrPage& page, Session* order, const EngineOptions& o) {
+  if (o.gate) gate_whole_lines(page, *o.gate);
+  if (o.split) page.lines = split_lines(std::move(page.lines), *o.split);
+  if (o.gate) gate_pieces(page, *o.gate);
+  page.picture_mask = PictureMask{};
+  order_page(page, order, o);
 }
 
 void order_page(OcrPage& page, Session* model, const EngineOptions& o) {
@@ -1217,7 +1669,8 @@ void order_page(OcrPage& page, Session* model, const EngineOptions& o) {
     if (y.size() != 6) throw Error("the order model gives " + std::to_string(y.size()) + " outputs, not 6");
     auto at = [&](size_t i) { return std::span<const float>(y[i].data<float>()); };
     const OrderOutputs outs{static_cast<int>(n), at(0), at(1), at(2), at(3), at(4), at(5)};
-    const PageOrder po = decode_order(outs, boxes, o.order);
+    PageOrder po = decode_order(outs, boxes, o.order);
+    if (!po.fallback && o.blocks_by_geometry) blocks_by_geometry(po, boxes, texts);
     order = po.order;
     page.order = po.fallback ? "xy-cut" : "model";
     std::vector<int> pos(n);  // where each line goes
@@ -1238,6 +1691,8 @@ void order_page(OcrPage& page, Session* model, const EngineOptions& o) {
   std::vector<OcrLine> ordered;
   for (size_t i : order) ordered.push_back(std::move(page.lines[i]));
   page.lines = std::move(ordered);
+  text_tables_as_text(page, o.tables ? o.tables->max_cell_chars : TableRule{}.max_cell_chars);
+  if (o.table_spans) table_spans(page);
   if (page.blocks.empty() && o.tables) find_tables(page, *o.tables);  // no model's blocks: tables from geometry
 }
 

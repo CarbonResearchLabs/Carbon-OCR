@@ -133,6 +133,20 @@ TEST(Detect, TinyLinesStillGetABand) {
   EXPECT_EQ(sum, 1.0f);
 }
 
+// ... and the decoder reads that band of one pixel back, where it is sure (DetRule::single_pixel); without it, the
+// line is lost as noise.
+TEST(Detect, ASurePixelBandIsALine) {
+  const std::vector<LineBox> lines = {{100, 100, 103, 104}};
+  std::vector<float> m = ideal_maps(lines, {});
+  const Detection d = decode_det(m.data(), kH, kW);
+  ASSERT_EQ(d.lines.size(), 1u);
+  EXPECT_LE(std::abs(d.lines[0].box.y0 - 100), 1.0);
+  EXPECT_LE(std::abs(d.lines[0].box.y1 - 104), 1.0);
+  DetRule none;
+  none.single_pixel = 0;
+  EXPECT_TRUE(decode_det(m.data(), kH, kW, 1.0, none).lines.empty());
+}
+
 TEST(Detect, TheMasksHoldTheSetPixelsAndTheirValues) {
   // A few set pixels across word boundaries; their values in row-major order.
   const int h = 3, w = 70;
@@ -213,6 +227,20 @@ TEST(Detect, OnlyAPageOfTinyLinesTakesTheSecondPass) {
   EXPECT_FALSE(takes_second_pass(decode_det(ideal_maps(tiny).data(), kH, kW, 2.0)));
 }
 
+// The second pass where a share of the lines is tiny though the median is not: a fifth of a page's lines small
+// print, at least second_pass_lines of them.
+TEST(Detect, ASecondPassForAPageOfSomeTinyLines) {
+  std::vector<LineBox> boxes;
+  for (int i = 0; i < 30; ++i) boxes.push_back({0, 20.0 * i, 300, 20.0 * i + 14});          // print
+  for (int i = 0; i < 8; ++i) boxes.push_back({400, 10.0 * i, 600, 10.0 * i + 6});          // 8 tiny lines: 21%
+  DetRule share;
+  share.second_pass_share = 0.15;
+  EXPECT_TRUE(takes_second_pass(lines_of(boxes), share));
+  EXPECT_FALSE(takes_second_pass(lines_of(boxes)));  // the default: by the median alone
+  boxes.resize(30 + 7);  // 7 tiny lines: under second_pass_lines
+  EXPECT_FALSE(takes_second_pass(lines_of(boxes), share));
+}
+
 // Merging the passes (page pixels, the first pass at half the page's scale): a line
 // both found is kept from the pass whose scale suits it (the second's for a line
 // under 9 px at the first's scale, 18 here), every other line of either kept, each
@@ -257,9 +285,10 @@ TEST(Detect, MergingKeepsEachLineFromThePassThatSuitsIt) {
   EXPECT_EQ(m.pictures[0].box.y0, 600);
   EXPECT_EQ(m.pictures[1].box.y0, 950);
 
-  // At the page's own scale the 12-px line is not tiny: the first's box
+  // At the page's own scale the 12-px line is not tiny: the first's box; and the second's box at y 500 that pairs
+  // with nothing, now not tiny and inside the first's kept box of the same line, goes (it would be read twice)
   const Detection same = merge_passes(first, second, 1.0);
-  ASSERT_EQ(same.lines.size(), want.size());
+  ASSERT_EQ(same.lines.size(), want.size() - 1);
   EXPECT_EQ(same.lines[0].box.y0, 100);
   EXPECT_EQ(same.lines[0].score, kFirst);
   // nothing found twice: everything kept
@@ -268,8 +297,9 @@ TEST(Detect, MergingKeepsEachLineFromThePassThatSuitsIt) {
 }
 
 // A first box over text the second pass read as tiny lines goes, so nothing is read
-// twice: two tiny lines the first pass ran together, or one it boxed loosely. A first
-// box over lines the second pass found large (a heading the larger scale split) stays.
+// twice: two tiny lines the first pass ran together, or one it boxed loosely. A heading
+// the larger scale split into pieces stays the first pass's one box: its pieces, not
+// tiny and inside it, go, or the heading would be read three times.
 TEST(Detect, MergingDropsAFirstBoxTheSecondPassReadAsTinyLines) {
   constexpr float kFirst = 0.25f, kSecond = 0.75f;
   const Detection first = lines_of({{100, 700, 500, 724},    // two tiny lines run together
@@ -285,10 +315,20 @@ TEST(Detect, MergingDropsAFirstBoxTheSecondPassReadAsTinyLines) {
   const Detection m = merge_passes(first, second, 2.0);  // tiny: under 18 page pixels
   std::vector<std::pair<double, float>> got;  // (top, pass)
   for (const DetBox& l : m.lines) got.emplace_back(l.box.y0, l.score);
-  const std::vector<std::pair<double, float>> want = {
-      {700, kSecond}, {705, kSecond}, {713, kSecond}, {800, kFirst}, {800, kSecond}, {800, kSecond}};
+  const std::vector<std::pair<double, float>> want = {{700, kSecond}, {705, kSecond}, {713, kSecond}, {800, kFirst}};
   std::sort(got.begin(), got.end());
   EXPECT_EQ(got, want);
+}
+
+// A tiny line the first pass placed coarsely (its box offset, under the IoU that would pair it) and the second
+// pass found again: the second's box is kept, the first's inside it goes.
+TEST(Detect, MergingDropsATinyFirstBoxInsideASecondOne) {
+  constexpr float kFirst = 0.25f, kSecond = 0.75f;
+  const Detection first = lines_of({{100, 300, 300, 309}}, kFirst);   // 9 px: tiny (under 18)
+  const Detection second = lines_of({{90, 296, 420, 311}}, kSecond);  // the same line, boxed wider and taller
+  const Detection m = merge_passes(first, second, 2.0);
+  ASSERT_EQ(m.lines.size(), 1u);
+  EXPECT_EQ(m.lines[0].score, kSecond);
 }
 
 }  // namespace

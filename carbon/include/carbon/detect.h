@@ -42,6 +42,10 @@ struct DetRule {
   float core_threshold = 0.5f;     // a probability
   float picture_threshold = 0.5f;  // a probability
   int min_core_pixels = 2;         // a smaller band is noise
+  // ... except a band of one pixel this sure (its probability; 0: never): training gives every line a band of at
+  // least one map pixel, so a line under about 5 px at the detector's scale, or a lone character under about 7,
+  // has only that one (det_targets' centres_in).
+  float single_pixel = 0.8f;
   int min_picture_pixels = 16;
   // A line's top is this quantile of its band pixels' top edges, its bottom
   // the (1 - q) quantile of their bottom edges, so the box of a slightly
@@ -54,6 +58,13 @@ struct DetRule {
   double second_pass_below = 9.0;
   double second_pass_scale = 2.0;
   double merge_iou = 0.5;
+  // The second pass also where the median line is not tiny but at least this share of the lines, and at least
+  // second_pass_lines of them, are (0, the default: by the median alone): a page whose small print is a fifth of
+  // its lines. At 0.15 the whole page's second pass helped OmniParseBench's tiny_plans (85.2 to 86.9) and
+  // large_format and cost 6-8% of the CPU's pages a second and 3% of the GPU's: off until the
+  // pass runs on the tiny lines' bands alone.
+  double second_pass_share = 0;
+  int second_pass_lines = 8;
 };
 
 struct DetBox {
@@ -62,9 +73,21 @@ struct DetBox {
   int pixels = 0;   // its map pixels
 };
 
+// The picture map thresholded (DetMasks::picture), kept with a detection: bit j of word k of row r is map pixel
+// (r, 32 k + j), which covers the boxes' pixels [px_x c, px_x (c + 1)) x [px_y r, px_y (r + 1)). The engine's gate
+// reads it (a line read out of a photograph, carbon/engine.h's GateRule); empty where no pass made one.
+struct PictureMask {
+  int height = 0, width = 0, words = 0;
+  double px_x = 0, px_y = 0;  // the boxes' pixels a map pixel covers
+  std::vector<uint32_t> bits;
+  // The share of the map pixels under a box that are set (0 for an empty mask or box).
+  double share(const LineBox& b) const;
+};
+
 struct Detection {
   std::vector<DetBox> lines;     // top to bottom, then left to right
   std::vector<DetBox> pictures;  // the same order
+  PictureMask picture_mask;      // the first pass's (decode_det from masks; merge_passes keeps the first's)
   // The median line height, in the boxes' pixels: under 9 px at the detector's
   // scale, the page takes a second pass at a larger one (takes_second_pass).  0
   // without lines.

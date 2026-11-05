@@ -71,10 +71,13 @@ class OrtSession final : public Session {
     so.SetIntraOpNumThreads(options.threads);
     so.SetInterOpNumThreads(1);
     so.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
-    // With threads > 1 the session's own threads sleep when idle: spinning
-    // would take cores the other workers need.  With 1 it has none.
-    so.AddConfigEntry("session.intra_op.allow_spinning", "0");
+    // With threads > 1 (a wide detector, run only on cores that are idle) the session's threads spin inside a run,
+    // where a detector's two dozen parallel sections would each wake them from sleep, and stop when it ends
+    // (force_spinning_stop), so they never spin on cores the other workers need.  With 1 it has none.
+    const bool wide = options.threads > 1;
+    so.AddConfigEntry("session.intra_op.allow_spinning", wide ? "1" : "0");
     so.AddConfigEntry("session.inter_op.allow_spinning", "0");
+    if (wide) so.AddConfigEntry("session.force_spinning_stop", "1");
     so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
     if (options.threads > 1 && !options.thread_cpus.empty()) {
       // each of its threads (not the caller's) on any of these: ONNX Runtime numbers processors from 1
@@ -84,8 +87,10 @@ class OrtSession final : public Session {
       for (int t = 1; t < options.threads; ++t) all += (all.empty() ? "" : ";") + cpus;
       so.AddConfigEntry("session.intra_op_thread_affinities", all.c_str());
     }
-    // Denormals flushed to zero: no slow path on tiny activations.
-    so.AddConfigEntry("session.set_denormal_as_zero", "1");
+    // Denormals kept (IEEE), as on every worker of the pool (carbon/src/parallel.cpp's ieee_denormals): ONNX
+    // Runtime applies this option once a process, to the thread that makes the first session, so "1" left one
+    // worker flushing and the others not.
+    so.AddConfigEntry("session.set_denormal_as_zero", "0");
     // The arena (SessionOptions::cpu_arena).  Without it every run asks the OS
     // for its activations, and large blocks come back as fresh, zero-filled
     // pages under a lock the whole process shares, which costs more the more

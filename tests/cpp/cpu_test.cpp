@@ -3,7 +3,10 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -856,6 +859,64 @@ TEST(CpuCrops, CountBeyondAsTheReference) {
         EXPECT_EQ(got.above, above) << isa_name(isa) << " w " << w << " hi " << hi;
       }
     }
+  }
+}
+
+// The deskew search's rows: every ISA's counts the reference's, for points across a page and past its edges (the
+// clamp), at angles either way, a count that is not a multiple of 4 (the tail).
+TEST(CpuSkew, RowsAreTheReferences) {
+  std::mt19937 rng(11);
+  std::uniform_real_distribution<float> px(-900.0f, 900.0f);
+  for (const int64_t n : {int64_t{1}, int64_t{7}, int64_t{4096}, int64_t{60003}}) {
+    std::vector<float> x(static_cast<size_t>(n)), y(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) {
+      x[static_cast<size_t>(i)] = std::round(px(rng)) + 0.5f;
+      y[static_cast<size_t>(i)] = std::round(px(rng));
+    }
+    const int rows = 1500, last = rows - 1;
+    for (const double deg : {0.0, -5.0, 0.35, 4.95, -12.5}) {
+      const double a = deg * 3.14159265358979323846 / 180.0, s = std::sin(a), c = std::cos(a);
+      std::vector<int32_t> want(4 * rows, 0);
+      cpu::skew_rows(x.data(), y.data(), n, c, s, rows / 2.0, last, want.data(), Isa::kScalar);
+      int64_t total = 0;
+      for (int32_t v : want) total += v;
+      ASSERT_EQ(total, n);
+      for (Isa isa : isas_available()) {
+        std::vector<int32_t> got(4 * rows, 0);
+        cpu::skew_rows(x.data(), y.data(), n, c, s, rows / 2.0, last, got.data(), isa);
+        EXPECT_EQ(got, want) << isa_name(isa) << " n " << n << " deg " << deg;
+      }
+    }
+  }
+}
+
+// The search's time on 60,000 points over its 21 coarse angles, the reference against the best ISA's: printed
+// where CARBON_TIME is set (a measurement, not a check).
+TEST(CpuSkew, Time) {
+  if (!std::getenv("CARBON_TIME")) GTEST_SKIP() << "set CARBON_TIME to time it";
+  std::mt19937 rng(5);
+  std::uniform_real_distribution<float> px(-700.0f, 700.0f);
+  const int64_t n = 60000;
+  std::vector<float> x(n), y(n);
+  for (int64_t i = 0; i < n; ++i) {
+    x[static_cast<size_t>(i)] = std::round(px(rng));
+    y[static_cast<size_t>(i)] = std::round(px(rng));
+  }
+  const int rows = 1300;
+  std::vector<int32_t> count(4 * rows);
+  for (Isa isa : {Isa::kScalar, best_isa()}) {
+    double best = 1e30;
+    for (int round = 0; round < 7; ++round) {
+      const auto t = std::chrono::steady_clock::now();
+      for (int k = 0; k < 21; ++k) {
+        const double a = (k - 10) * 0.5 * 3.14159265358979323846 / 180.0;
+        std::fill(count.begin(), count.end(), 0);
+        cpu::skew_rows(x.data(), y.data(), n, std::cos(a), std::sin(a), rows / 2.0, rows - 1, count.data(), isa);
+      }
+      best = std::min(best, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count());
+    }
+    std::printf("skew_rows %s: %.3f ms for 21 angles of %lld points\n", isa_name(isa), best,
+                static_cast<long long>(n));
   }
 }
 

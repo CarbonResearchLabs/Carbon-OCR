@@ -17,6 +17,10 @@
 
 #include "carbon/error.h"
 
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <xmmintrin.h>
+#endif
+
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -37,6 +41,22 @@
 namespace carbon {
 
 namespace {
+
+// IEEE arithmetic on the calling thread: denormals kept, not flushed to zero (MXCSR's FTZ and DAZ, bits 15 and 6;
+// Arm's FPCR FZ and FZ16, bits 24 and 19, cleared). Every worker the same, so a page's bits do not depend on which
+// worker read it: ONNX Runtime's set_denormal_as_zero reached only the thread that made the process's first
+// session. Flushing would not be the same on every ISA either (x86 detects tininess after rounding, Arm before).
+void ieee_denormals() {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+  _mm_setcsr(_mm_getcsr() & ~0x8040u);
+#elif defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+  uint64_t fpcr;
+  __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+  fpcr &= ~((uint64_t{1} << 24) | (uint64_t{1} << 19));
+  __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+#endif
+}
+
 
 // Workers take cores fastest class first and, within a class, one NUMA node
 // after another, so a pool smaller than the machine spreads its memory traffic;
@@ -461,6 +481,7 @@ WorkerPool::WorkerPool(PoolOptions options) : impl_(std::make_unique<Impl>()) {
       if (pin && !topo.cores.empty() && pin_this_thread(topo.cores[i % topo.cores.size()])) {
         impl_->pinned.fetch_add(1);
       }
+      ieee_denormals();
       started.count_down();
       impl_->run(i);
     });

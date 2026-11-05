@@ -348,12 +348,22 @@ TEST(Engine, ReadsAPagesPictures) {
 
 // The order model's reading order, not the XY-cut's: tests/data/fake-order.onnx
 // reads lines bottom to top, each a block of its own, a Section-Header.  Unsure, the
-// XY-cut's order, the blocks still the model's.
+// XY-cut's order, the blocks still the model's.  By geometry (the default), the
+// model's blocks top to bottom, their labels the model's.
 TEST(Engine, PutsLinesInTheOrderModelsOrder) {
   const GrayImage page = load_image(kSet / "page.png");
   EngineOptions o;
   o.order_model = std::filesystem::path(CARBON_TEST_DATA) / "fake-order.onnx";
   o.order.min_sure = 0;  // the fake model's links are not sure ones
+  {
+    const OcrPage g = Engine(kSet, o).ocr(page.view());
+    ASSERT_EQ(g.lines.size(), 3u);
+    EXPECT_EQ(g.order, "model");
+    EXPECT_EQ(g.lines[0].text, "aaa");  // the top line first
+    ASSERT_EQ(g.blocks.size(), 3u);
+    for (const OcrBlock& b : g.blocks) EXPECT_EQ(b.label, "Section-Header");
+  }
+  o.blocks_by_geometry = false;  // the model's own order between its blocks, from here
   Engine engine(kSet, o);
   ASSERT_TRUE(engine.has_order_model());
   const OcrPage p = engine.ocr(page.view());
@@ -463,6 +473,204 @@ TEST(Engine, ASetMustBeWhole) {
   EngineOptions o;
   o.rec = "rec-cjk";  // not in the fake set
   EXPECT_THROW(Engine(kSet, o), Error);
+}
+
+OcrLine gate_line(LineBox b, const char* text, float conf, float least) {
+  OcrLine l;
+  l.box = b;
+  l.text = text;
+  l.confidence = conf;
+  l.least = least;
+  return l;
+}
+
+std::vector<std::string> texts_of(const std::vector<OcrLine>& lines) {
+  std::vector<std::string> t;
+  for (const OcrLine& l : lines) t.push_back(l.text);
+  return t;
+}
+
+// The gate on whole lines: nothing read, rules and marks alone, a sliver of two characters at most, dropped with
+// their reasons; text, a tall box that read a word, and a rule beside text kept.
+TEST(Gate, DropsWholeLinesThatAreNotText) {
+  OcrPage p;
+  p.width = p.height = 1000;
+  p.lines = {gate_line({10, 10, 500, 30}, "A real line of text", 0.99f, 0.9f),
+             gate_line({10, 40, 500, 60}, "  ", 0, 0),
+             gate_line({10, 70, 500, 90}, "___ | __ — •", 0.8f, 0.5f),
+             gate_line({600, 10, 610, 60}, "|1", 0.3f, 0.3f),      // 10 wide, 50 high: a sliver
+             gate_line({600, 100, 620, 160}, "Abc", 0.9f, 0.9f),  // tall, but three characters
+             gate_line({10, 200, 500, 220}, "Total ____ 12", 0.9f, 0.6f)};
+  detail::gate_whole_lines(p, GateRule{});
+  EXPECT_EQ(texts_of(p.lines), (std::vector<std::string>{"A real line of text", "Abc", "Total ____ 12"}));
+  ASSERT_EQ(p.dropped.size(), 3u);
+  EXPECT_EQ(p.dropped[0].why, "empty");
+  EXPECT_EQ(p.dropped[1].why, "rules");
+  EXPECT_EQ(p.dropped[2].why, "sliver");
+  EXPECT_NE(p.json().find("\"dropped\": [{\"box\": [10.0, 40.0, 500.0, 60.0]"), std::string::npos) << p.json();
+}
+
+// The gate on pieces: read out of the picture mask unsurely, or a few unsure characters alone on their row,
+// dropped; a sure line on the picture, a few sure characters alone, and a few unsure ones beside another kept.
+TEST(Gate, DropsPiecesReadOutOfPicturesAndLoneMarks) {
+  OcrPage p;
+  p.width = p.height = 1000;
+  p.picture_mask.height = 20;
+  p.picture_mask.width = 64;
+  p.picture_mask.words = 2;
+  p.picture_mask.px_x = p.picture_mask.px_y = 10;  // a map pixel covers 10 x 10 page pixels
+  p.picture_mask.bits.assign(20 * 2, 0);
+  for (int r = 0; r < 10; ++r) p.picture_mask.bits[static_cast<size_t>(r) * 2] = ~0u;  // x 0-320, y 0-100
+  EXPECT_DOUBLE_EQ(p.picture_mask.share({0, 0, 320, 100}), 1.0);
+  EXPECT_DOUBLE_EQ(p.picture_mask.share({160, 0, 480, 100}), 0.5);
+  p.lines = {gate_line({20, 20, 300, 40}, "qur 51R9", 0.7f, 0.3f),             // on the picture, unsure
+             gate_line({20, 60, 300, 80}, "A caption in the photo", 0.97f, 0.9f),  // on it, sure
+             gate_line({20, 300, 40, 320}, "4", 0.4f, 0.4f),                      // alone, unsure
+             gate_line({20, 400, 40, 420}, "7", 0.4f, 0.4f),                      // unsure, beside a word
+             gate_line({50, 400, 300, 420}, "seven items", 0.95f, 0.9f),
+             gate_line({20, 500, 50, 520}, "12", 0.9f, 0.9f)};                    // alone, sure
+  detail::gate_pieces(p, GateRule{});
+  EXPECT_EQ(texts_of(p.lines),
+            (std::vector<std::string>{"A caption in the photo", "7", "seven items", "12"}));
+  ASSERT_EQ(p.dropped.size(), 2u);
+  EXPECT_EQ(p.dropped[0].why, "picture");
+  EXPECT_EQ(p.dropped[1].why, "lone");
+}
+
+// The order model's blocks in two columns, the model reading across them: by geometry, the left column's blocks
+// come first. The gap between a column's paragraphs (60 px) is wider than the gutter (50 px) in pixels, but the
+// gutter is 5 character widths and the gap 3 line heights, so the columns are cut first.
+TEST(Gate, BlocksInColumnsReadColumnByColumn) {
+  std::vector<LineBox> boxes;
+  std::vector<std::string> texts;
+  for (double x0 : {0.0, 450.0}) {  // the left column's four lines, then the right's
+    for (double y0 : {0.0, 30.0, 110.0, 140.0}) {
+      boxes.push_back({x0, y0, x0 + 400, y0 + 20});
+      texts.push_back(std::string(40, 'x'));
+    }
+  }
+  PageOrder po;
+  po.order = {0, 1, 4, 5, 2, 3, 6, 7};  // the model's: across the columns
+  po.blocks.resize(4);
+  po.blocks[0].lines = {0, 1};  // left, top
+  po.blocks[1].lines = {4, 5};  // right, top
+  po.blocks[2].lines = {2, 3};  // left, bottom
+  po.blocks[3].lines = {6, 7};  // right, bottom
+  po.blocks[1].label = 5;       // the labels go with their blocks
+  detail::blocks_by_geometry(po, boxes, texts);
+  EXPECT_EQ(po.order, (std::vector<size_t>{0, 1, 2, 3, 4, 5, 6, 7}));
+  ASSERT_EQ(po.blocks.size(), 4u);
+  EXPECT_EQ(po.blocks[2].lines, (std::vector<size_t>{4, 5}));
+  EXPECT_EQ(po.blocks[2].label, 5);
+}
+
+// A table whose header spans three columns, the model's columns shifted by it (the header a column of its own): laid
+// out again from the cells' boxes, the header spans the three, each cell in its own column, and the HTML says so.
+TEST(Gate, TablesLaidOutWithTheirSpans) {
+  OcrPage p;
+  p.width = p.height = 1000;
+  const char* texts[] = {"Results", "A", "B", "C", "1", "2", "3"};
+  const LineBox boxes[] = {{100, 10, 700, 30},   {100, 40, 250, 60},  {300, 40, 450, 60}, {550, 40, 700, 60},
+                           {100, 70, 250, 90},   {300, 70, 450, 90},  {550, 70, 700, 90}};
+  for (int i = 0; i < 7; ++i) p.lines.push_back(gate_line(boxes[i], texts[i], 1, 1));
+  p.blocks = {{"Table", 0.9f, {0, 1, 2, 3, 4, 5, 6},
+               {{0, 1, {0}}, {1, 0, {1}}, {1, 2, {2}}, {1, 3, {3}}, {2, 0, {4}}, {2, 2, {5}}, {2, 3, {6}}}}};
+  detail::table_spans(p);
+  const std::vector<OcrCell>& c = p.blocks[0].cells;
+  ASSERT_EQ(c.size(), 7u);
+  EXPECT_EQ(c[0].lines, std::vector<int>{0});
+  EXPECT_EQ(c[0].row, 0);
+  EXPECT_EQ(c[0].col, 0);
+  EXPECT_EQ(c[0].col_span, 3);
+  for (int k = 1; k < 7; ++k) {
+    EXPECT_EQ(c[k].row, 1 + (k - 1) / 3) << k;
+    EXPECT_EQ(c[k].col, (k - 1) % 3) << k;
+    EXPECT_EQ(c[k].col_span, 1) << k;
+  }
+  EXPECT_NE(p.json().find("\"col_span\": 3"), std::string::npos);
+}
+
+// The width buckets at a ratio of their own: at the trainer's 1.3, every width's bucket as width_bucket's; at 1.15
+// a finer ladder, each bucket holding its width, past 2048 a width rounded up to 8 as at 1.3.
+TEST(Gate, WidthBucketsByRatio) {
+  for (int w = 1; w <= 4096; ++w) ASSERT_EQ(width_bucket(w, 1.3), width_bucket(w)) << w;
+  int buckets_13 = 0, buckets_115 = 0, last_13 = 0, last_115 = 0;
+  for (int w = 1; w <= 2048; ++w) {
+    const int b = width_bucket(w, 1.15);
+    ASSERT_GE(b, w);
+    ASSERT_EQ(b % 8, 0);
+    if (w >= 32) ASSERT_LE(b - w, 0.16 * w + 8) << w;  // past the first bucket, about 15% of padding at most
+    buckets_115 += b != last_115;
+    buckets_13 += width_bucket(w) != last_13;
+    last_115 = b;
+    last_13 = width_bucket(w);
+  }
+  EXPECT_GT(buckets_115, buckets_13);
+  EXPECT_EQ(width_bucket(3001, 1.15), 3008);
+}
+
+// The order model's table whose median cell is a line of text is text; one of short cells stays a table.
+TEST(Gate, TablesOfTextAreText) {
+  OcrPage p;
+  p.width = p.height = 1000;
+  const char* texts[] = {"This is a whole line of body text, far longer than a cell", "and here the next one goes on",
+                         "Name", "Age"};
+  for (int i = 0; i < 4; ++i) p.lines.push_back(gate_line({10, 10.0 + 30 * i, 900, 30.0 + 30 * i}, texts[i], 1, 1));
+  p.blocks = {{"Table", 0.6f, {0, 1}, {{0, 0, {0}}, {1, 0, {1}}}},
+              {"Table", 0.6f, {2, 3}, {{0, 0, {2}}, {0, 1, {3}}}}};
+  detail::text_tables_as_text(p, TableRule{}.max_cell_chars);
+  EXPECT_EQ(p.blocks[0].label, "Text");
+  EXPECT_TRUE(p.blocks[0].cells.empty());
+  EXPECT_EQ(p.blocks[1].label, "Table");
+  EXPECT_EQ(p.blocks[1].cells.size(), 2u);
+}
+
+// Spaces by the ink (SpaceRule): of a crop of four characters, a and b a pixel apart, b and c 9 apart, c and d a
+// pixel apart, the unsure space between a and b dropped, the one between b and c kept, and the sure one between c
+// and d kept though the ink does not part them. Letter-spaced, every gap 9 wide, the unsure spaces dropped. A crop
+// of no contrast has no columns of ink.
+TEST(Gate, SpacesTheInkBearsOut) {
+  const CropRule crop;
+  const int h = crop.height, w = 64;
+  std::vector<uint8_t> c(static_cast<size_t>(h) * w, 255);
+  for (auto [x0, x1] : {std::pair{0, 11}, {12, 23}, {32, 43}, {44, 55}}) {
+    for (int y = 8; y < 25; ++y) std::fill(c.begin() + y * w + x0, c.begin() + y * w + x1, uint8_t{0});
+  }
+  std::vector<uint8_t> ink(w);
+  ASSERT_TRUE(detail::ink_columns(c.data(), w, h, w, crop, ink.data()));
+  EXPECT_EQ(ink[5], 1);
+  EXPECT_EQ(ink[11], 0);
+  EXPECT_EQ(ink[27], 0);
+  const std::vector<std::string> vocab = {"", "a", "b", "c", "d", " "};
+  CtcLine d;
+  d.ids = {1, 5, 2, 5, 3, 5, 4};
+  d.frames = {1, 3, 4, 7, 9, 11, 12};
+  d.probs = {0.99f, 0.5f, 0.99f, 0.5f, 0.99f, 0.9f, 0.99f};
+  const SpaceRule rule;
+  OcrLine by_ink;
+  by_ink.box = {100, 100, 300, 130};
+  OcrLine as_read = by_ink;
+  detail::read_line(by_ink, d, w / crop.frame_px, crop, vocab, ink.data(), w, &rule);
+  detail::read_line(as_read, d, w / crop.frame_px, crop, vocab);
+  EXPECT_EQ(by_ink.text, "ab c d");
+  ASSERT_EQ(by_ink.words.size(), 3u);
+  EXPECT_EQ(by_ink.words[0].text, "ab");
+  EXPECT_EQ(as_read.text, "a b c d");
+  std::fill(c.begin(), c.end(), uint8_t{255});  // letter-spaced: a, b, c 9 apart
+  for (auto [x0, x1] : {std::pair{0, 11}, {20, 31}, {40, 51}}) {
+    for (int y = 8; y < 25; ++y) std::fill(c.begin() + y * w + x0, c.begin() + y * w + x1, uint8_t{0});
+  }
+  ASSERT_TRUE(detail::ink_columns(c.data(), w, h, w, crop, ink.data()));
+  CtcLine spaced;
+  spaced.ids = {1, 5, 2, 5, 3};
+  spaced.frames = {1, 4, 6, 9, 11};
+  spaced.probs = {0.99f, 0.5f, 0.99f, 0.5f, 0.99f};
+  OcrLine heading;
+  heading.box = by_ink.box;
+  detail::read_line(heading, spaced, w / crop.frame_px, crop, vocab, ink.data(), w, &rule);
+  EXPECT_EQ(heading.text, "abc");
+  const std::vector<uint8_t> flat(static_cast<size_t>(h) * w, 200);
+  EXPECT_FALSE(detail::ink_columns(flat.data(), w, h, w, crop, ink.data()));
 }
 
 }  // namespace

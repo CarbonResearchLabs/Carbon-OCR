@@ -586,6 +586,34 @@ void above_bits_avx2(const float* v, int n, float t, uint32_t* bits) {
 
 // 32 bytes a step: a byte at most lo where min(v, lo) is v, at least hi where max(v, hi) is v; the masks' ones
 // summed by vpsadbw into four 64-bit lanes. The row's last bytes one at a time.
+// Four points a step: x and y widened by vcvtps2pd (exact), r = y c - x s + mid by vmulpd, vmulpd, vsubpd, vaddpd
+// (the reference's operations in its order; no FMA), truncated by vcvttpd2dq as the reference's cast, clamped by
+// vpmaxsd and vpminsd, each lane's row and its histogram (lane i & 3) as one index, then the four counts.
+void skew_rows_avx2(const float* x, const float* y, int64_t n, double c, double s, double mid, int last,
+                    int32_t* count) {
+  const __m256d vc = _mm256_set1_pd(c), vs = _mm256_set1_pd(s), vm = _mm256_set1_pd(mid);
+  const __m128i zero = _mm_setzero_si128(), top = _mm_set1_epi32(last), lane = _mm_setr_epi32(0, 1, 2, 3);
+  alignas(16) int32_t at[4];
+  int64_t i = 0;
+  for (; i + 4 <= n; i += 4) {
+    const __m256d xd = _mm256_cvtps_pd(_mm_loadu_ps(x + i)), yd = _mm256_cvtps_pd(_mm_loadu_ps(y + i));
+    const __m256d r = _mm256_add_pd(_mm256_sub_pd(_mm256_mul_pd(yd, vc), _mm256_mul_pd(xd, vs)), vm);
+    __m128i v = _mm_min_epi32(_mm_max_epi32(_mm256_cvttpd_epi32(r), zero), top);
+    v = _mm_add_epi32(_mm_slli_epi32(v, 2), lane);
+    _mm_store_si128(reinterpret_cast<__m128i*>(at), v);
+    ++count[at[0]];
+    ++count[at[1]];
+    ++count[at[2]];
+    ++count[at[3]];
+  }
+  for (; i < n; ++i) {
+    const double r = static_cast<double>(y[i]) * c - static_cast<double>(x[i]) * s + mid;
+    int v = static_cast<int>(r);
+    v = v < 0 ? 0 : v > last ? last : v;
+    ++count[4 * v + static_cast<int>(i & 3)];
+  }
+}
+
 ByteCounts count_beyond_avx2(const uint8_t* c, int w, int h, int64_t stride, int lo, int hi) {
   const bool any_below = lo >= 0, any_above = hi <= 255;
   const __m256i lo8 = _mm256_set1_epi8(static_cast<char>(any_below ? lo : 0));

@@ -130,7 +130,9 @@ class CpuModels final : public PipelineModels {
     return std::move(det_->run(std::span<const Tensor>(&input, 1))[0]);
   }
 
-  void set_pages(std::span<const GrayView> pages) override { pages_.assign(pages.begin(), pages.end()); }
+  void set_pages(std::span<const GrayView> pages, std::span<const RowRuns>) override {
+    pages_.assign(pages.begin(), pages.end());
+  }
 
   void recognize(std::span<const int32_t> page_of, std::span<const LineBox> boxes, int bw, const CropRule& crop,
                  std::vector<CtcLine>& lines, std::vector<int32_t>& lengths) override {
@@ -354,8 +356,9 @@ struct Pipeline::Impl {
       std::vector<float> z;
       try {
         z = models->orient(thumbs.data(), static_cast<int>(batch.size()), side);
-      } catch (...) {  // the run's pages fail with it; the next run goes on
+      } catch (...) {  // the run's pages fail with it; the next run goes on, unless the device is broken
         fail_pages(batch, std::current_exception());
+        if (models->broken()) fail(std::current_exception());
         continue;
       }
       const size_t classes = z.size() / batch.size();
@@ -423,8 +426,9 @@ struct Pipeline::Impl {
       std::vector<Detection> found;
       try {
         found = models->detect(smalls, ph, pw, e.det);
-      } catch (...) {  // the run's pages fail with it; the next run goes on
+      } catch (...) {  // the run's pages fail with it; the next run goes on, unless the device is broken
         fail_pages(batch, std::current_exception());
+        if (models->broken()) fail(std::current_exception());
         continue;
       }
       ++detect_runs;
@@ -448,17 +452,55 @@ struct Pipeline::Impl {
     }
   }
 
+  // The rows a page's crops read: each line's crop region (crop_region) widened by the
+  // resampler's support, twice over, and two rows more; runs closer than 16 rows joined. Rows past the page's are
+  // the crop rule's paper, read from nowhere.
+  static RowRuns rows_read(const std::vector<OcrLine>& lines, const CropRule& crop, int height) {
+    RowRuns r;
+    r.reserve(lines.size());
+    for (const OcrLine& l : lines) {
+      const CropRegion c = crop_region(l.box, crop);
+      const double scale = std::max(1.0, (c.y1 - c.y0) / crop.height);
+      const int m = static_cast<int>(std::ceil(2 * scale)) + 2;
+      const int y0 = std::max(0, static_cast<int>(std::floor(c.y0)) - m);
+      const int y1 = std::min(height, static_cast<int>(std::ceil(c.y1)) + m);
+      if (y1 > y0) r.push_back({y0, y1});
+    }
+    std::sort(r.begin(), r.end());
+    RowRuns merged;
+    for (const auto& run : r) {
+      if (!merged.empty() && run.first <= merged.back().second + 16) {
+        merged.back().second = std::max(merged.back().second, run.second);
+      } else {
+        merged.push_back(run);
+      }
+    }
+    return merged;
+  }
+
   void recognize_stage() {
     const size_t cap = static_cast<size_t>(o.line_batch) * 4;  // lines gathered before the runs start
-    while (auto first = to_recognize.pop()) {
+    // The next group, taken from the pages already waiting while this one is read and given to the models then
+    // (prefetch_pages: a GPU uploads them while it reads this group's lines); it is not topped up after.
+    std::vector<PagePtr> ahead;
+    for (;;) {
       std::vector<PagePtr> group;
-      size_t n = (*first)->out.lines.size();
-      group.push_back(std::move(*first));
-      while (n < cap) {
-        auto more = to_recognize.try_pop();
-        if (!more) break;
-        n += (*more)->out.lines.size();
-        group.push_back(std::move(*more));
+      size_t n = 0;
+      if (!ahead.empty()) {
+        group = std::move(ahead);
+        ahead.clear();
+        for (const PagePtr& p : group) n += p->out.lines.size();
+      } else {
+        auto first = to_recognize.pop();
+        if (!first) break;
+        n = (*first)->out.lines.size();
+        group.push_back(std::move(*first));
+        while (n < cap) {
+          auto more = to_recognize.try_pop();
+          if (!more) break;
+          n += (*more)->out.lines.size();
+          group.push_back(std::move(*more));
+        }
       }
       // every line of the group by its width bucket, then its page
       struct Item {
@@ -481,11 +523,34 @@ struct Pipeline::Impl {
       // A run's error is every page's with a line in it; those pages fail once the group's runs are done (the
       // runs read the group's pages), and the rest of the group goes on.
       std::vector<std::exception_ptr> errors(group.size());
+      std::vector<RowRuns> rows;
+      for (const PagePtr& p : group) rows.push_back(rows_read(p->out.lines, e.crop, p->up.view.height));
       try {
-        models->set_pages(views);
+        models->set_pages(views, rows);
       } catch (...) {
         fail_pages(group, std::current_exception());
         continue;
+      }
+      if (o.prefetch) {  // the next group from the pages waiting now, its upload started beside this group's runs
+        size_t ahead_lines = 0;
+        while (ahead_lines < cap) {
+          auto more = to_recognize.try_pop();
+          if (!more) break;
+          ahead_lines += (*more)->out.lines.size();
+          ahead.push_back(std::move(*more));
+        }
+        if (!ahead.empty()) {
+          std::vector<GrayView> next;
+          std::vector<RowRuns> next_rows;
+          for (const PagePtr& p : ahead) {
+            next.push_back(p->up.view);
+            next_rows.push_back(rows_read(p->out.lines, e.crop, p->up.view.height));
+          }
+          try {
+            models->prefetch_pages(next, next_rows);
+          } catch (...) {  // its set_pages uploads them again, and meets the error then, if it is still there
+          }
+        }
       }
       std::vector<int32_t> page_of, lengths;
       std::vector<LineBox> boxes;
@@ -510,6 +575,7 @@ struct Pipeline::Impl {
           for (size_t i = a; i < b; ++i) {
             if (!errors[items[i].page]) errors[items[i].page] = ep;
           }
+          if (models->broken()) fail(ep);
           a = b;
           continue;
         }
@@ -539,8 +605,7 @@ struct Pipeline::Impl {
   void finish(Page& p, int k) {
     OcrPage& out = p.out;
     out.ms.recognize = ms_since(p.lines_start);
-    if (e.split) out.lines = split_lines(std::move(out.lines), *e.split);
-    detail::order_page(out, order[k].get(), e);
+    detail::finish_page(out, order[k].get(), e);  // the gate, the split and the order, as the CPU engine's
     out.ms.total = ms_since(p.start);
     ++pages;
     p.image = GrayImage{};
@@ -658,6 +723,11 @@ std::vector<OcrPage> Pipeline::ocr(std::span<const GrayView> pages) {
 }
 
 Device Pipeline::device() const { return impl_->models->device(); }
+
+bool Pipeline::stopped() const {
+  std::lock_guard lk(impl_->m);
+  return impl_->stopping && impl_->error != nullptr;
+}
 
 PipelineStats Pipeline::stats() const {
   PipelineStats s;

@@ -312,21 +312,41 @@ NB_MODULE(carbon_ocr, m) {
       .def(
           "__init__",
           [](carbon::Engine* e, const std::filesystem::path& set, int workers, bool pin, const std::string& rec,
-             std::optional<std::filesystem::path> order_model, const std::string& precision) {
+             std::optional<std::filesystem::path> order_model, const std::string& precision, bool gate,
+             const std::string& block_order, float single_pixel, double second_pass_share, bool table_spans,
+             bool share_sessions, double bucket_ratio, bool spaces_from_ink) {
             carbon::EngineOptions o;
             o.pool.workers = workers;
             o.pool.pin = pin;
             o.rec = rec;
             if (order_model) o.order_model = *order_model;
             o.precision = precision_of(precision);
+            if (!gate) o.gate.reset();
+            if (block_order != "geometry" && block_order != "model") {
+              throw carbon::Error("block_order is \"geometry\" or \"model\", not \"" + block_order + "\"");
+            }
+            o.blocks_by_geometry = block_order == "geometry";
+            o.det.single_pixel = single_pixel;
+            o.det.second_pass_share = second_pass_share;
+            o.table_spans = table_spans;
+            o.share_sessions = share_sessions;
+            if (!(bucket_ratio > 1.0 && bucket_ratio < 2.0)) throw carbon::Error("bucket_ratio is in (1, 2)");
+            o.bucket_ratio = bucket_ratio;
+            if (spaces_from_ink) o.spaces = carbon::SpaceRule{};
             new (e) carbon::Engine(set, o);
           },
           "set"_a, "workers"_a = 0, "pin"_a = true, "rec"_a = "rec-latin", "order_model"_a = nb::none(),
-          "precision"_a = "auto",
+          "precision"_a = "auto", "gate"_a = true, "block_order"_a = "geometry",
+          "single_pixel"_a = carbon::DetRule{}.single_pixel, "second_pass_share"_a = carbon::DetRule{}.second_pass_share,
+          "table_spans"_a = true, "share_sessions"_a = true, "bucket_ratio"_a = 1.3, "spaces_from_ink"_a = false,
           "A Fullerene set's directory (orient.onnx, det.onnx, <rec>.onnx, <rec>.vocab.json, and order.native.bin "
           "or order.onnx where it has one; order_model another); workers 0 is one per physical core. precision: "
           "the models' files, \"auto\" (the fastest the set has), \"fp32\", \"fp16\" or \"int8\" "
-          "(carbon::choose_set_model).")
+          "(carbon::choose_set_model). gate: lines that are not text dropped (carbon::GateRule); False keeps every "
+          "line. block_order: the order model's blocks ordered by \"geometry\" (carbon::EngineOptions::"
+          "blocks_by_geometry) or as the \"model\" gave them. single_pixel, second_pass_share: "
+          "carbon::DetRule's (0 for neither). table_spans: the order model's tables laid out again with their "
+          "spans (carbon::EngineOptions::table_spans).")
       .def_prop_ro("workers", &carbon::Engine::workers)
       .def(
           "ocr",
@@ -496,8 +516,11 @@ NB_MODULE(carbon_ocr, m) {
       "box"_a, "height"_a = d.height, "pad_v"_a = d.pad_v, "pad_h"_a = d.pad_h,
       "CTC frames the recognizer gives a box's crop.");
 
-  m.def("width_bucket", &carbon::width_bucket, "crop_width"_a,
-        "The batch width the engine runs a crop of this width at: buckets 1.3x apart, 32 to 2048 px.");
+  m.def(
+      "width_bucket", [](int crop_width, double ratio) { return carbon::width_bucket(crop_width, ratio); },
+      "crop_width"_a, "ratio"_a = 1.3,
+      "The batch width the engine runs a crop of this width at: buckets `ratio` apart (the trainer's 1.3), 32 to "
+      "2048 px.");
 
   m.def(
       "crop",

@@ -42,6 +42,12 @@ By default the pages run in parallel on the CPU, one worker per physical core. `
 | `--text-layer auto\|off` | `auto` | read a PDF page from its own text layer where it passes the checks |
 | `--hybrid auto\|off` | `auto` | read the pictures of a page that was read from its text layer by OCR |
 | `--second-pass auto\|off` | `auto` | detect a page of tiny text (its median line under 9 px at the detector's scale) again at twice the scale, and merge the two passes |
+| `--second-pass-share F` | 0 | also take the second pass where at least this share of the lines (and 8 of them) are tiny; 0: by the median alone |
+| `--single-pixel F` | 0.8 | a detector band of one map pixel at least this sure is a line; 0: never |
+| `--gate auto\|off` | `auto` | drop lines that are not text: rules and marks, slivers, unsure pieces read out of pictures, lone unsure marks (the JSON lists them); `off` keeps every line |
+| `--block-order geometry\|model` | `geometry` | the order model's blocks in order by their geometry, a page's columns first; `model`: as the model ordered them |
+| `--table-spans on\|off` | `on` | the order model's tables with their spanning cells (`colspan`, `rowspan`) |
+| `--spaces model\|ink` | `model` | `ink`: drop a space the recognizer is unsure of where the line's ink shows no gap (the CPU only) |
 | `--as-given` | off | no quarter turns and no deskew: the page as given |
 | `--precision auto\|fp32\|fp16\|int8` | `auto` | the files the models run. On the CPU: `fp16` the set's `.fp16.onnx` on the engine's own kernels, `int8` its `.int8.onnx`, `fp32` its `.onnx`; `auto` as below. On the GPU: `fp16` the `.fp16.onnx` files and the recognizer's trunk and fused CTC head, `fp32` the `.onnx` files, `int8` the `.int8-sym.onnx` files; `auto` the FP16 files, the FP32 one where a set lacks one |
 | `--backend ort\|native` | per model | run every model on one backend; by default a model runs on the native int8 backend where the set has its `.int8.onnx`, else on ONNX Runtime |
@@ -52,7 +58,7 @@ By default the pages run in parallel on the CPU, one worker per physical core. `
 | `--in-flight N` | 32 | `cuda`: pages in the pipeline at once |
 | `--engine-cache DIR` | | keep TensorRT's built engines here, for later runs |
 
-The reading order comes from the set's `order.onnx` when the set has one; otherwise the engine orders lines by the XY-cut. The order model is also used only where it is sure of its result, and the XY-cut takes over elsewhere. The JSON output records which of the two ordered each page.
+The reading order comes from the set's `order.onnx` when the set has one; otherwise the engine orders lines by the XY-cut. The order model is also used only where it is sure of its result, and the XY-cut takes over elsewhere. The model's blocks are then put in order by their geometry, a page's columns first. The JSON output records which of the two ordered each page.
 
 ## <img src="assets/chip-02.svg" height="22" alt=""> Serving pages over HTTP
 
@@ -66,12 +72,12 @@ curl --data-binary @scan.jpg "http://127.0.0.1:8080/ocr?format=pdf" -o searchabl
 curl http://127.0.0.1:8080/info
 ```
 
-`serve` loads a set's models once and reads the pages clients send over HTTP/1.1, until Ctrl+C. Every client's pages share the engine. On the CPU each page goes to the next free worker, is decoded there and is answered as soon as it is read, so a slow page holds back no other. On the GPU (`--device cuda`) the batched pipeline puts every client's pages in its batches. `serve` takes `ocr`'s model, worker and device options (`--rec`, `--backend`, `--precision`, `--second-pass`, `--as-given`, `--workers`, `--no-pin`, `--device`, `--batch`, `--in-flight`, `--engine-cache`), so it runs every model file the engine does. Connections are kept alive, and a client may send `Expect: 100-continue`.
+`serve` loads a set's models once and reads the pages clients send over HTTP/1.1, until Ctrl+C. Every client's pages share the engine. On the CPU each page goes to the next free worker, is decoded there and is answered as soon as it is read, so a slow page holds back no other. On the GPU (`--device cuda`) the batched pipeline puts every client's pages in its batches. `serve` takes `ocr`'s model, worker, device and page options (`--rec`, `--backend`, `--precision`, `--second-pass`, `--as-given`, `--gate`, `--block-order`, `--table-spans`, `--workers`, `--no-pin`, `--device`, `--batch`, `--in-flight`, `--engine-cache`), so it runs every model file the engine does. On the GPU, `--prefetch off` uploads each group's pages only when their turn comes. Connections are kept alive, and a client may send `Expect: 100-continue`.
 
 | request | answer |
 |---|---|
 | `POST /ocr` | the body is a page's image (PNG, JPEG, BMP or PNM), and the answer that page as `ocr` writes it, in `?format=`: `json` (the default: the page's object), `text`, `hocr`, `alto`, `page`, `markdown`, `html` or `pdf`. `?name=` names the image in hOCR, ALTO and PAGE XML (`page` by default), and `?text_only=1` makes the `pdf` its invisible text alone. `?html=1` adds `html` to the `json` object: the page's body as `html` writes it. The headers `X-Carbon-Ms` and `X-Carbon-Lines` give the page's time in the engine and its number of lines |
-| `GET /health` | `ok` |
+| `GET /health` | `ok`; 503 once a GPU error has stopped the pipeline |
 | `GET /info` | JSON: the version, the set, the device, the precision, the workers, the pages in flight and the queue |
 
 | status | when |

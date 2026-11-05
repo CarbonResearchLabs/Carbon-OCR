@@ -327,12 +327,28 @@ struct Server::Impl {
 
   // ------------------------------------------------ the engine's side
 
+  // The GPU pipeline's runs so far: how full its batches are, so a load test can see whether its pages in
+  // flight fill them. Empty for the CPU engine.
+  std::string pipeline_stats() const {
+    if (!pipe) return "";
+    const PipelineStats st = pipe->stats();
+    char buf[256];
+    std::snprintf(buf, sizeof buf,
+                  ", \"pipeline\": {\"pages\": %lld, \"lines\": %lld, \"detect_runs\": %lld, "
+                  "\"recognize_runs\": %lld, \"pages_per_detect_run\": %.2f, \"lines_per_recognize_run\": %.1f}",
+                  static_cast<long long>(st.pages), static_cast<long long>(st.lines),
+                  static_cast<long long>(st.detect_runs), static_cast<long long>(st.recognize_runs),
+                  st.pages_per_detect_run(), st.lines_per_recognize_run());
+    return buf;
+  }
+
   std::string info() const {
     const int workers = engine ? engine->workers() : 0;
     return "{\"version\": " + json_string(kVersion) + ", \"set\": " + json_string(set.generic_string()) +
            ", \"device\": " + (o.cuda ? "\"cuda\"" : "\"cpu\"") + ", \"precision\": " +
            json_string(precision_name(o.engine.precision)) + ", \"workers\": " + std::to_string(workers) +
-           ", \"in_flight\": " + std::to_string(in_flight) + ", \"queue\": " + std::to_string(o.queue) + "}\n";
+           ", \"in_flight\": " + std::to_string(in_flight) + ", \"queue\": " + std::to_string(o.queue) +
+           pipeline_stats() + "}\n";
   }
 
   // A page's answer, in its format, as carbon-ocr ocr writes the page.
@@ -588,7 +604,11 @@ struct Server::Impl {
       if (req.method != "GET") {
         error_reply(c, 405, req.path + " takes GET", keep, {{"Allow", "GET"}});
       } else if (req.path == "/health") {
-        reply(c, 200, "text/plain; charset=utf-8", "ok\n", keep);
+        if (pipe && pipe->stopped()) {  // its device broken: nothing more will be read
+          error_reply(c, 503, "the pipeline stopped: its device can run nothing more", keep);
+        } else {
+          reply(c, 200, "text/plain; charset=utf-8", "ok\n", keep);
+        }
       } else {
         reply(c, 200, "application/json", info(), keep);
       }
@@ -678,9 +698,10 @@ struct Server::Impl {
 
   void run() {
     std::vector<std::thread> threads;
+    // On the GPU, PNG decoding (about 10 ms a page a core) is the CPU's share of a page: half the physical cores
+    // by default, at least 4, where 4 alone capped a server near 370 pages a second.
     const int feeders = o.cuda ? std::max(1, o.decoders > 0 ? o.decoders
-                                                            : std::min(4, static_cast<int>(
-                                                                              std::thread::hardware_concurrency())))
+                                                            : std::max(4, cpu_topology().default_workers() / 2))
                                : 1;
     feeders_left = feeders;
     for (int i = 0; i < feeders; ++i) {

@@ -78,6 +78,10 @@ Shape from_dims(const nvinfer1::Dims& d) {
 }
 
 // FNV-1a: the cache key has to be stable across runs, not secret.
+// A model file of FP16 weights and tensors (the export's <model>.fp16.onnx, <rec>.features.fp16.onnx): TF32
+// has nothing to change in its engine. Every other file (FP32, int8 Q/DQ) is built without TF32.
+bool fp16_file(const std::filesystem::path& model) { return model.filename().string().find(".fp16.") != std::string::npos; }
+
 uint64_t fnv1a(std::string_view bytes, uint64_t h = 14695981039346656037ull) {
   for (unsigned char c : bytes) {
     h ^= c;
@@ -243,6 +247,7 @@ class TrtSession final : public Session {
                         std::to_string(prop.major) + "." + std::to_string(prop.minor) +
                         "|" + std::to_string(options.workspace_bytes) + "|O" +
                         std::to_string(options.optimization_level);
+      if (!fp16_file(model)) key += "|no-tf32";  // FP32's engines built without TF32 (build); FP16's keys as before
       for (const auto& p : options.profiles) {
         key += "|profile";
         for (const auto& r : p) {
@@ -522,6 +527,9 @@ class TrtSession final : public Session {
     std::unique_ptr<nvinfer1::IBuilderConfig> config(builder->createBuilderConfig());
     config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, options.workspace_bytes);
     config->setBuilderOptimizationLevel(options.optimization_level);
+    // FP32 that is FP32: TensorRT lets kFLOAT tensors' convolutions and matrix products run in TF32 (10-bit
+    // mantissas) unless kTF32 is cleared, so an FP32 file's engine would not read as the CPU's FP32 does.
+    if (!fp16_file(model)) config->clearFlag(nvinfer1::BuilderFlag::kTF32);
 
     std::vector<nvinfer1::ITensor*> free_inputs;
     for (int32_t i = 0; i < network->getNbInputs(); ++i) {

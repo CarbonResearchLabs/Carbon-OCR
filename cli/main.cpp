@@ -4,6 +4,7 @@
 //   carbon-ocr ocr IMAGE|PDF... --set DIR [--rec rec-latin] [--backend ort|native]
 //                           [--precision auto|fp32|fp16|int8]
 //                           [--dpi 200] [--text-layer auto|off] [--hybrid auto|off] [--second-pass auto|off]
+//                           [--gate auto|off] [--block-order geometry|model]
 //                           [--format text|json|hocr|alto|page|markdown|html|pdf] [--out-dir DIR]
 //                           [--output FILE] [--text-out FILE] [--text-only] [--image-dpi 300] [--as-given]
 //                           [--workers N] [--no-pin] [--device cpu|cuda] [--batch 8] [--in-flight N]
@@ -160,6 +161,12 @@ struct Args {
   std::string text_layer = "auto";  // ocr: auto, a page's text layer where it passes; off
   std::string hybrid = "auto";      // ocr: auto, the pictures of a page read from its text layer read by OCR; off
   std::string second_pass = "auto";  // ocr: auto, tiny text detected again at twice the scale; off
+  std::string gate = "auto";         // ocr, serve: auto, lines that are not text dropped (carbon::GateRule); off
+  std::string prefetch = "on";       // serve on the GPU: the next group's pages uploaded while the current is read
+  std::string table_spans = "on";       // ocr, serve: the order model's tables laid out again with spans
+  std::string spaces = "model";         // ocr, serve: spaces as the recognizer reads them, or borne out by the ink
+  std::string block_order = "geometry";  // ocr, serve: the order model's blocks by geometry, or as the model gave them
+  std::optional<double> second_pass_share, single_pixel;  // ocr, serve: carbon::DetRule's, where given (0: off)
   std::string out_dir;               // ocr --format page: a file a page here
   std::string output;                // ocr: the file to write (pdf needs one); empty: standard output
   std::string text_out;              // ocr: also the pages' text, to this file
@@ -183,7 +190,9 @@ struct Args {
                "usage: carbon-ocr ocr IMAGE|PDF... --set DIR [--rec NAME] [--workers N]\n"
                "                        [--no-pin] [--backend ort|native] [--precision auto|fp32|fp16|int8]\n"
                "                        [--dpi N] [--text-layer auto|off]\n"
-               "                        [--hybrid auto|off] [--second-pass auto|off]\n"
+               "                        [--hybrid auto|off] [--second-pass auto|off] [--gate auto|off]\n"
+               "                        [--block-order geometry|model] [--second-pass-share F] [--single-pixel F]\n"
+               "                        [--table-spans on|off] [--spaces model|ink]\n"
                "                        [--format text|json|hocr|alto|page|markdown|html|pdf] [--out-dir DIR]\n"
                "                        [--output FILE] [--text-out FILE] [--text-only] [--image-dpi N]\n"
                "                        [--as-given] [--device cpu|cuda] [--batch N] [--in-flight N]\n"
@@ -328,6 +337,27 @@ Args parse(int argc, char** argv) {
     } else if (arg == "--second-pass") {
       a.second_pass = value();
       if (a.second_pass != "auto" && a.second_pass != "off") usage("--second-pass takes auto or off");
+    } else if (arg == "--prefetch") {
+      a.prefetch = value();
+      if (a.prefetch != "on" && a.prefetch != "off") usage("--prefetch takes on or off");
+    } else if (arg == "--gate") {
+      a.gate = value();
+      if (a.gate != "auto" && a.gate != "off") usage("--gate takes auto or off");
+    } else if (arg == "--spaces") {
+      a.spaces = value();
+      if (a.spaces != "model" && a.spaces != "ink") usage("--spaces takes model or ink");
+    } else if (arg == "--table-spans") {
+      a.table_spans = value();
+      if (a.table_spans != "on" && a.table_spans != "off") usage("--table-spans takes on or off");
+    } else if (arg == "--block-order") {
+      a.block_order = value();
+      if (a.block_order != "geometry" && a.block_order != "model") usage("--block-order takes geometry or model");
+    } else if (arg == "--second-pass-share" || arg == "--single-pixel") {
+      const std::string v = value();
+      char* end = nullptr;
+      const double x = std::strtod(v.c_str(), &end);
+      if (end == v.c_str() || *end || !(x >= 0 && x <= 1)) usage(arg + " takes a number from 0 to 1");
+      (arg == "--single-pixel" ? a.single_pixel : a.second_pass_share) = x;
     } else if (arg == "--dpi") {
       a.dpi = to_int(arg, value(), 36);
     } else if (arg == "--format") {
@@ -1095,6 +1125,12 @@ carbon::EngineOptions engine_options(const Args& a) {
   o.pool.workers = a.workers.empty() ? 0 : a.workers.front();
   o.pool.pin = a.pin;
   if (a.second_pass == "off") o.det.second_pass_below = 0;  // one detection pass, whatever the lines' size
+  if (a.gate == "off") o.gate.reset();                       // every line kept, text or not
+  o.blocks_by_geometry = a.block_order == "geometry";
+  o.table_spans = a.table_spans != "off";
+  if (a.spaces == "ink") o.spaces = carbon::SpaceRule{};  // unsure spaces the ink does not bear out dropped
+  if (a.second_pass_share) o.det.second_pass_share = *a.second_pass_share;
+  if (a.single_pixel) o.det.single_pixel = static_cast<float>(*a.single_pixel);
   if (a.as_given) {  // the page as given (OCRmyPDF turns and deskews pages itself, and grafts the text back)
     o.turn_probability = 2.0f;
     o.deskew = false;
@@ -1327,6 +1363,7 @@ int serve(const Args& a) {
   if (a.in_flight) so.engine.in_flight = a.in_flight;
   so.cuda = a.device == "cuda";
   so.pipeline.page_batch = a.batch;
+  so.pipeline.prefetch = a.prefetch != "off";
   if (a.in_flight) so.pipeline.in_flight = a.in_flight;
   so.pipeline.engine_cache = a.engine_cache;
   if (!a.quiet) {

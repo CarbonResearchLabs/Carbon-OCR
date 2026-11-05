@@ -20,6 +20,7 @@
 // script classifier and other recognizers, and the language model.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
@@ -63,6 +64,34 @@ struct TableRule {
   int max_cell_chars = 30;
 };
 
+// Lines that are not text, dropped before they are ordered and written: what the recognizer
+// read out of a photograph, a rule, a speck or a page's edge. Before the lines are split at their gaps, a line that
+// read nothing, or only rules and marks (_ - — – . | = ~ · • / \), or a sliver (taller than `sliver` times its
+// width) that read at most `sliver_chars` characters. After the split, a piece at least `picture_share` on the
+// detector's picture mask that read unsurely (its confidence under `picture_sure`, or a character's probability
+// under `picture_least`); and a piece of at most `lone_chars` letters and digits, its confidence under `lone_sure`,
+// with no other piece on its row within a line height. The JSON keeps each, with its reason (OcrPage::dropped).
+struct GateRule {
+  double sliver = 1.6;
+  int sliver_chars = 2;
+  double picture_share = 0.8;
+  float picture_sure = 0.9f, picture_least = 0.5f;
+  int lone_chars = 3;
+  float lone_sure = 0.6f;
+};
+
+// Spaces the recognizer read where the ink does not part the characters: a space whose
+// probability is under `sure` is dropped where the crop's columns between its two neighbouring characters hold no
+// blank run `wider` times the line's median blank run between inks, and at least `min_gap` of the text's height
+// (letter-spaced and wide type read a space between letters; a word's space is wider than the line's letters' gaps,
+// however tight the type). A column is ink where the crop's darkest pixel in it, in the text's rows, is darker than
+// halfway between the crop's darkest and its 90th percentile; a crop of under 32 levels' contrast keeps every space.
+struct SpaceRule {
+  float sure = 0.7f;
+  double wider = 2.0;
+  double min_gap = 0.08;
+};
+
 // The precision a set's models run in on the CPU: which of each model's files
 // (choose_set_model).  auto: the fastest the set has.
 enum class Precision : uint8_t { kAuto, kFp32, kFp16, kInt8 };
@@ -90,6 +119,10 @@ struct EngineOptions {
   bool deskew = true;
   double max_skew = 5.0, min_skew = 0.2, min_skew_gain = 1.05;
   int line_batch = 8;             // lines a recognition task holds when every core is busy
+  // The CPU engine's width buckets (width_bucket): the trainer's ladder, 1.3 times wider a step. Finer (1.15) pads
+  // the lines less (7.5% of recognition's pixels, against 13%), but the recognizer then reads
+  // paddings it was not trained on, so it is a graded choice. The GPU's profiles keep 1.3.
+  double bucket_ratio = 1.3;
   // The stream (Engine::submit): pages being read at once, past which submit waits. 0: two a worker, so a
   // worker that finishes a page always finds the next one queued.
   int in_flight = 0;
@@ -99,8 +132,24 @@ struct EngineOptions {
   bool use_order = true;
   std::filesystem::path order_model;
   OrderRule order;
+  // The order model's blocks in an order of their own, by geometry: an XY-cut over the blocks' boxes, its gaps in
+  // the page's units (a gutter in character widths, a gap down the page in line heights), so columns are read one
+  // after the other; the model's order inside each block, its labels and cells, kept. False: the model's order.
+  bool blocks_by_geometry = true;
+  // The order model's tables with their spans: a cell over more than half of two cells that
+  // lie apart across the page (a header over columns) spans the model's columns it covers more than half of, and a
+  // column the model made of such cells alone goes; every other cell keeps the model's row and column, so a table
+  // without a wide cell is the model's as it was. False: the model's grid, no spans.
+  bool table_spans = true;
+  // One ONNX Runtime session a model for every worker, not one a worker: its packed weights
+  // once in the caches the cores share, its run on the caller's thread (one intra-op thread) as before. The native
+  // backend's sessions keep each run's buffers and stay a worker's own. Measured on the speed set: the same bytes,
+  // and 4-6% more pages a second on 6 and 10 workers (one alone: the same). False: a session a worker.
+  bool share_sessions = true;
   std::optional<SplitRule> split = SplitRule{};  // lines split at wide gaps before the order; none: not
   std::optional<TableRule> tables = TableRule{};  // tables from geometry without the order model; none: not
+  std::optional<GateRule> gate = GateRule{};      // lines that are not text dropped; none: every line kept
+  std::optional<SpaceRule> spaces;                // unsure spaces the ink does not bear out dropped; none (default)
   DetRule det;
   // The crop rule the recognizer reads lines by. A recognizer that carries its own (its ONNX
   // file's carbon.crop.height, pad_v and pad_h, written at export) sets those three.
@@ -122,11 +171,13 @@ struct OcrLine {
   float confidence = 0;  // the mean probability of its characters (0 for no characters)
   float det_score = 0;   // the detector's mean core probability
   std::vector<OcrWord> words;
+  float least = 0;       // the least probability of its characters, spaces aside (0 for none)
 };
 
 struct OcrCell {
   int row = 0, col = 0;
   std::vector<int> lines;  // indices into OcrPage::lines
+  int row_span = 1, col_span = 1;  // the rows and columns it covers (EngineOptions::table_spans)
 };
 
 // A block of the order model's: a run of the page's lines in reading order.
@@ -144,6 +195,12 @@ struct OcrPage {
                               // levelled page's
   std::vector<OcrLine> lines; // in reading order
   std::vector<LineBox> pictures;
+  struct Dropped {            // a line the gate took for something other than text (GateRule)
+    OcrLine line;
+    std::string why;          // "empty", "rules", "sliver", "picture", "lone"
+  };
+  std::vector<Dropped> dropped;
+  PictureMask picture_mask;   // the detector's, for the gate while the page is read; cleared once it is
   std::string order = "xy-cut";  // the reading order's: "model" (the order model's), or the XY-cut's
   bool second_pass = false;      // detected again at a larger scale, its median line tiny (carbon/detect.h)
   std::vector<OcrBlock> blocks;  // the order model's; none without it
@@ -162,6 +219,13 @@ struct OcrPage {
   // col, lines}]}] (with the order model), "ms"}
   std::string json() const;
 };
+
+// A box of a page as read (turned upright, then levelled: the boxes an OcrPage holds) on the page as given: its
+// four corners (x, y), in the order of the box's top-left, top-right, bottom-right and bottom-left as read, a
+// levelled page's kept inside the page; and the box around them. On a page read as it was given (no turn, no
+// skew) both are the box itself. The writers place every box so (carbon/output.h).
+std::array<std::array<double, 2>, 4> corners_as_given(const LineBox& box, const OcrPage& page);
+LineBox box_as_given(const LineBox& box, const OcrPage& page);
 
 // A model of a Fullerene set, <set>/<name>, on the CPU, by precision:
 //
@@ -283,5 +347,8 @@ std::vector<size_t> reading_order(std::span<const LineBox> boxes);
 // training buckets (32 px, then 1.3 times wider, in steps of 8, to
 // 2048) that holds it, or its own width rounded up to 8 past the last.
 int width_bucket(int crop_width);
+// The same ladder at another ratio (32 px, then `ratio` times wider, in steps of 8, to 2048): the CPU engine's
+// buckets where EngineOptions::bucket_ratio is not the trainer's 1.3.
+int width_bucket(int crop_width, double ratio);
 
 }  // namespace carbon

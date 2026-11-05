@@ -286,6 +286,10 @@ std::string to_pdf(std::span<const OcrPage> pages, std::span<const GrayView> ima
       img = turned.view();
     }
     const double w = img.width * k, h = img.height * k;
+    // A levelled page's boxes are its levelled image's, the image here is not: each word's text is turned by the
+    // skew about the page's centre, as rotate_page levelled it (corners_as_given, carbon/engine.h).
+    constexpr double kPi = 3.14159265358979323846;
+    const double sa = std::sin(page.skew * kPi / 180.0), ca = std::cos(page.skew * kPi / 180.0);
     const size_t image_obj = text_only ? 0 : obj.size() + 1;
     const size_t content_obj = text_only ? obj.size() + 1 : image_obj + 1, page_obj = content_obj + 1;
     std::string c = "BT\n3 Tr\n";
@@ -309,9 +313,19 @@ std::string to_pdf(std::span<const OcrPage> pages, std::span<const GrayView> ima
         const double size = (word.box.y1 - word.box.y0) * k, width = (word.box.x1 - word.box.x0) * k;
         if (!units || size <= 0 || width <= 0) continue;
         const double stretch = 100.0 * width / (units * size * kAdvance / 1000.0);
-        const double x = word.box.x0 * k, base = h - word.box.y1 * k - size * kDescent / 1000.0;
-        c += "/F0 " + num(size) + " Tf " + num(stretch) + " Tz 1 0 0 1 " + num(x) + " " + num(base) + " Tm <" + hex +
-             "> Tj\n";
+        if (page.skew == 0) {
+          const double x = word.box.x0 * k, base = h - word.box.y1 * k - size * kDescent / 1000.0;
+          c += "/F0 " + num(size) + " Tf " + num(stretch) + " Tz 1 0 0 1 " + num(x) + " " + num(base) + " Tm <" +
+               hex + "> Tj\n";
+        } else {
+          // the baseline's start in the levelled image's pixels, then where it lies on the image as it is
+          const double bx = word.box.x0, by = word.box.y1 + (word.box.y1 - word.box.y0) * kDescent / 1000.0;
+          const double dx = bx - img.width / 2.0, dy = by - img.height / 2.0;
+          const double ix = dx * ca - dy * sa + img.width / 2.0, iy = dx * sa + dy * ca + img.height / 2.0;
+          // text space's x along the levelled row (image (c, s), PDF (c, -s)), its y up the row (PDF (s, c))
+          c += "/F0 " + num(size) + " Tf " + num(stretch) + " Tz " + num(ca) + " " + num(-sa) + " " + num(sa) + " " +
+               num(ca) + " " + num(ix * k) + " " + num(h - iy * k) + " Tm <" + hex + "> Tj\n";
+        }
       }
     }
     c += "ET\n";

@@ -83,6 +83,7 @@ void dwconv_f32_neon(Rows<float>, const float*, int, int, const Epilogue&);
 void dwconv_u8s8_neon(Rows<uint8_t>, int32_t, const int8_t*, int, int, const Epilogue&);
 void ctc_argmax_avx2(const float*, int, int, int, int32_t*, float*);
 ByteCounts count_beyond_avx2(const uint8_t*, int, int, int64_t, int, int);
+void skew_rows_avx2(const float*, const float*, int64_t, double, double, double, int, int32_t*);
 void above_bits_avx2(const float*, int, float, uint32_t*);
 // det_head's band: its working memory (scratch kA) the head's row, three upsampled rows and a row of zeros.
 void det_head_avx2(const float* x, int h4, int w4, const DetHeadWeights& w, float* maps, int row0, int row1);

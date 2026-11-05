@@ -70,6 +70,7 @@ struct PipelineOptions {
   std::filesystem::path engine_cache;  // TensorRT's built engines; empty: built at every open (minutes)
   bool fused_head = true;  // the recognizer's trunk and cuda::ctc_head_argmax where the set has
                            // <rec>.features.fp16.onnx and <rec>.head.bin; else <rec>.onnx and cuda::ctc_greedy
+  bool prefetch = true;    // the next group's pages given to the models while the current one is read (prefetch_pages)
 };
 
 // What the pipeline has done: its runs and what they held.
@@ -79,6 +80,10 @@ struct PipelineStats {
   double pages_per_detect_run() const { return detect_runs ? 1.0 * pages / detect_runs : 0.0; }
   double lines_per_recognize_run() const { return recognize_runs ? 1.0 * lines / recognize_runs : 0.0; }
 };
+
+// The rows of a page a group's crops read, [first, last) runs in order, apart (pipeline.cpp's rows_read); empty:
+// every row.
+using RowRuns = std::vector<std::pair<int, int>>;
 
 // The pages' models, on one device.  The pipeline's stages call each from one
 // thread of their own; implementations hold the sessions and buffers.
@@ -101,9 +106,21 @@ class PipelineModels {
   // that does not, its pages take no second pass.
   virtual bool second_pass() const { return false; }
   virtual Tensor detect_one(const Tensor& input);
+  // Whether the device can run nothing more: an error a failed run left that every later run would meet too (a
+  // GPU's sticky error: an illegal address, a launch failure, a lost device). Asked after a failed run; where so,
+  // the pipeline stops, its error that run's, rather than fail every page from then on.
+  virtual bool broken() { return false; }
   // The pages the recognize runs that follow crop from (a group of upright pages,
-  // alive until the next call): on a GPU, uploaded once for all of them.
-  virtual void set_pages(std::span<const GrayView> pages) = 0;
+  // alive until the next call): on a GPU, uploaded once for all of them. rows[i], where
+  // given, are the rows page i's crops read (RowRuns): a device may move those alone.
+  virtual void set_pages(std::span<const GrayView> pages, std::span<const RowRuns> rows) = 0;
+  // The group of pages after the current one, given while the current one is read (alive until its own
+  // set_pages, which follows with these same pages): a device may start their upload now, so it overlaps the
+  // current group's runs. Nothing by default.
+  virtual void prefetch_pages(std::span<const GrayView> pages, std::span<const RowRuns> rows) {
+    (void)pages;
+    (void)rows;
+  }
   // The lines boxes[i] of page page_of[i] (set_pages'), cropped by `crop` at bucket
   // width bw: their CTC decodings and the frames read (each crop's own width /
   // frame_px, at most the model's frames).
@@ -139,6 +156,9 @@ class Pipeline {
 
   Device device() const;
   PipelineStats stats() const;
+  // Whether an error outside every page's work ended the pipeline (its device broken, PipelineModels::broken):
+  // from then on submit and next throw it.
+  bool stopped() const;
   const CropRule& crop() const;
 
  private:

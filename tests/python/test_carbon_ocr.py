@@ -98,9 +98,10 @@ def test_the_second_pass_is_the_engines():
                                              ((100, 200, 900, 240), 0.25), ((100, 300, 400, 311), 0.75)]
     assert [(b, s) for b, s, _ in pictures] == [((50, 600, 950, 900), 0.25)]
     assert carbon_ocr.merge_passes(first, second)[0][0][1] == 0.25  # at the page's own scale, 12 px is print
-    # no pair that close: every line kept but the first's tiny one the second read again inside it (read twice)
-    kept = carbon_ocr.merge_passes(first, second, 2.0, iou=0.95)[0]
-    assert len(kept) == 5 and ((100, 100, 500, 112), 0.25) not in [(b, s) for b, s, _ in kept]
+    # no pair that close: every line kept but those read twice, the first's tiny one the second read again inside
+    # it, and the second's 36-px line inside the first's box of the same line
+    kept = [(b, s) for b, s, _ in carbon_ocr.merge_passes(first, second, 2.0, iou=0.95)[0]]
+    assert len(kept) == 4 and ((100, 100, 500, 112), 0.25) not in kept and ((104, 202, 896, 238), 0.75) not in kept
 
 
 def test_det_decoded_on_the_gpu_is_the_cpus():

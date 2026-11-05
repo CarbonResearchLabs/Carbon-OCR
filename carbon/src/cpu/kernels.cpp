@@ -383,6 +383,24 @@ void above_bits(const float* v, int n, float t, uint32_t* bits, Isa isa) {
   }
 }
 
+void skew_rows(const float* x, const float* y, int64_t n, double c, double s, double mid, int last, int32_t* count,
+               Isa isa) {
+  if (n <= 0) return;
+  check(isa, "skew_rows");
+  switch (dw_kernel(isa)) {
+#if defined(CARBON_KERNEL_AVX2)
+    case Isa::kAvx2: detail::skew_rows_avx2(x, y, n, c, s, mid, last, count); return;
+#endif
+    default: break;
+  }
+  for (int64_t i = 0; i < n; ++i) {  // the reference, a point at a time
+    const double r = static_cast<double>(y[i]) * c - static_cast<double>(x[i]) * s + mid;
+    int v = static_cast<int>(r);
+    v = v < 0 ? 0 : v > last ? last : v;
+    ++count[4 * v + static_cast<int>(i & 3)];
+  }
+}
+
 ByteCounts count_beyond(const uint8_t* c, int w, int h, int64_t stride, int lo, int hi, Isa isa) {
   ByteCounts n{0, 0};
   if (w <= 0 || h <= 0 || (lo < 0 && hi > 255)) return n;

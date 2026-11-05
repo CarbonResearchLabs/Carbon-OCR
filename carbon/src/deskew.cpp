@@ -60,9 +60,10 @@ int otsu(const std::array<int64_t, 256>& hist, int64_t total) {
 }
 
 // The search's points: each turned by an angle to the row it falls in, counted in four interleaved histograms
-// (consecutive points share rows), their squares summed in row order: the same score as one histogram.
+// (consecutive points share rows), their squares summed in row order: the same score as one histogram. The points
+// are floats, half the bytes of doubles, widened exactly where they are read (the search's arithmetic is in double).
 struct Points {
-  std::vector<double> xs, ys;  // from the page's centre
+  std::vector<float> xs, ys;  // from the page's centre
   int rows = 0;
   double half = 0;             // rows / 2.0
   std::vector<int32_t> count;  // four histograms of rows, interleaved: count[4 * row + k]
@@ -70,19 +71,9 @@ struct Points {
   double score(double deg) {
     const double a = deg * kPi / 180.0, s = std::sin(a), c = std::cos(a);
     std::fill(count.begin(), count.end(), 0);
-    const size_t n = xs.size();
-    const double* x = xs.data();
-    const double* y = ys.data();
-    int32_t* h = count.data();
-    const int last = rows - 1;
-    const double mid = half;
-    for (size_t i = 0; i < n; ++i) {
-      // the row the point is on after the page turns `deg` counterclockwise
-      const double r = y[i] * c - x[i] * s + mid;
-      int v = static_cast<int>(r);
-      v = v < 0 ? 0 : v > last ? last : v;
-      ++h[4 * v + static_cast<int>(i & 3)];
-    }
+    // the row each point is on after the page turns `deg` counterclockwise (cpu::skew_rows: the CPU's vectors)
+    cpu::skew_rows(xs.data(), ys.data(), static_cast<int64_t>(xs.size()), c, s, half, rows - 1, count.data());
+    const int32_t* h = count.data();
     double sum = 0;
     for (int j = 0; j < rows; ++j) {
       const int64_t m = int64_t{h[4 * j]} + h[4 * j + 1] + h[4 * j + 2] + h[4 * j + 3];
@@ -116,9 +107,9 @@ Skew find_skew(const GrayView& page, double max_degrees) {
     for (int x = 0; x < page.width; ++x) {
       if (row[x] > t) continue;
       if (until == 0) {
-        // widened once, as the search's arithmetic widens each float point
-        p.xs.push_back(static_cast<double>(static_cast<float>(x - cx)));
-        p.ys.push_back(static_cast<double>(static_cast<float>(y - cy)));
+        // kept as floats; the search widens each where it reads it
+        p.xs.push_back(static_cast<float>(x - cx));
+        p.ys.push_back(static_cast<float>(y - cy));
         until = step;
       }
       --until;

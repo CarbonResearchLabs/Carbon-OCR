@@ -112,7 +112,7 @@ OcrPage laid_out() {
 TEST(Output, WritesTheOrderModelsBlocks) {
   const std::vector<OcrPage> pages = {laid_out()};
   EXPECT_EQ(to_markdown(pages),
-            "## Report\n\nFirst line of text\nsecond line.\n\n- apples\n- pears and plums\n\n<table>\n"
+            "## Report\n\nFirst line of text second line.\n\n- apples\n- pears and plums\n\n<table>\n"
             "<tr><td>Name</td><td>Age</td></tr>\n<tr><td>Ann &amp; Bo</td><td>31</td></tr>\n</table>\n");
   const std::vector<std::string> images = {"scan.png"};
   const std::string h = to_hocr(pages, images);
@@ -175,6 +175,109 @@ TEST(Output, WritesEachLabelAsItsHtml) {
             "<div class=\"form\"><p>Name: ____</p></div>\n"
             "<nav><ul><li>Contents</li><li>Chapter 1 ..... 5</li></ul></nav>\n<figure><p>in the figure</p></figure>\n"
             "<header><p>Running head</p></header>\n<p>Hyphen- Ated</p>\n");
+}
+
+// A Text block's lines, one paragraph: in markdown as in HTML, joined by spaces, and a word broken at a line's end
+// joined again after any letter (ß is two bytes), at a soft hyphen too, before any lowercase (ł is lowercase).
+TEST(Output, JoinsAParagraphsLinesInMarkdownAsInHtml) {
+  OcrPage p;
+  p.width = p.height = 600;
+  const char* texts[] = {"Ein groß-", "artiger Satz mit Wort\u00AD", "teilen und abc-", "\u0142\u00F3d\u017A."};
+  for (int i = 0; i < 4; ++i) p.lines.push_back({{10, 10.0 + 30 * i, 300, 30.0 + 30 * i}, texts[i], 1, 0, {}});
+  p.blocks = {{"Text", 1, {0, 1, 2, 3}, {}}};
+  const std::string want = "Ein großartiger Satz mit Wortteilen und abc\u0142\u00F3d\u017A.";
+  EXPECT_EQ(to_markdown(std::vector<OcrPage>{p}), want + "\n");
+  EXPECT_EQ(to_html_body(p), "<p>" + want + "</p>\n");
+  p.blocks.clear();  // no blocks: the lines are close, one paragraph
+  EXPECT_EQ(to_markdown(std::vector<OcrPage>{p}), want + "\n");
+}
+
+// A paragraph's start that markdown would read as its own: a fence, an HTML block, a thematic break.
+TEST(Output, EscapesWhatMarkdownWouldReadAsBlocks) {
+  OcrPage p;
+  p.width = p.height = 600;
+  const char* texts[] = {"```code", "~~~", "<div> a", "____", "= = =", "a < b"};
+  for (int i = 0; i < 6; ++i) p.lines.push_back({{10, 10.0 + 60 * i, 300, 30.0 + 60 * i}, texts[i], 1, 0, {}});
+  for (int i = 0; i < 6; ++i) p.blocks.push_back({"Text", 1, {i}, {}});
+  EXPECT_EQ(to_markdown(std::vector<OcrPage>{p}),
+            "\\```code\n\n\\~~~\n\n\\<div> a\n\n\\____\n\n\\= = =\n\na < b\n");
+}
+
+// A picture's unsure lines (what a photograph read as) are left out of markdown and HTML; its sure ones written.
+// A heading that is not one (a formula read as bars and digits, or read unsurely) is written as a paragraph.
+TEST(Output, WritesAPicturesSureLinesAndHeadingsThatReadAsHeadings) {
+  OcrPage p;
+  p.width = p.height = 600;
+  p.lines = {{{10, 10, 300, 30}, "qur 51R9", 0.6f, 0, {}},
+             {{10, 40, 300, 60}, "Figure legend text", 0.97f, 0, {}},
+             {{10, 100, 300, 120}, "| ? 3785 2 17 |", 0.95f, 0, {}},
+             {{10, 140, 300, 160}, "Methods", 0.5f, 0, {}},
+             {{10, 180, 300, 200}, "Results", 0.99f, 0, {}}};
+  p.blocks = {{"Picture", 1, {0, 1}, {}},
+              {"Section-Header", 1, {2}, {}},
+              {"Section-Header", 1, {3}, {}},
+              {"Section-Header", 1, {4}, {}}};
+  EXPECT_EQ(to_markdown(std::vector<OcrPage>{p}),
+            "Figure legend text\n\n\\| ? 3785 2 17 |\n\nMethods\n\n## Results\n");
+  EXPECT_EQ(to_html_body(p),
+            "<figure><p>Figure legend text</p></figure>\n<p>| ? 3785 2 17 |</p>\n<p>Methods</p>\n<h2>Results</h2>\n");
+}
+
+// A table's spans: a header over three columns one <td colspan>, a cell over two rows one <td rowspan>, the
+// places they cover left out; markdown's table as HTML's.
+TEST(Output, WritesATablesSpans) {
+  OcrPage p;
+  p.width = p.height = 600;
+  const char* texts[] = {"Results", "A", "B", "C", "x", "1", "2"};
+  for (int i = 0; i < 7; ++i) p.lines.push_back({{10, 10.0 + 30 * i, 300, 30.0 + 30 * i}, texts[i], 1, 0, {}});
+  OcrBlock t{"Table", 1, {0, 1, 2, 3, 4, 5, 6}, {}};
+  t.cells = {{0, 0, {0}, 1, 3}, {1, 0, {1}, 1, 1}, {1, 1, {2}, 1, 1}, {1, 2, {3}, 1, 1},
+             {2, 0, {4}, 2, 1}, {2, 1, {5}, 1, 1}, {3, 1, {6}, 1, 1}};
+  p.blocks = {t};
+  const std::string want =
+      "<table>\n<tr><td colspan=\"3\">Results</td></tr>\n<tr><td>A</td><td>B</td><td>C</td></tr>\n"
+      "<tr><td rowspan=\"2\">x</td><td>1</td><td></td></tr>\n<tr><td>2</td><td></td></tr>\n</table>";
+  EXPECT_EQ(to_html_body(p), want + "\n");
+  EXPECT_EQ(to_markdown(std::vector<OcrPage>{p}), want + "\n");
+}
+
+// Boxes on the page as given: a page read turned a quarter (its boxes the upright page's) and one levelled.
+TEST(Output, PlacesBoxesOnThePageAsGiven) {
+  OcrPage p;
+  p.width = 200;   // as given: 200 wide, 400 high, its text running down
+  p.height = 400;
+  p.rotation = 90;  // read upright, 400 wide and 200 high
+  p.lines = {{{10, 20, 190, 40}, "Hello", 0.9f, 0, {{{10, 20, 190, 40}, "Hello", 0.9f}}}};
+  const LineBox g = box_as_given(p.lines[0].box, p);
+  EXPECT_EQ(g.x0, 160);
+  EXPECT_EQ(g.y0, 10);
+  EXPECT_EQ(g.x1, 180);
+  EXPECT_EQ(g.y1, 190);
+  const std::vector<std::string> images = {"turned.png"};
+  const std::string h = to_hocr(std::vector<OcrPage>{p}, images);
+  EXPECT_NE(h.find("bbox 160 10 180 190; baseline"), std::string::npos) << h;
+  EXPECT_NE(h.find("x_size 20;"), std::string::npos) << h;  // the text's own height, as read
+  const std::string a = to_alto(std::vector<OcrPage>{p}, images);
+  EXPECT_NE(a.find("HPOS=\"160\" VPOS=\"10\" WIDTH=\"20\" HEIGHT=\"180\" WC=\"0.90\" CONTENT=\"Hello\""),
+            std::string::npos)
+      << a;
+
+  OcrPage lv;  // levelled by 2 degrees: a polygon in PAGE XML, not a box
+  lv.width = 400;
+  lv.height = 200;
+  lv.skew = 2.0;
+  lv.lines = {{{100, 90, 300, 110}, "Hello", 0.9f, 0, {}}};
+  const auto c = corners_as_given(lv.lines[0].box, lv);
+  EXPECT_NE(c[0][1], c[1][1]);  // the top edge is not level on the page as given
+  const std::string x = to_page_xml(lv, "levelled.png");
+  EXPECT_EQ(x.find("<Coords points=\"100,90 300,90 300,110 100,110\"/>"), std::string::npos) << x;
+  OcrPage given = lv;
+  given.skew = 0;  // read as given: the box itself, rounded outward as before
+  EXPECT_NE(to_page_xml(given, "g.png").find("<Coords points=\"100,90 300,90 300,110 100,110\"/>"),
+            std::string::npos);
+  const LineBox same = box_as_given(given.lines[0].box, given);
+  EXPECT_EQ(same.x0, 100);
+  EXPECT_EQ(same.y1, 110);
 }
 
 }  // namespace

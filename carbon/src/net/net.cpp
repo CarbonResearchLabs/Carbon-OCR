@@ -146,7 +146,13 @@ struct Value {
  private:
   template <typename T>
   void fill(std::vector<T>& v, size_t size, T zero) {
-    if (v.size() != size) v.assign(size, zero);
+    // A new size: resized, not refilled whole: the inside is the making layer's to write, the
+    // border is zeroed below and the slack here, so a run whose batch or width changed (most of recognition's) no
+    // longer zeroes every tensor end to end.
+    if (v.size() != size) {
+      v.resize(size, zero);
+      std::fill(v.end() - 64, v.end(), zero);  // the slack, for the kernels' wide reads
+    }
     if (!ph && !pw) return;
     for (int i = 0; i < n; ++i) {
       for (int y = -ph; y < h + ph; ++y) {

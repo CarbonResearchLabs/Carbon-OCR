@@ -33,7 +33,8 @@ struct LineTasks {
   std::vector<size_t> lines;
   std::vector<size_t> starts;
 };
-LineTasks line_tasks(std::span<const OcrLine> lines, const CropRule& crop, int parts, int line_batch);
+LineTasks line_tasks(std::span<const OcrLine> lines, const CropRule& crop, int parts, int line_batch,
+                     double ratio = 1.3);
 
 // The page at the detector's scale: its long side long_side, the crop rule's
 // antialiased bilinear.
@@ -87,12 +88,43 @@ void place_detection(const Detection& first, const GrayView& upright, int dw, in
 
 // A line's text, words (each from the frame its first character starts on) and
 // confidence from its CTC decoding over `length` frames.
+// With `ink` (a flag a crop column, ink_width of them: the crop's columns that hold ink, ink_columns) and `spaces`,
+// an unsure space the ink does not bear out is dropped (SpaceRule).
 void read_line(OcrLine& line, const CtcLine& d, int32_t length, const CropRule& crop,
-               const std::vector<std::string>& vocab);
+               const std::vector<std::string>& vocab, const uint8_t* ink = nullptr, int ink_width = 0,
+               const SpaceRule* spaces = nullptr);
+
+// A crop's columns that hold ink (SpaceRule): out[x] 1 or 0 for x < width, of an h-row crop `stride` bytes a row;
+// false (out untouched) where the crop's contrast is under 32 levels.
+bool ink_columns(const uint8_t* crop, int width, int h, int64_t stride, const CropRule& rule, uint8_t* out);
 
 // The page's lines in reading order: the order model's with its blocks (order not
 // null), or the XY-cut's; tables from geometry where no model gave blocks.
 void order_page(OcrPage& page, Session* order, const EngineOptions& o);
+
+// The gate (GateRule), in its two places: on whole lines before they are split at their gaps, and on the pieces
+// after, before they are ordered. Each dropped line goes to page.dropped with its reason, in the order it was.
+void gate_whole_lines(OcrPage& page, const GateRule& rule);
+void gate_pieces(OcrPage& page, const GateRule& rule);
+
+// The order model's blocks put in an order of their own by geometry (EngineOptions::blocks_by_geometry): an XY-cut
+// over the blocks' boxes, a gutter measured in the lines' median character width and a gap down the page in their
+// median height, so columns come before the space between paragraphs; each block's lines in the model's order.
+// po.order follows. boxes and texts are the page's lines, as po indexes them.
+void blocks_by_geometry(PageOrder& po, std::span<const LineBox> boxes, std::span<const std::string> texts);
+
+// The order model's tables whose median cell holds more than max_cell_chars characters (find_tables' own test,
+// TableRule::max_cell_chars): body text the model took for a table, relabelled Text, its cells let go. The page's
+// lines must be in their reading order (the blocks' indices are places in it).
+void text_tables_as_text(OcrPage& page, int max_cell_chars);
+
+// The order model's tables laid out again from their cells' boxes, with spans (EngineOptions::table_spans): the
+// page's lines in their reading order, as text_tables_as_text's.
+void table_spans(OcrPage& page);
+
+// A page's last steps, the CPU's and the GPU's alike: the gate, the split at wide gaps, the reading order (and
+// tables), the picture mask let go.
+void finish_page(OcrPage& page, Session* order, const EngineOptions& o);
 
 // The order model a page is read in, where use_order: order_model (an ONNX file on
 // ONNX Runtime, or an order.native.bin on the native backend); else the set's

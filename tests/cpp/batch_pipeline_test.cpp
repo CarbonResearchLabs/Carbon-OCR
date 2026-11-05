@@ -7,11 +7,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "carbon/deskew.h"
@@ -167,7 +169,9 @@ class FaultyModels final : public PipelineModels {
  public:
   explicit FaultyModels(std::unique_ptr<PipelineModels> m) : m_(std::move(m)) {}
   std::atomic<bool> orient_fails{false}, second_fails{false}, recognize_fails{false};
+  std::atomic<bool> device_broken{false};  // what a run that failed left: a sticky error, the device lost
   std::atomic<int> detect_fails_at_width{0};
+  bool broken() override { return device_broken; }
 
   Device device() const override { return m_->device(); }
   std::vector<float> orient(const float* thumbs, int n, int side) override {
@@ -184,7 +188,9 @@ class FaultyModels final : public PipelineModels {
     if (second_fails) throw Error("second pass failed");
     return m_->detect_one(input);
   }
-  void set_pages(std::span<const GrayView> pages) override { m_->set_pages(pages); }
+  void set_pages(std::span<const GrayView> pages, std::span<const RowRuns> rows) override {
+    m_->set_pages(pages, rows);
+  }
   void recognize(std::span<const int32_t> page_of, std::span<const LineBox> boxes, int bw, const CropRule& crop,
                  std::vector<CtcLine>& lines, std::vector<int32_t>& lengths) override {
     if (recognize_fails) throw Error("recognize failed");
@@ -204,6 +210,23 @@ std::string error_of_next(Pipeline& pipe, std::optional<OcrPage>* page = nullptr
   } catch (const Error& e) {
     return e.what();
   }
+}
+
+// A run that fails on a device that can run nothing more (a sticky error) stops the pipeline: its pages fail with
+// the error, the pipeline says it stopped, and it takes no more pages, rather than fail each one from then on.
+TEST(BatchPipeline, ABrokenDeviceStopsThePipeline) {
+  const GrayImage page = load_image(kSet / "page.png");
+  auto models = std::make_unique<FaultyModels>(cpu_pipeline_models(kSet, EngineOptions{}, 2));
+  FaultyModels& f = *models;
+  Pipeline pipe(kSet, cpu_options(), std::move(models));
+  EXPECT_FALSE(pipe.stopped());
+  f.recognize_fails = true;
+  f.device_broken = true;
+  pipe.submit(GrayImage{page.width, page.height, page.pixels});
+  EXPECT_NE(error_of_next(pipe), "");
+  for (int i = 0; i < 200 && !pipe.stopped(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  EXPECT_TRUE(pipe.stopped());
+  EXPECT_THROW(pipe.submit(GrayImage{page.width, page.height, page.pixels}), Error);
 }
 
 // A run that fails fails the pages it held, each with that error, and no other: the rest come out as the

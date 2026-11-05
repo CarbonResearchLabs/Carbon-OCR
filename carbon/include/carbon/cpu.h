@@ -250,6 +250,13 @@ struct ByteCounts {  // an aggregate, so no constructor of its is built for an i
 };
 ByteCounts count_beyond(const uint8_t* c, int w, int h, int64_t stride, int lo, int hi, Isa isa = best_isa());
 
+// The deskew search's rows (carbon/deskew.h, find_skew): for each of n points (x[i], y[i]), each widened to double,
+// the row r = y c - x s + mid, truncated to an int and kept in [0, last], counted in four interleaved histograms:
+// ++count[4 r + (i & 3)]. The products and sums in that order, no FMA, so every ISA's counts are the reference's.
+// Vectors: avx2 for every x86-64 set; the scalar reference elsewhere.
+void skew_rows(const float* x, const float* y, int64_t n, double c, double s, double mid, int last, int32_t* count,
+               Isa isa = best_isa());
+
 // ---------------------------------------------------------------- CTC greedy
 //
 // One line of a recognizer's logits [classes][frames] (class-major, the models'
