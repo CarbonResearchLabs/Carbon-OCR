@@ -156,7 +156,7 @@ ocrmypdf --plugin tools/ocrmypdf/carbon_ocrmypdf.py \
     --carbon-set models/fullerene-3M in.pdf out.pdf
 ```
 
-[docs/USAGE.md](docs/USAGE.md) covers every command and option, the output formats, the Python module and the plugin.
+[docs/USAGE.md](docs/USAGE.md) covers every command and option, the output formats, the Python module and the plugin. [Examples/](Examples) has Jupyter notebooks that work through the engine from Python and the command line: a quickstart, every option tried on a page where it matters, streams and batches, each step by hand, measuring accuracy, and the HTTP server.
 
 ## <img src="docs/assets/chip-07.svg" height="22" alt=""> Repository
 
@@ -165,6 +165,7 @@ ocrmypdf --plugin tools/ocrmypdf/carbon_ocrmypdf.py \
 | [`carbon/`](carbon) | the engine library: [`include/carbon/`](carbon/include/carbon) is the public API (`carbon.h` includes all of it but the server, `server.h`); `src/` holds the CPU kernels, the CUDA kernels, the backends, the PDF helpers and the HTTP server |
 | [`cli/`](cli) | `carbon-ocr` (and its HTTP server, `carbon-ocr serve`), and `carbon-pdf`, the helper process PDFs are rendered in |
 | [`python/`](python) | `carbon_ocr`, the engine for Python ([python/README.md](python/README.md)) |
+| [`Examples/`](Examples) | Jupyter notebooks on using the engine and tuning it ([Examples/README.md](Examples/README.md)) |
 | [`models/`](models) | where model sets go, and how a set is laid out ([models/README.md](models/README.md)) |
 | [`tests/`](tests) | the C++ tests (GoogleTest), the Python tests and their fixtures: small ONNX models and PDFs |
 | [`tools/ocrmypdf/`](tools/ocrmypdf) | the OCRmyPDF plugin |

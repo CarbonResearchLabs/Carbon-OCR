@@ -1,0 +1,6 @@
+# What the notebooks need besides the carbon_ocr module itself (pip install ./python).
+jupyterlab>=4
+matplotlib>=3.8
+numpy>=1.24
+pillow>=10.1
+huggingface_hub>=0.23

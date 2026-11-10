@@ -1,0 +1,4 @@
+# What the notebooks write as they run
+data/
+out/
+.ipynb_checkpoints/
