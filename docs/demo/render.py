@@ -64,7 +64,7 @@ FACE = "".join(
     for fam, wt, f in (("Plex", 300, "IBMPlexSans-Light.woff2"), ("Plex", 400, "IBMPlexSans-Regular.woff2"),
                        ("Plex", 500, "IBMPlexSans-Medium.woff2"), ("Plex", 600, "IBMPlexSans-SemiBold.woff2"),
                        ("PlexMono", 400, "IBMPlexMono-Regular.woff2"), ("PlexMono", 500, "IBMPlexMono-Medium.woff2")))
-FOOT = "github.com/karanvora2599/Carbon-OCR · huggingface.co/CarbonResearchLabs/fullerene-3M · getcarbonresearch.com"
+FOOT = "github.com/Carbon-Financial/Carbon-OCR · huggingface.co/CarbonResearchLabs/fullerene-3M · getcarbonresearch.com"
 
 
 def css(t):

@@ -6,7 +6,7 @@ authors:
   - family-names: Vora
     given-names: Karan
     affiliation: Carbon Research Labs
-repository-code: "https://github.com/karanvora2599/Carbon-OCR"
+repository-code: "https://github.com/Carbon-Financial/Carbon-OCR"
 url: "https://getcarbonresearch.com"
 license: Apache-2.0
 version: 0.1.0
@@ -24,5 +24,5 @@ references:
         given-names: Karan
         affiliation: Carbon Research Labs
     url: "https://huggingface.co/CarbonResearchLabs/fullerene-3M"
-    license-url: "https://github.com/karanvora2599/Carbon-OCR/blob/main/LICENSE-WEIGHTS.md"
+    license-url: "https://github.com/Carbon-Financial/Carbon-OCR/blob/main/LICENSE-WEIGHTS.md"
     date-released: 2026-11-03

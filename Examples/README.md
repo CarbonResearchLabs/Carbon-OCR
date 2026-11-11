@@ -22,7 +22,7 @@ jupyter lab Examples
 ```
 
 - **The model set.** The notebooks read pages with `fullerene-3M` from `models/fullerene-3M`, and download it there from [Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M) the first time (about 20 MB). To use a set kept elsewhere, set `CARBON_OCR_SET` to its folder.
-- **The command line.** Notebook 6 runs `carbon-ocr`, built with CMake as the [build guide](https://github.com/karanvora2599/Carbon-OCR/blob/main/docs/BUILD.md) describes. It finds the program in `build/<preset>/cli/`, on the `PATH`, or where `CARBON_OCR` points. Notebooks 1 to 5 need only the Python module.
+- **The command line.** Notebook 6 runs `carbon-ocr`, built with CMake as the [build guide](https://github.com/Carbon-Financial/Carbon-OCR/blob/main/docs/BUILD.md) describes. It finds the program in `build/<preset>/cli/`, on the `PATH`, or where `CARBON_OCR` points. Notebooks 1 to 5 need only the Python module.
 
 ## The files
 
