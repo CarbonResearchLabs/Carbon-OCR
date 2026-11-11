@@ -200,7 +200,7 @@ If you use Carbon-OCR or the Fullerene models, please cite them (also in [CITATI
   title        = {Carbon-OCR and Fullerene: OCR in C++ and CUDA, with the Fullerene models},
   organization = {Carbon Research Labs},
   year         = {2026},
-  url          = {https://github.com/Carbon-Financial/Carbon-OCR}
+  url          = {https://github.com/CarbonResearchLabs/Carbon-OCR}
 }
 
 @misc{vora2026fullerene3m,
