@@ -196,7 +196,7 @@ Five of the eight can be fixed in the engine, with no new training: the captions
   <img src="assets/fig-bench-light.svg" alt="OmniParseBench, all 2,937 pages: fullerene-3M scores a headline of 52.3 against Tesseract 5.5's 5.9; text 27.3 against 17.8, tables 47.9 and layout 81.7 against 0." width="100%">
 </picture>
 
-Three invented pages show what the engine does; they do not measure how well. That is OmniParseBench, read end to end on all its 2,937 pages and graded by its own grader: `fullerene-3M` scores a headline of 52.3 against Tesseract 5.5's 5.9 (text 27.3 against 17.8; tables 47.9 and layout 81.7, which Tesseract, writing text alone, scores 0), and on a laptop reads 4.06 pages a second on one core against 0.76. Text is where it leaves the most points: OmniParseBench's pages include scripts the Latin set has no recognizer for, handwriting and old scans, none of which these clean printed pages have.
+Three invented pages show what the engine does; they do not measure how well. That is OmniParseBench, read end to end on all its 2,937 pages and graded by its own grader: `fullerene-3M` scores a headline of 52.3 against Tesseract 5.5's 5.9 (text 27.3 against 17.8; tables 47.9 and layout 81.7, which Tesseract, writing text alone, scores 0), and on one core of a desktop's CPU reads 5.14 pages a second against 0.92. Text is where it leaves the most points: OmniParseBench's pages include scripts the Latin set has no recognizer for, handwriting and old scans, none of which these clean printed pages have.
 
 ## <img src="assets/chip-10.svg" height="22" alt=""> Run it yourself
 

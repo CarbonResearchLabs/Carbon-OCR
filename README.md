@@ -85,16 +85,12 @@ The trained `fullerene-3M` ([on Hugging Face](https://huggingface.co/CarbonResea
 
 Read as PDFs means through `carbon-ocr ocr`, as you would run it: each page from its text layer where the layer passes its checks, its words set in the lines the detector finds, and by OCR otherwise. Setting the words in the detector's lines costs the text pages about 10% of their speed (`--layer-lines layer` skips it). Tesseract writes text alone, so it scores 0 on tables and layout. Where `fullerene-3M` loses: Tesseract reads OmniDocBench's text better and orders it a little better, most of all on newspapers (an edit distance of 0.097 against 0.305). Tesseract also reads more of olmOCR-Bench's old scans (20.7 to 16.0), and neither writes LaTeX (0 on the math tests). [docs/ENGINE.md](docs/ENGINE.md) has each benchmark's breakdown.
 
-**Speed**, on a laptop (Intel Core i7-13620H, RTX 4060 Laptop GPU), 3 to 5 November:
-- **4.06 pages a second on one core** against Tesseract's 0.76 (a median page of 208 ms against 976), and 13.6 against 3.2 in six processes.
-- **15.0 pages a second** in one process of 10 workers with 20 pages in flight; one page at a time on 6 workers, a median page of 79 ms.
-- 18.5 pages a second served over HTTP (`carbon-ocr serve`, 16 to 32 clients at once), the images' decoding included.
-- **95.2 pages a second on the GPU** (`--device cuda`, the FP16 files on TensorRT, 32 pages in flight), every page read, scoring within 0.1 of the CPU.
-
-**On a desktop** (a virtual machine with 8 CPUs of an Intel Core i5-13600KF, and an RTX 4060 Ti), sustained over five minutes after a minute's warm-up, 16 November:
-- **31.2 pages a second** on 8 CPU workers, and 5.29 on one core.
-- **212.6 pages a second on the GPU** (`--device cuda`, 32 pages in flight); all 2,937 pages at 226.2, every page read, scoring within 0.2 of the CPU.
-- On 17 November, the engine as released here read all of OmniParseBench at 30.4 pages a second on 8 workers, and its PDFs at 24.9 through `carbon-ocr ocr`.
+**Speed**, on a desktop (a virtual machine with 8 CPUs of an Intel Core i5-13600KF, and an RTX 4060 Ti), 17 November:
+- **5.14 pages a second on one core** against Tesseract's 0.92, so 5.6 times as fast (a median page of 165 ms against 789), and 31.3 against 6.0 in eight processes.
+- **30.8 pages a second** in one process of 8 workers with 16 pages in flight, 31.0 sustained over five minutes; one page at a time on 8 workers, a median page of 53 ms. Every page comes out the same bytes either way.
+- 31.9 pages a second served over HTTP (`carbon-ocr serve` on the CPU, 32 connections), the images' decoding included; 24.6 through `carbon-ocr ocr` on 8 workers, in runs of 64 pages that each load the models.
+- **209.7 pages a second on the GPU**, sustained over five minutes (`--device cuda`, the FP16 files on TensorRT, 32 pages in flight); all 2,937 pages at 237.2, every page read, scoring 52.3 as the CPU does.
+- All of OmniParseBench at 30.9 pages a second in 8 processes, and its PDFs at 24.9 through `carbon-ocr ocr`.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/fig-bench-dark.svg">
@@ -103,7 +99,7 @@ Read as PDFs means through `carbon-ocr ocr`, as you would run it: each page from
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/fig-bench-speed-dark.svg">
-  <img src="docs/assets/fig-bench-speed-light.svg" alt="Pages a second: 4.06 against Tesseract's 0.76 on one core, 13.54 against 2.97 in six processes." width="100%">
+  <img src="docs/assets/fig-bench-speed-light.svg" alt="Pages a second on a desktop's 8 CPUs: 5.14 against Tesseract's 0.92 on one core, 31.34 against 6.04 in eight processes." width="100%">
 </picture>
 
 **Pages, read** (17 November): `fullerene-3M` on three invented pages, a report page, a page of two tables and a rough photo of the first, every picture drawn from the engine's own output. On the report page it found every line, read 252 of 255 words right, put 21 blocks in the page's own reading order and wrote HTML, in 104 ms on one core; it turned the photo 180° and levelled it; it put all 73 table cells in their row and column, 62 of them character for character. Every fault found is listed with where it comes from ([docs/DEMO.md](docs/DEMO.md), [PDF](docs/Carbon-OCR-Demo.pdf), [dark](docs/Carbon-OCR-Demo-Dark.pdf); the scripts in [docs/demo/](docs/demo/)).
