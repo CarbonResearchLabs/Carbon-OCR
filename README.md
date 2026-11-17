@@ -91,6 +91,11 @@ Read as PDFs means through `carbon-ocr ocr`, as you would run it: each page from
 - 18.5 pages a second served over HTTP (`carbon-ocr serve`, 16 to 32 clients at once), the images' decoding included.
 - **95.2 pages a second on the GPU** (`--device cuda`, the FP16 files on TensorRT, 32 pages in flight), every page read, scoring within 0.1 of the CPU.
 
+**On a desktop** (a virtual machine with 8 CPUs of an Intel Core i5-13600KF, and an RTX 4060 Ti), sustained over five minutes after a minute's warm-up, 16 November:
+- **31.2 pages a second** on 8 CPU workers, and 5.29 on one core.
+- **212.6 pages a second on the GPU** (`--device cuda`, 32 pages in flight); all 2,937 pages at 226.2, every page read, scoring within 0.2 of the CPU.
+- On 17 November, the engine as released here read all of OmniParseBench at 30.4 pages a second on 8 workers, and its PDFs at 24.9 through `carbon-ocr ocr`.
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/fig-bench-dark.svg">
   <img src="docs/assets/fig-bench-light.svg" alt="OmniParseBench, all 2,937 pages: fullerene-3M scores a headline of 52.3 against Tesseract 5.5's 5.9; text 27.3 against 17.8, tables 47.9 and layout 81.7 against 0." width="100%">
