@@ -300,6 +300,32 @@ int code_points(const std::string& s) {
   return n;
 }
 
+// A text's one character, spaces aside, where it has one alone; 0 otherwise.
+uint32_t lone_char(const std::string& t) {
+  uint32_t got = 0;
+  int n = 0;
+  for (size_t i = 0; i < t.size();) {
+    const unsigned char c = static_cast<unsigned char>(t[i]);
+    size_t k = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 1;
+    if (i + k > t.size()) k = 1;
+    uint32_t cp = k == 1 ? c : c & (0x7Fu >> k);
+    for (size_t j = 1; j < k; ++j) cp = cp << 6 | (static_cast<unsigned char>(t[i + j]) & 0x3Fu);
+    i += k;
+    if (cp == ' ' || cp == '\t') continue;
+    got = cp;
+    if (++n > 1) return 0;
+  }
+  return got;
+}
+
+bool is_dash(uint32_t c) { return c == '-' || (c >= 0x2010 && c <= 0x2015) || c == 0x2212; }
+
+// A list's markers (the order model's features' bullets, carbon/order.cpp), dashes aside.
+bool is_bullet(uint32_t c) {
+  static constexpr std::u32string_view kBullets = U"•◦▪▫‣●○■□*·►▸➢✓";
+  return c != 0 && kBullets.find(static_cast<char32_t>(c)) != std::u32string_view::npos;
+}
+
 }  // namespace
 
 namespace detail {
@@ -1128,7 +1154,7 @@ void Engine::Impl::page(Job& j, int k) {
     Tensor thumb = Tensor::empty(DType::kFloat32, {1, 1, side, side});
     detail::thumbnail_input(small.view(), j.page.width, j.page.height, side, thumb.data<float>().data());
     const Tensor logits = std::move(w[k].orient->run(one(std::move(thumb)))[0]);
-    out.rotation = detail::rotation_of(logits.data<float>(), *o.turn_probability);
+    out.rotation = detail::rotation_of(logits.data<float>(), *o.turn_probability, o.turn_by_quarters);
   };
   // With fast cores idle (a page alone), the skew's search on the page as given runs beside orientation: a page
   // orientation does not turn keeps it, a turned one searches again (the same bytes either way).
@@ -1402,10 +1428,16 @@ void thumbnail_input(const GrayView& small, int page_w, int page_h, int side, fl
   ink_input(small, fit_side(page_w, longest, side), fit_side(page_h, longest, side), side, side, out);
 }
 
-int rotation_of(std::span<const float> z, float turn_probability) {
+int rotation_of(std::span<const float> z, float turn_probability, bool quarters) {
   const size_t best = static_cast<size_t>(std::max_element(z.begin(), z.end()) - z.begin());
   double sum = 0;
   for (float v : z) sum += std::exp(v - z[best]);
+  if (quarters && z.size() >= 12) {  // each quarter its three bins of 30 degrees (11, 0, 1 the upright's)
+    std::array<double, 4> q{};
+    for (size_t b = 0; b < 12; ++b) q[((b + 1) / 3) % 4] += std::exp(z[b] - z[best]) / sum;
+    const size_t t = static_cast<size_t>(std::max_element(q.begin(), q.end()) - q.begin());
+    return t != 0 && q[t] >= turn_probability ? static_cast<int>(t) * 90 : 0;
+  }
   const double p = 1.0 / sum;
   return p >= turn_probability && (best == 3 || best == 6 || best == 9) ? static_cast<int>(best) * 30 : 0;
 }
@@ -1423,7 +1455,7 @@ void make_upright(const GrayView& page, int rotation, GrayImage small, const Eng
   }
   if (o.deskew) {
     const Skew s = skew && !rotation ? *skew : find_skew(u.small.view(), o.max_skew);
-    if (std::abs(s.degrees) >= o.min_skew && s.gain >= o.min_skew_gain) {
+    if (std::abs(s.degrees) >= o.min_skew && s.gain >= (std::abs(s.degrees) > 5.0 ? o.wide_skew_gain : o.min_skew_gain)) {
       u.skew = s.degrees;
       u.levelled = split ? rotate_page(u.view, s.degrees, split) : rotate_page(u.view, s.degrees);
       u.view = u.levelled.view();
@@ -1782,14 +1814,75 @@ void read_line(OcrLine& line, const CtcLine& d, int32_t length, const CropRule& 
 // ---------------------------------------------------------------- the gate (GateRule)
 
 void gate_whole_lines(OcrPage& page, const GateRule& rule) {
+  const size_t n = page.lines.size();
+  // The lone marks first (GateRule: bullet_join, dash_cell): a list's marker into the line on its right, an empty
+  // cell's dash kept. Each looks at the text lines on its row: those whose heights overlap half of the smaller's.
+  std::vector<int> join(n, -1);       // the line a marker joins
+  std::vector<char> cell_dash(n, 0);  // a dash kept as a cell's
+  std::vector<char> taken(n, 0);      // a line a marker joins already
+  if (rule.bullet_join > 0 || rule.dash_cell > 0) {
+    for (size_t i = 0; i < n; ++i) {
+      const uint32_t c = lone_char(page.lines[i].text);
+      const bool dash = is_dash(c), bullet = is_bullet(c);
+      if (!dash && !bullet) continue;
+      const LineBox& m = page.lines[i].box;
+      const double h = std::max(1.0, m.y1 - m.y0);
+      double right_gap = 1e300, left_gap = 1e300, far = 0;
+      size_t right = n;
+      for (size_t j = 0; j < n; ++j) {
+        if (j == i) continue;
+        const OcrLine& o = page.lines[j];
+        const double over = std::min(m.y1, o.box.y1) - std::max(m.y0, o.box.y0);
+        if (over < 0.5 * std::min(h, std::max(1.0, o.box.y1 - o.box.y0)) || kinds_of(o.text).alnum == 0) continue;
+        if (o.box.x0 >= m.x0) {
+          const double g = std::max(0.0, o.box.x0 - m.x1);
+          if (g < right_gap) {
+            right_gap = g;
+            right = j;
+          }
+          far = std::max(far, g);
+        } else {
+          const double g = std::max(0.0, m.x0 - o.box.x1);
+          left_gap = std::min(left_gap, g);
+          far = std::max(far, g);
+        }
+      }
+      // a bullet, or a dash with nothing before it on its row and its item close after it, is a list's marker
+      const bool marker = bullet || (left_gap > rule.bullet_join * h && (rule.dash_cell <= 0 || right_gap < rule.dash_cell * h));
+      if (rule.bullet_join > 0 && marker && right < n && right_gap <= rule.bullet_join * h && !taken[right]) {
+        join[i] = static_cast<int>(right);
+        taken[right] = 1;
+      } else if (rule.dash_cell > 0 && dash && far > 0 && left_gap >= rule.dash_cell * h &&
+                 right_gap >= rule.dash_cell * h) {
+        cell_dash[i] = 1;  // apart from the text either side of it (a hyphen at a line's end is not)
+      }
+    }
+    for (size_t i = 0; i < n; ++i) {
+      if (join[i] < 0) continue;
+      const OcrLine& mark = page.lines[i];
+      OcrLine& to = page.lines[static_cast<size_t>(join[i])];
+      std::string t = mark.text;
+      t.erase(0, t.find_first_not_of(" \t"));
+      t.erase(t.find_last_not_of(" \t") + 1);
+      if (!to.words.empty()) to.words.insert(to.words.begin(), OcrWord{mark.box, t, mark.confidence});
+      to.text = t + " " + to.text;
+      to.box.x0 = std::min(to.box.x0, mark.box.x0);
+    }
+  }
   std::vector<OcrLine> kept;
-  kept.reserve(page.lines.size());
-  for (OcrLine& l : page.lines) {
+  kept.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    if (join[i] >= 0) continue;  // a marker, now its item's first word
+    OcrLine& l = page.lines[i];
     const TextKinds k = kinds_of(l.text);
     const double w = l.box.x1 - l.box.x0, h = l.box.y1 - l.box.y0;
-    const char* why = k.chars() == 0                                                   ? "empty"
+    const bool sliver = h > rule.sliver * w && k.chars() <= rule.sliver_chars &&
+                        (rule.sliver_thin <= 0 || h > rule.sliver_thin * w ||
+                         l.text.find_first_not_of(" |lI1!ij()[]{}/\\:;.,'\"`") == std::string::npos);
+    const char* why = cell_dash[i]                                                     ? nullptr
+                      : k.chars() == 0                                                 ? "empty"
                       : k.alnum == 0 && k.other == 0                                   ? "rules"
-                      : h > rule.sliver * w && k.chars() <= rule.sliver_chars           ? "sliver"
+                      : sliver                                                         ? "sliver"
                                                                                         : nullptr;
     if (why) {
       page.dropped.push_back({std::move(l), why});
@@ -1813,6 +1906,7 @@ void gate_pieces(OcrPage& page, const GateRule& rule) {
   for (size_t i = 0; i < n; ++i) {  // a few unsure characters with nothing beside them on their row
     const OcrLine& l = page.lines[i];
     if (why[i] || l.confidence >= rule.lone_sure || kinds_of(l.text).alnum > rule.lone_chars) continue;
+    if (rule.dash_cell > 0 && is_dash(lone_char(l.text))) continue;  // an empty cell's mark (gate_whole_lines)
     const double h = std::max(1.0, l.box.y1 - l.box.y0);
     bool beside = false;
     for (size_t j = 0; j < n && !beside; ++j) {
@@ -2038,8 +2132,11 @@ void order_page(OcrPage& page, Session* model, const EngineOptions& o) {
   std::vector<OcrLine> ordered;
   for (size_t i : order) ordered.push_back(std::move(page.lines[i]));
   page.lines = std::move(ordered);
+  // body text the model took for a table, by the model's cells (a table by geometry joins a cell's wrapped lines, so
+  // its cells are no measure of that)
   text_tables_as_text(page, o.tables ? o.tables->max_cell_chars : TableRule{}.max_cell_chars);
   if (o.table_spans) table_spans(page);
+  if (o.grid) tables_by_geometry(page, *o.grid);  // the model's tables by geometry
   if (page.blocks.empty() && o.tables) find_tables(page, *o.tables);  // no model's blocks: tables from geometry
 }
 
@@ -2173,6 +2270,35 @@ void Engine::order(std::span<OcrPage> pages) {
 bool Engine::has_order_model() const { return !impl_->w.empty() && impl_->w[0].order != nullptr; }
 
 const CropRule& Engine::crop() const { return impl_->o.crop; }
+
+LineFinder::LineFinder(const std::filesystem::path& set, const EngineOptions& options) : o_(options) {
+  const SetModel m = choose_set_model(set, "det", o_.backend, o_.precision);
+  o_.det = detail::model_det_rule(m.file, o_.det);
+  SessionOptions single;
+  single.threads = 1;
+  det_ = open_session(m.backend, m.file, single);  // the whole file: its maps, no head cut away
+}
+
+LineFinder::~LineFinder() = default;
+
+std::vector<LineBox> LineFinder::find(const GrayView& page) {
+  if (!page.data || page.width <= 0 || page.height <= 0) throw Error("LineFinder::find: an empty page");
+  const GrayImage small = detail::det_scale(page, o_.det_long_side, o_.det_area);
+  const GrayView sv = small.view();
+  const int dw = sv.width, dh = sv.height;
+  Tensor input = Tensor::empty(DType::kFloat32, {1, 1, round_up(dh, 32), round_up(dw, 32)});
+  ink_input(sv, dw, dh, round_up(dw, 32), round_up(dh, 32), input.data<float>().data());
+  const detail::DetectRun run = [&](const Tensor& x) { return std::move(det_->run(std::span<const Tensor>(&x, 1))[0]); };
+  const Tensor maps = run(input);
+  const Shape& s = maps.shape();
+  const Detection d = decode_det(maps.data<float>().data(), static_cast<int>(s[2]), static_cast<int>(s[3]), 1.0, o_.det);
+  OcrPage out;
+  detail::place_detection(d, page, dw, dh, o_, run, out);
+  std::vector<LineBox> boxes;
+  boxes.reserve(out.lines.size());
+  for (const OcrLine& l : out.lines) boxes.push_back(l.box);
+  return boxes;
+}
 
 float Engine::turn_probability() const { return *impl_->o.turn_probability; }
 

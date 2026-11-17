@@ -3,7 +3,9 @@
 # the checks, and by OCR with --text-layer off, which says so; written as hOCR,
 # and as PAGE XML a file a page.  figure.pdf: a hybrid page.
 #   cmake -DCLI=<carbon-ocr> -DDATA=<tests/data> -DOUT=<dir> -P cli_pdf_test.cmake
+# --layer-lines layer: the layer's own lines (PDFium's), each page's "Hello PDF"
 execute_process(COMMAND "${CLI}" ocr "${DATA}/text.pdf" --set "${DATA}/fake-set" --format json --workers 2
+                        --layer-lines layer
                 RESULT_VARIABLE code OUTPUT_VARIABLE out ERROR_VARIABLE err ENCODING UTF-8)
 if(NOT code EQUAL 0)
   message(FATAL_ERROR "carbon-ocr failed (${code}): ${err}")
@@ -21,6 +23,20 @@ foreach(i 0 1)
     message(FATAL_ERROR "page ${i}: page ${page}, source '${source}', first line '${text}': ${out}")
   endif()
 endforeach()
+# by default an upright page's words go into the detector's lines (the fake set's detector parts the two
+# words: its lines are its own), every word of the layer kept and in order; the page turned a quarter, its text
+# down the page, keeps the layer's line
+execute_process(COMMAND "${CLI}" ocr "${DATA}/text.pdf" --set "${DATA}/fake-set" --format text --workers 2
+                RESULT_VARIABLE code OUTPUT_VARIABLE out ERROR_VARIABLE err ENCODING UTF-8)
+if(NOT code EQUAL 0)
+  message(FATAL_ERROR "carbon-ocr (the detector's lines) failed (${code}): ${err}")
+endif()
+string(REGEX REPLACE "[ 
+]+" " " flat "${out}")
+string(STRIP "${flat}" flat)
+if(NOT flat STREQUAL "Hello PDF Hello PDF")
+  message(FATAL_ERROR "the detector's lines: '${flat}'")
+endif()
 execute_process(COMMAND "${CLI}" ocr "${DATA}/text.pdf" --set "${DATA}/fake-set" --format json --workers 1
                         --text-layer off
                 RESULT_VARIABLE code OUTPUT_VARIABLE out ERROR_VARIABLE err ENCODING UTF-8)
@@ -54,8 +70,10 @@ if(line EQUAL -1)
 endif()
 
 # a page read from its text layer whose picture holds text of its own (figure.pdf: a bar the fake
-# set reads as "aaa"): its picture read by OCR, its lines joining the layer's; --hybrid off, not
+# set reads as "aaa"): its picture read by OCR, its lines joining the layer's (PDFium's lines, --layer-lines layer:
+# the fake set's detector would part the words); --hybrid off, not
 execute_process(COMMAND "${CLI}" ocr "${DATA}/figure.pdf" --set "${DATA}/fake-set" --format json --workers 1
+                        --layer-lines layer
                 RESULT_VARIABLE code OUTPUT_VARIABLE out ERROR_VARIABLE err ENCODING UTF-8)
 if(NOT code EQUAL 0)
   message(FATAL_ERROR "carbon-ocr on figure.pdf failed (${code}): ${err}")
@@ -69,7 +87,7 @@ if(NOT source STREQUAL "hybrid" OR NOT n EQUAL 2 OR NOT pictures EQUAL 1 OR hell
   message(FATAL_ERROR "figure.pdf: source '${source}', ${n} lines, ${pictures} pictures: ${out}")
 endif()
 execute_process(COMMAND "${CLI}" ocr "${DATA}/figure.pdf" --set "${DATA}/fake-set" --format json --workers 1
-                        --hybrid off
+                        --hybrid off --layer-lines layer
                 RESULT_VARIABLE code OUTPUT_VARIABLE out ERROR_VARIABLE err ENCODING UTF-8)
 string(JSON source GET "${out}" pages 0 source)
 string(JSON n LENGTH "${out}" pages 0 lines)

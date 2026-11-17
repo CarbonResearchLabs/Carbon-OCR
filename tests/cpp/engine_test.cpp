@@ -22,6 +22,7 @@
 #include "carbon/deskew.h"
 #include "carbon/error.h"
 #include "carbon/image.h"
+#include "carbon/output.h"
 #include "carbon/textlayer.h"
 #include "../../carbon/src/engine_steps.h"
 #include "../../carbon/src/escape_scan.h"
@@ -199,6 +200,27 @@ TEST(Engine, LevelsASkewedPage) {
   o.deskew = false;  // without it, the lines' boxes hold the slant
   const OcrPage slanted = Engine(kSet, o).ocr(page.view());
   EXPECT_EQ(slanted.skew, 0.0);
+}
+
+// A page turned 15 degrees, past the narrow search: levelled (max_skew 45, the default), and read as it was;
+// with max_skew 5 it is not levelled by 15. A page within 5 degrees finds the same angle either way.
+TEST(Engine, LevelsAPageSkewedPastFiveDegrees) {
+  const GrayImage level = load_image(kSet / "page.png");
+  const GrayImage page = rotate_page(level.view(), 15);
+  EngineOptions o;
+  o.pool.workers = 1;
+  EXPECT_EQ(o.max_skew, 45.0);
+  const OcrPage p = Engine(kSet, o).ocr(page.view());
+  EXPECT_NEAR(p.skew, -15, 0.15);
+  ASSERT_EQ(p.lines.size(), 3u);
+  const char* want[] = {"aaa", "aaaaa", "aa"};
+  for (int i = 0; i < 3; ++i) EXPECT_EQ(p.lines[i].text, want[i]) << "line " << i;
+  EngineOptions narrow;
+  narrow.pool.workers = 1;
+  narrow.max_skew = 5;
+  EXPECT_LE(std::abs(Engine(kSet, narrow).ocr(page.view()).skew), 5.0);
+  const GrayImage small = rotate_page(level.view(), 2.5);
+  EXPECT_EQ(find_skew(small.view(), 45).degrees, find_skew(small.view(), 5).degrees);
 }
 
 TEST(Engine, ManyPagesComeBackInOrder) {
@@ -691,6 +713,231 @@ TEST(Gate, TablesOfTextAreText) {
   EXPECT_TRUE(p.blocks[0].cells.empty());
   EXPECT_EQ(p.blocks[1].label, "Table");
   EXPECT_EQ(p.blocks[1].cells.size(), 2u);
+}
+
+// The gate's marks: a bullet the detector found apart from its item joins it as its first word; a dash with
+// nothing before it and its item close after it is a list's marker too; a dash between a table's cells, far from
+// them, is kept as an empty cell's; a dash alone on its row, or at a word's end (a hyphen the detector cut off), is
+// a rule, dropped as before. A letter's tall box (a table's "P")
+// is kept, a rule's sliver (an "l", "1" or "|"; or anything over four times taller than wide) dropped.
+TEST(Gate, KeepsTheMarksOfListsAndEmptyCells) {
+  OcrPage p;
+  p.width = p.height = 1000;
+  p.lines = {gate_line({10, 10, 22, 30}, "•", 0.9f, 0.9f),            // 0: a bullet, its item just after
+             gate_line({34, 10, 400, 30}, "First item", 0.99f, 0.9f),
+             gate_line({10, 50, 22, 70}, "-", 0.9f, 0.9f),            // 2: a dash, its item just after
+             gate_line({36, 50, 400, 70}, "Second item", 0.99f, 0.9f),
+             gate_line({10, 100, 120, 120}, "Gender", 0.99f, 0.9f),   // 4: a table row, its middle cell a dash
+             gate_line({300, 100, 312, 120}, "–", 0.9f, 0.9f),
+             gate_line({500, 100, 560, 120}, "0.48", 0.99f, 0.9f),
+             gate_line({10, 200, 22, 220}, "-", 0.9f, 0.9f),          // 7: a dash alone on its row
+             gate_line({700, 300, 712, 328}, "P", 0.85f, 0.8f),       // 8: a letter, 2.3 times taller than wide
+             gate_line({700, 400, 708, 428}, "l", 0.85f, 0.8f),       // 9: a rule's sliver, read as an l
+             gate_line({800, 400, 805, 440}, "W", 0.85f, 0.8f),       // 10: eight times taller than wide
+             gate_line({10, 500, 200, 520}, "develop", 0.99f, 0.9f),  // 11: a word, and the hyphen after it
+             gate_line({202, 500, 212, 520}, "-", 0.9f, 0.9f),        //     a line's end, not a cell
+             gate_line({600, 500, 900, 520}, "the next column", 0.99f, 0.9f)};
+  detail::gate_whole_lines(p, GateRule{});
+  EXPECT_EQ(texts_of(p.lines), (std::vector<std::string>{"• First item", "- Second item", "Gender", "–", "0.48", "P",
+                                                          "develop", "the next column"}));
+  ASSERT_EQ(p.lines[0].words.size(), 0u);  // no words before: none made
+  EXPECT_EQ(p.lines[0].box.x0, 10);
+  ASSERT_EQ(p.dropped.size(), 4u);
+  EXPECT_EQ(p.dropped[0].why, "rules");
+  EXPECT_EQ(p.dropped[0].line.box.y0, 200);
+  EXPECT_EQ(p.dropped[1].why, "sliver");
+  EXPECT_EQ(p.dropped[2].why, "sliver");
+  EXPECT_EQ(p.dropped[3].why, "rules");
+  EXPECT_EQ(p.dropped[3].line.box.x0, 202);
+  // a line with words gets the marker as its first word; and each mark is off at 0, as before
+  OcrPage q;
+  q.width = q.height = 1000;
+  q.lines = {gate_line({10, 10, 22, 30}, "•", 0.9f, 0.9f), gate_line({34, 10, 400, 30}, "Item", 0.99f, 0.9f),
+             gate_line({10, 100, 120, 120}, "Gender", 0.99f, 0.9f), gate_line({300, 100, 312, 120}, "–", 0.9f, 0.9f)};
+  q.lines[1].words = {{{34, 10, 400, 30}, "Item", 0.99f}};
+  OcrPage off = q;
+  detail::gate_whole_lines(q, GateRule{});
+  ASSERT_EQ(q.lines[0].words.size(), 2u);
+  EXPECT_EQ(q.lines[0].words[0].text, "•");
+  EXPECT_EQ(q.lines[0].words[0].box.x0, 10);
+  GateRule none;
+  none.bullet_join = none.dash_cell = 0;
+  detail::gate_whole_lines(off, none);
+  EXPECT_EQ(texts_of(off.lines), (std::vector<std::string>{"Item", "Gender"}));
+  // after the split, a kept dash is not a lone mark to drop either
+  OcrPage r;
+  r.width = r.height = 1000;
+  r.lines = {gate_line({10, 100, 120, 120}, "Gender", 0.99f, 0.9f), gate_line({300, 100, 312, 120}, "–", 0.3f, 0.3f)};
+  detail::gate_pieces(r, GateRule{});
+  EXPECT_EQ(r.lines.size(), 2u);
+}
+
+// Tables by geometry: the model's table in two blocks (its header, then its body) is one; its third heading,
+// which the model took for a heading of the page, is inside its box and joins it; the second heading set on two
+// lines is one cell, its lines a line each in the HTML; the lines before and after it stay where they were.
+TEST(Gate, TablesByGeometry) {
+  OcrPage p;
+  p.width = p.height = 1000;
+  const std::vector<std::pair<LineBox, const char*>> lines = {
+      {{100, 0, 300, 20}, "Results"},                                                         // 0  Text
+      {{100, 40, 200, 60}, "Name"},     {{300, 40, 360, 60}, "Age"},                          // 1, 2  Table A
+      {{480, 40, 560, 60}, "Total"},                                                          // 3  Section-Header
+      {{300, 61, 370, 79}, "(years)"},                                                        // 4  Table A
+      {{100, 90, 180, 110}, "Ann"},     {{300, 90, 330, 110}, "31"}, {{500, 90, 530, 110}, "12"},   // 5-7  Table B
+      {{100, 120, 180, 140}, "Bob"},    {{300, 120, 330, 140}, "40"}, {{500, 120, 530, 140}, "7"},  // 8-10 Table B
+      {{100, 200, 400, 220}, "The end."}};                                                    // 11 Text
+  for (const auto& [b, t] : lines) p.lines.push_back(gate_line(b, t, 1, 1));
+  p.blocks = {{"Text", 0.9f, {0}, {}},
+              {"Table", 0.7f, {1, 2, 4}, {{0, 0, {1}}, {0, 1, {2, 4}}}},
+              {"Section-Header", 0.8f, {3}, {}},
+              {"Table", 0.8f, {5, 6, 7, 8, 9, 10}, {}},
+              {"Text", 0.9f, {11}, {}}};
+  detail::tables_by_geometry(p, GridRule{});
+  ASSERT_EQ(p.blocks.size(), 3u);
+  EXPECT_EQ(p.blocks[0].label, "Text");
+  EXPECT_EQ(p.blocks[1].label, "Table");
+  EXPECT_FLOAT_EQ(p.blocks[1].confidence, 0.8f);
+  EXPECT_EQ(p.blocks[2].label, "Text");
+  EXPECT_EQ(texts_of(p.lines), (std::vector<std::string>{"Results", "Name", "Age", "(years)", "Total", "Ann", "31",
+                                                          "12", "Bob", "40", "7", "The end."}));
+  EXPECT_EQ(p.blocks[0].lines, std::vector<int>{0});
+  EXPECT_EQ(p.blocks[2].lines, std::vector<int>{11});
+  const std::vector<OcrCell>& c = p.blocks[1].cells;
+  ASSERT_EQ(c.size(), 9u);
+  const int want[9][2] = {{0, 0}, {0, 1}, {0, 2}, {1, 0}, {1, 1}, {1, 2}, {2, 0}, {2, 1}, {2, 2}};
+  for (int k = 0; k < 9; ++k) {
+    EXPECT_EQ(c[k].row, want[k][0]) << k;
+    EXPECT_EQ(c[k].col, want[k][1]) << k;
+    EXPECT_EQ(c[k].col_span, 1) << k;
+  }
+  EXPECT_EQ(c[1].lines, (std::vector<int>{2, 3}));  // "Age", then "(years)"
+  EXPECT_EQ(c[2].lines, std::vector<int>{4});       // "Total"
+  const std::string html = to_html_body(p);
+  EXPECT_NE(html.find("<tr><td>Name</td><td>Age<br>(years)</td><td>Total</td></tr>"), std::string::npos) << html;
+  EXPECT_NE(html.find("<tr><td>Bob</td><td>40</td><td>7</td></tr>"), std::string::npos) << html;
+
+  // Side by side: a wide table the model cut down the middle, its rows in line across the cut, is one; two tables
+  // beside each other whose rows do not line up stay two.
+  auto two = [&](double shift) {
+    OcrPage s;
+    s.width = s.height = 1000;
+    for (int r = 0; r < 4; ++r) {
+      const double y = 100 + 30.0 * r, z = y + (r % 2 ? shift : 0);
+      s.lines.push_back(gate_line({100, y, 180, y + 20}, "a", 1, 1));
+      s.lines.push_back(gate_line({250, y, 300, y + 20}, "1", 1, 1));
+      s.lines.push_back(gate_line({600, z, 650, z + 20}, "2", 1, 1));
+      s.lines.push_back(gate_line({750, z, 800, z + 20}, "3", 1, 1));
+    }
+    s.blocks = {{"Table", 0.8f, {0, 1, 4, 5, 8, 9, 12, 13}, {}}, {"Table", 0.8f, {2, 3, 6, 7, 10, 11, 14, 15}, {}}};
+    detail::tables_by_geometry(s, GridRule{});
+    return s;
+  };
+  const OcrPage one = two(0), apart = two(13);
+  ASSERT_EQ(one.blocks.size(), 1u);
+  EXPECT_EQ(one.blocks[0].cells.size(), 16u);
+  EXPECT_EQ(one.blocks[0].cells.back().col, 3);
+  ASSERT_EQ(apart.blocks.size(), 2u);
+  EXPECT_EQ(apart.blocks[0].cells.back().col, 1);
+
+  // Two tables one above the other with a caption between them stay two, however close.
+  OcrPage cap;
+  cap.width = cap.height = 1000;
+  for (double y : {100.0, 130.0}) {
+    cap.lines.push_back(gate_line({100, y, 180, y + 20}, "x", 1, 1));
+    cap.lines.push_back(gate_line({300, y, 340, y + 20}, "1", 1, 1));
+  }
+  cap.lines.push_back(gate_line({100, 160, 400, 178}, "Table 2. The next one", 1, 1));
+  for (double y : {182.0, 212.0}) {
+    cap.lines.push_back(gate_line({100, y, 180, y + 20}, "y", 1, 1));
+    cap.lines.push_back(gate_line({300, y, 340, y + 20}, "2", 1, 1));
+  }
+  cap.blocks = {{"Table", 0.8f, {0, 1, 2, 3}, {}}, {"Text", 0.8f, {4}, {}}, {"Table", 0.8f, {5, 6, 7, 8}, {}}};
+  detail::tables_by_geometry(cap, GridRule{});
+  ASSERT_EQ(cap.blocks.size(), 3u);
+  EXPECT_EQ(cap.blocks[0].label, "Table");
+  EXPECT_EQ(cap.blocks[1].label, "Text");
+  EXPECT_EQ(cap.lines[static_cast<size_t>(cap.blocks[1].lines[0])].text, "Table 2. The next one");
+  EXPECT_EQ(cap.blocks[2].label, "Table");
+
+  // A table of one column by geometry keeps the model's cells and blocks.
+  OcrPage list;
+  list.width = list.height = 1000;
+  for (int r = 0; r < 3; ++r) list.lines.push_back(gate_line({100, 100.0 + 30 * r, 300, 120.0 + 30 * r}, "item", 1, 1));
+  list.blocks = {{"Table", 0.6f, {0, 1, 2}, {{0, 0, {0}}, {0, 1, {1}}, {1, 0, {2}}}}};
+  const OcrPage before = list;
+  detail::tables_by_geometry(list, GridRule{});
+  ASSERT_EQ(list.blocks.size(), 1u);
+  EXPECT_EQ(list.blocks[0].cells.size(), 3u);
+  EXPECT_EQ(list.blocks[0].cells[1].col, 1);
+  EXPECT_EQ(list.json(), before.json());
+}
+
+// Tables by geometry, row labels: each set in the middle of its group of rows (the first group's first row has none), it spans its
+// rows, so each row's value has its label to its left; a row of numbers alone is never a cell's next line.
+TEST(Gate, TablesByGeometrySpanTheirRowLabels) {
+  OcrPage p;
+  p.width = p.height = 1000;
+  const char* items[] = {"a", "b", "c", "d", "e", "f"};
+  p.lines.push_back(gate_line({100, 0, 180, 20}, "Group", 1, 1));
+  p.lines.push_back(gate_line({250, 0, 320, 20}, "Item", 1, 1));
+  p.lines.push_back(gate_line({450, 0, 520, 20}, "Value", 1, 1));
+  for (int r = 0; r < 6; ++r) {
+    const double y = 30.0 + 30 * r;
+    if (r == 1) p.lines.push_back(gate_line({100, y, 170, y + 20}, "Fruit", 1, 1));
+    if (r == 4) p.lines.push_back(gate_line({100, y, 170, y + 20}, "Nuts", 1, 1));
+    p.lines.push_back(gate_line({250, y, 280, y + 20}, items[r], 1, 1));
+    p.lines.push_back(gate_line({450, y, 470, y + 20}, std::to_string(r + 1).c_str(), 1, 1));
+  }
+  std::vector<int> all(p.lines.size());
+  std::iota(all.begin(), all.end(), 0);
+  p.blocks = {{"Table", 0.8f, all, {}}};
+  detail::tables_by_geometry(p, GridRule{});
+  ASSERT_EQ(p.blocks.size(), 1u);
+  const std::string html = to_html_body(p);
+  EXPECT_NE(html.find("<tr><td rowspan=\"3\">Fruit</td><td>a</td><td>1</td></tr>\n<tr><td>b</td><td>2</td></tr>\n"
+                      "<tr><td>c</td><td>3</td></tr>\n<tr><td rowspan=\"3\">Nuts</td><td>d</td><td>4</td></tr>"),
+            std::string::npos)
+      << html;
+  EXPECT_NE(html.find("<tr><td>Group</td><td>Item</td><td>Value</td></tr>"), std::string::npos) << html;
+}
+
+// The detector alone (a text layer's page) finds the lines the engine reads, where it reads them.
+TEST(Engine, FindsALinesPlacesAlone) {
+  const GrayImage page = load_image(kSet / "page.png");
+  EngineOptions o;
+  o.pool.workers = 1;
+  const OcrPage p = Engine(kSet, o).ocr(page.view());
+  std::vector<LineBox> found = LineFinder(kSet, o).find(page.view());
+  std::vector<LineBox> read;
+  for (const OcrLine& l : p.lines) read.push_back(l.box);
+  auto by_y = [](const LineBox& a, const LineBox& b) { return a.y0 < b.y0; };
+  std::sort(found.begin(), found.end(), by_y);
+  std::sort(read.begin(), read.end(), by_y);
+  ASSERT_EQ(found.size(), 3u);
+  ASSERT_EQ(found.size(), read.size());
+  for (size_t i = 0; i < found.size(); ++i) {
+    EXPECT_NEAR(found[i].x0, read[i].x0, 1.0) << i;
+    EXPECT_NEAR(found[i].y0, read[i].y0, 1.0) << i;
+    EXPECT_NEAR(found[i].x1, read[i].x1, 1.0) << i;
+    EXPECT_NEAR(found[i].y1, read[i].y1, 1.0) << i;
+  }
+}
+
+// A quarter turn by its three bins' sum (60, 90 and 120 degrees for 90), where no bin alone is sure; the
+// upright quarter's bins (330, 0 and 30) never turn the page.
+TEST(Engine, TurnsByQuartersOfThreeBins) {
+  std::vector<float> z(13, 0.0f);
+  z[2] = z[3] = z[4] = 2.0f;  // each bin 0.23, the quarter 0.69
+  EXPECT_EQ(detail::rotation_of(z, 0.65f), 0);
+  EXPECT_EQ(detail::rotation_of(z, 0.65f, true), 90);
+  EXPECT_EQ(detail::rotation_of(z, 0.7f, true), 0);
+  std::vector<float> up(13, 0.0f);
+  up[11] = up[0] = up[1] = 4.0f;
+  EXPECT_EQ(detail::rotation_of(up, 0.5f, true), 0);
+  std::vector<float> half(13, 0.0f);
+  half[7] = 9.0f;  // 210 degrees: the 180 quarter's
+  EXPECT_EQ(detail::rotation_of(half, 0.65f, true), 180);
+  EXPECT_EQ(detail::rotation_of(half, 0.65f), 0) << "the bin alone is not a quarter turn's";
 }
 
 // Five graded options (the characters' confidence on by default, the rest off): a tall page detected by its

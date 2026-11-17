@@ -14,6 +14,7 @@ namespace carbon {
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
+constexpr double kNarrow = 5.0;  // degrees: the search in half degrees; past it, find_skew's wide search
 
 // The page's histogram, counted in four interleaved histograms so that a run of
 // one gray level (paper) is not one long chain of increments to one counter.
@@ -122,11 +123,45 @@ Skew find_skew(const GrayView& page, double max_degrees) {
   p.count.assign(static_cast<size_t>(4) * p.rows, 0);
   const double level = p.score(0);
   double best = 0, best_score = level;
-  for (double d = -max_degrees; d <= max_degrees + 1e-9; d += 0.5) {
+  const double near = std::min(max_degrees, kNarrow);
+  for (double d = -near; d <= near + 1e-9; d += 0.5) {
     const double v = p.score(d);
     if (v > best_score) {
       best_score = v;
       best = d;
+    }
+  }
+  if (max_degrees > kNarrow) {
+    // Past the narrow search, 1-degree steps on a quarter of the points; the best of them, and the half degrees
+    // either side, on all of them, against the narrow search's best.
+    Points q;
+    q.rows = p.rows;
+    q.half = p.half;
+    q.count.assign(p.count.size(), 0);
+    for (size_t i = 0; i < p.xs.size(); i += 4) {
+      q.xs.push_back(p.xs[i]);
+      q.ys.push_back(p.ys[i]);
+    }
+    double wide = 0, wide_score = -1;
+    const double edge = std::floor(max_degrees);
+    for (double d = -edge; d <= edge + 1e-9; d += 1.0) {
+      if (std::abs(d) <= kNarrow + 1e-9) continue;
+      const double v = q.score(d);
+      if (v > wide_score) {
+        wide_score = v;
+        wide = d;
+      }
+    }
+    // a best at the search's edge is no peak of its own (a page's diagonal structure, a grid): no wide angle then
+    if (std::abs(wide) < edge - 1e-9) {
+      for (double d = wide - 0.5; d <= wide + 0.5 + 1e-9; d += 0.5) {
+        if (std::abs(d) > max_degrees + 1e-9) continue;
+        const double v = p.score(d);
+        if (v > best_score) {
+          best_score = v;
+          best = d;
+        }
+      }
     }
   }
   const double coarse = best;

@@ -490,8 +490,9 @@ bool numbered(const std::string& t) {
 }
 
 // A table's cells as HTML, markdown's and HTML's alike: a <td> a cell at its row and column, colspan and rowspan
-// where it covers more (OcrCell's spans), the places a span covers left out; a cell's lines one paragraph. A cell at
-// a place another's span covers gives its lines to that one, so no text is lost.
+// where it covers more (OcrCell's spans), the places a span covers left out; a cell's lines a line each, <br>
+// between them (a heading set on two lines, or values set one a line in one cell). A cell at a place another's span
+// covers gives its lines to that one, so no text is lost.
 std::string table_html(const OcrPage& page, const OcrBlock& b) {
   int rows = 0, cols = 0;
   for (const OcrCell& c : b.cells) {
@@ -529,7 +530,12 @@ std::string table_html(const OcrPage& page, const OcrBlock& b) {
       out += "<td";
       if (s.col_span > 1) out += " colspan=\"" + std::to_string(s.col_span) + "\"";
       if (s.row_span > 1) out += " rowspan=\"" + std::to_string(s.row_span) + "\"";
-      out += ">" + html(paragraph(page, s.lines)) + "</td>";
+      out += '>';
+      for (size_t i = 0; i < s.lines.size(); ++i) {
+        if (i) out += "<br>";
+        out += html(page.lines[static_cast<size_t>(s.lines[i])].text);
+      }
+      out += "</td>";
     }
     out += "</tr>\n";
   }

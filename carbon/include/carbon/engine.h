@@ -69,20 +69,69 @@ struct TableRule {
   int max_cell_chars = 30;
 };
 
+// Tables by geometry inside the order model's Table blocks (EngineOptions::grid). Distances are in the table's
+// median line height.
+//   1. Blocks: two Table blocks are one table where they overlap or lie within merge_gap of each other down the
+//      page, their spans across overlapping by half the narrower's; or side by side (no overlap across, their spans
+//      down overlapping by half the shorter's) where side_rows of the smaller's lines share a row with the other's
+//      (centres within side_tol); and where no other line lies in the gap between them (a caption, a paragraph:
+//      two tables).
+//   2. Extent: the lines of other blocks wholly inside the table's box are its (a header the model labelled a heading,
+//      a cell's long line), and those whose centres are inside it of at most inside_chars characters (a paragraph's
+//      line that runs past the table's edge is not); then
+//      the rows next to it, above and below, within grow_gap, whose lines are two or more each in a column of its
+//      own, their median at most grow_chars characters (a cell's, not two columns of text), while there are such.
+//   3. Rows: its lines by their centres down the page, a line joining the row whose mean centre is within row_tol.
+//   4. Columns: from its fullest rows (the most lines), each column the median of their k-th lines' edges, columns
+//      that overlap joined; a line covering more than `cover` of a column's width is in it, from the first such
+//      column to the last (a column span), else in the column its centre is in or nearest.
+//   5. A cell's next lines: a row whose lines each overlap a different line of the row above across, no more of
+//      them, and none of them a number alone (digits, no letter: a value, in a row of its own), joins that row,
+//      cell by cell: in a header of at most header_rows rows (the rows down to the first full row), or nearer the
+//      row above than wrap_pitch of the table's median row pitch.
+//   6. Row labels: in the rows from the first that holds a number (a value: the rows above are the header's), a
+//      first-column label over the rows next to it whose first cells are empty and which hold a number spans them,
+//      set at the top of its group where the first label has none above it, else in the middle (each row the
+//      nearer label's); a row whose first cell spans columns (a section's) bounds the groups.
+// Each cell's lines are a line each in the writers' tables.
+struct GridRule {
+  double merge_gap = 1.5;
+  double side_rows = 0.6, side_tol = 0.3;
+  int inside_chars = 40;
+  double grow_gap = 1.5;
+  int grow_chars = 30;
+  double row_tol = 0.6;
+  double cover = 0.5;
+  double wrap_pitch = 0.75;
+  int header_rows = 4;
+};
+
 // Lines that are not text, dropped before they are ordered and written: what the recognizer
 // read out of a photograph, a rule, a speck or a page's edge. Before the lines are split at their gaps, a line that
 // read nothing, or only rules and marks (_ - — – . | = ~ · • / \), or a sliver (taller than `sliver` times its
-// width) that read at most `sliver_chars` characters. After the split, a piece at least `picture_share` on the
+// width) that read at most `sliver_chars` characters: narrow ones a rule reads as (| l I 1 ! i j ( ) [ ] { } / \ :
+// ; . , ' "), or any where it is taller than sliver_thin times its width (0: any, whatever its height), since a
+// letter's box alone (a table's "P", "n" or "F") is up to about three times taller than wide. After the split, a
+// piece at least `picture_share` on the
 // detector's picture mask that read unsurely (its confidence under `picture_sure`, or a character's probability
 // under `picture_least`); and a piece of at most `lone_chars` letters and digits, its confidence under `lone_sure`,
 // with no other piece on its row within a line height. The JSON keeps each, with its reason (OcrPage::dropped).
+//
+// Two marks are kept from that, on whole lines: a list's marker the detector found apart from its item (a bullet,
+// or a dash with nothing before it on its row) joins the line on its right, within bullet_join of its line heights,
+// as that line's first word; and a lone dash (- ‐ – — −) with other text on its row, at least dash_cell of its line
+// heights from the text on either side of it (a hyphen at a line's end is not), is an empty table cell's mark, kept
+// as a line of its own. 0 turns either off.
 struct GateRule {
   double sliver = 1.6;
   int sliver_chars = 2;
+  double sliver_thin = 4.0;
   double picture_share = 0.8;
   float picture_sure = 0.9f, picture_least = 0.5f;
   int lone_chars = 3;
   float lone_sure = 0.6f;
+  double bullet_join = 2.5;
+  double dash_cell = 1.0;
 };
 
 // Spaces the recognizer read where the ink does not part the characters: a space whose
@@ -122,11 +171,20 @@ struct EngineOptions {
   // carries one (carbon.orient.turn_probability, calibrated on held-out pages when the
   // model is exported), else 0.95.
   std::optional<float> turn_probability;
+  // A quarter turn's probability the sum of its three bins' (for 90 degrees: 60, 90 and 120), the turn the
+  // likeliest quarter, where it reaches turn_probability; what is left of the angle, up to 45 degrees, is deskew's
+  // (max_skew). False: a quarter turn's own bin, the likeliest of the 12 (the default). Off until a threshold is
+  // calibrated for the sums (they run higher than a bin's: at a bin's 0.65, pages in scripts the model was not
+  // trained on, upright, were turned 180 degrees).
+  bool turn_by_quarters = false;
   // Deskew (carbon/deskew.h): a page skewed by at least min_skew degrees (and at
   // most max_skew), whose level angle clearly beats level (its projection score
-  // min_skew_gain times the level page's), is levelled before detection.
+  // min_skew_gain times the level page's), is levelled before detection; past 5 degrees (a page photographed or
+  // scanned askew, up to 45) its score must be wide_skew_gain times the level page's. 45 by default: on real pages
+  // turned 8 to 40 degrees, 0.7 to 0.8 of the upright page's text read back against 0.2 to 0.45 at 5, and upright
+  // and slightly skewed pages read the same; 5: the narrow search alone.
   bool deskew = true;
-  double max_skew = 5.0, min_skew = 0.2, min_skew_gain = 1.05;
+  double max_skew = 45.0, min_skew = 0.2, min_skew_gain = 1.05, wide_skew_gain = 1.25;
   int line_batch = 8;             // lines a recognition task holds when every core is busy
   // The CPU engine's width buckets (width_bucket): the trainer's ladder, 1.3 times wider a step. Finer (1.15) pads
   // the lines less (7.5% of recognition's pixels, against 13%), but the recognizer then reads
@@ -150,6 +208,11 @@ struct EngineOptions {
   // column the model made of such cells alone goes; every other cell keeps the model's row and column, so a table
   // without a wide cell is the model's as it was. False: the model's grid, no spans.
   bool table_spans = true;
+  // The order model's tables laid out by geometry (GridRule, tables_by_geometry): its Table blocks that are one
+  // table joined, each grown by the lines inside its box and the rows beside it that fall in its columns, its grid
+  // from its lines' rows and its fullest rows' columns. A table with no two columns keeps the model's cells. None:
+  // the model's cells for every table (with table_spans).
+  std::optional<GridRule> grid = GridRule{};
   // One ONNX Runtime session a model for every worker, not one a worker: its packed weights
   // once in the caches the cores share, its run on the caller's thread (one intra-op thread) as before. The native
   // backend's sessions keep each run's buffers and stay a worker's own. Measured on the speed set: the same bytes,
@@ -355,6 +418,24 @@ class Engine {
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+};
+
+// The set's detector alone, for a page whose text comes from elsewhere (a born-digital page's text layer, its
+// words put into the lines the detector finds, carbon/textlayer.h): the lines' boxes on the page as given (not
+// turned or levelled), found as Engine finds them (at its scale, with its decoding thresholds, a page of tiny text
+// detected again). Its own one-thread session of the set's det file (the options' backend and precision); use from
+// one thread.
+class LineFinder {
+ public:
+  explicit LineFinder(const std::filesystem::path& set, const EngineOptions& options = {});
+  ~LineFinder();
+  LineFinder(const LineFinder&) = delete;
+  LineFinder& operator=(const LineFinder&) = delete;
+  std::vector<LineBox> find(const GrayView& page);
+
+ private:
+  std::unique_ptr<Session> det_;
+  EngineOptions o_;
 };
 
 // A recognizer's classes, from <rec>.vocab.json ({"chars": [...]}, class 0 the

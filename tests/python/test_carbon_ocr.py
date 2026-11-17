@@ -335,6 +335,9 @@ def test_the_batched_pipeline_reads_as_the_engine_does():
     assert s["pages"] == 5 and s["lines"] == 9 and 1 <= s["detect_runs"] <= 5
     assert p.ocr([page], html=True)[0]["html"] == carbon_ocr.Engine(str(DATA / "fake-set"), workers=1).ocr(
         [page], html=True)[0]["html"]
+    no_grid = carbon_ocr.Pipeline(str(DATA / "fake-set"), device="cpu", threads=1, model_threads=1, grid=False)
+    assert no_grid.ocr([page])[0]["text"] == carbon_ocr.Engine(str(DATA / "fake-set"), workers=1, grid=False).ocr(
+        [page])[0]["text"] == read
     with pytest.raises(Exception):
         carbon_ocr.Pipeline(str(DATA / "fake-set"), device="tpu")
 
@@ -372,3 +375,20 @@ def test_the_pipeline_streams_pages_while_python_runs():
     assert ticks, "the Python thread ran while the pipeline read"
     with pytest.raises(Exception, match="block_order"):
         carbon_ocr.Pipeline(str(DATA / "fake-set"), device="cpu", block_order="sideways")
+
+
+def test_the_engines_table_gate_and_deskew_options():
+    # The table, gate and deskew options through the module: a page turned 15 degrees is levelled at the default deskew (45 degrees)
+    # and not by 15 with max_skew 5; the other options taken and read as the engine's; a deskew past 45 refused
+    page = Image.open(DATA / "fake-set" / "page.png").convert("L").rotate(15, resample=Image.BILINEAR, fillcolor=255)
+    turned = np.ascontiguousarray(np.asarray(page))
+    wide = carbon_ocr.Engine(str(DATA / "fake-set"), workers=1).ocr([turned])[0]
+    narrow = carbon_ocr.Engine(str(DATA / "fake-set"), workers=1, max_skew=5.0).ocr([turned])[0]
+    assert abs(wide["skew"] + 15) < 0.3
+    assert abs(narrow["skew"]) <= 5.0
+    assert wide["text"] == "aaa\naaaaa\naa\n"
+    e = carbon_ocr.Engine(str(DATA / "fake-set"), workers=1, grid=False, blocks_first=True, turn_by_quarters=True,
+                          wide_skew_gain=1.5, bullet_join=0.0, dash_cell=0.0, sliver_thin=0.0)
+    assert e.ocr([turned])[0]["text"] == "aaa\naaaaa\naa\n"
+    with pytest.raises(Exception, match="max_skew"):
+        carbon_ocr.Engine(str(DATA / "fake-set"), workers=1, max_skew=60.0)

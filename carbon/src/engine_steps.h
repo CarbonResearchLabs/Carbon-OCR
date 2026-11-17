@@ -47,8 +47,10 @@ void thumbnail_input(const GrayView& small, int page_w, int page_h, int side, fl
 
 // The quarter turn the orientation logits (13 classes) ask for, in degrees
 // clockwise (0, 90, 180 or 270): only a quarter turn, only when the softmax
-// probability reaches turn_probability.
-int rotation_of(std::span<const float> logits, float turn_probability);
+// probability reaches turn_probability: the likeliest bin's, where it is a quarter
+// turn's; with `quarters` (EngineOptions::turn_by_quarters), the likeliest quarter's,
+// the sum of its three bins (for 90: 60, 90 and 120 degrees).
+int rotation_of(std::span<const float> logits, float turn_probability, bool quarters = false);
 
 // A page turned upright and levelled: the full page (view) and its copy at the
 // detector's scale (small), each turned back by `rotation` and levelled when
@@ -149,6 +151,12 @@ void text_tables_as_text(OcrPage& page, int max_cell_chars);
 // The order model's tables laid out again from their cells' boxes, with spans (EngineOptions::table_spans): the
 // page's lines in their reading order, as text_tables_as_text's.
 void table_spans(OcrPage& page);
+
+// The order model's tables by geometry (GridRule, EngineOptions::grid; carbon/tables.cpp): Table blocks that
+// are one table joined into one, at the first's place, each grown by the lines inside its box and the rows beside
+// it, its cells by its rows and columns, its lines cell by cell; a table with no two columns keeps the model's cells
+// and blocks. The page's lines follow the blocks' order again (each block's lines one run of them).
+void tables_by_geometry(OcrPage& page, const GridRule& rule);
 
 // A page's last steps, the CPU's and the GPU's alike: the gate, the split at wide gaps, the reading order (and
 // tables), the picture mask let go.

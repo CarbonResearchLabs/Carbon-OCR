@@ -24,7 +24,7 @@ carbon-ocr ocr scans/*.png --set models/fullerene-3M --device cuda --precision f
 
 `ocr` reads PNG, JPEG, BMP and PNM pages, and PDFs. A PDF's pages are rendered by PDFium in `carbon-pdf` helper processes. If a document crashes PDFium, only a helper dies, and your program keeps running.
 
-A born-digital PDF page whose text layer passes the engine's checks is read from that layer instead of by OCR. Its pictures (the page's image objects) are still read by OCR, and their lines join the layer's. The JSON output gives each page's source (`ocr`, `text layer` or `hybrid`). For a PDF page read by OCR, it also says why the page's text layer was not used.
+A born-digital PDF page whose text layer passes the engine's checks is read from that layer instead of by OCR. Its words are put into the lines the detector finds on the page, so its tables and reading order come out as a scanned page's would (`--layer-lines layer` keeps PDFium's own lines). Its pictures (the page's image objects) are still read by OCR, and their lines join the layer's. The JSON output gives each page's source (`ocr`, `text layer` or `hybrid`). For a PDF page read by OCR, it also says why the page's text layer was not used.
 
 By default the pages run in parallel on the CPU, one worker per physical core. `--device cuda` reads them through the batched pipeline on the GPU instead: TensorRT runs the set's files at `--precision` (the FP16 files by default), and each model is batched across the pages in flight. This needs a build with TensorRT and CUDA ([BUILD.md](BUILD.md)).
 
@@ -41,17 +41,23 @@ By default the pages run in parallel on the CPU, one worker per physical core. `
 | `--dpi N\|auto` | 200 | the dpi a PDF's pages are rendered at; `auto`: each page at the dpi its small print or its scan needs, from 200 to 400 |
 | `--text-layer auto\|off` | `auto` | read a PDF page from its own text layer where it passes the checks; a tagged page in its structure tree's order |
 | `--hybrid auto\|off` | `auto` | read the pictures of a page that was read from its text layer by OCR |
+| `--layer-lines detected\|layer` | `detected` | a text layer's words in the lines the detector finds on the page (an upright page's); `layer`: PDFium's lines, about 10% faster on text pages |
 | `--second-pass auto\|off` | `auto` | detect a page of tiny text (its median line under 9 px at the detector's scale) again at twice the scale, and merge the two passes |
 | `--second-pass-share F` | 0 | also take the second pass where at least this share of the lines (and 8 of them) are tiny; 0: by the median alone |
 | `--single-pixel F` | 0.8 | a detector band of one map pixel at least this sure is a line; 0: never |
 | `--gate auto\|off` | `auto` | drop lines that are not text: rules and marks, slivers, unsure pieces read out of pictures, lone unsure marks (the JSON lists them); `off` keeps every line |
 | `--block-order geometry\|model` | `geometry` | the order model's blocks in order by their geometry, a page's columns first; `model`: as the model ordered them |
-| `--table-spans on\|off` | `on` | the order model's tables with their spanning cells (`colspan`, `rowspan`) |
+| `--grid on\|off` | `on` | lay the order model's tables out by geometry: its split blocks joined, rows and columns from the lines' places, a cell set on two lines one cell, row labels spanning their rows; `off`: the model's cells |
+| `--table-spans on\|off` | `on` | with `--grid off`, the order model's tables with their spanning cells (`colspan`, `rowspan`) |
+| `--blocks-first on\|off` | `off` | the order model's blocks as its same-block scores' clusters, not the runs of its order |
 | `--spaces model\|ink` | `model` | `ink`: drop a space the recognizer is unsure of where the line's ink shows no gap (the CPU only) |
 | `--beam N` | 0 | read the lines the recognizer is unsure of again by a CTC prefix beam of N prefixes (8 is the width to ask for); under 2: off, every line greedy |
 | `--beam-gate F` | 0.9 | the confidence under which a line goes to the beam; 0: none, 2: every line |
 | `--beam-topk N` | 5 | the classes each frame offers the beam besides the blank |
 | `--as-given` | off | no quarter turns and no deskew: the page as given |
+| `--max-skew D` | 45 | deskew's range in degrees; 5: the narrow search alone |
+| `--wide-skew-gain F` | 1.25 | how much better than level a skew past 5 degrees must score to be levelled |
+| `--turn bin\|quarters` | `bin` | `quarters`: a quarter turn read by the sum of its three 30-degree bins (needs a threshold calibrated for the sums) |
 | `--precision auto\|fp32\|fp16\|int8` | `auto` | the files the models run. On the CPU: `fp16` the set's `.fp16.onnx` on the engine's own kernels, `int8` its `.int8.onnx`, `fp32` its `.onnx`; `auto` as below. On the GPU: `fp16` the `.fp16.onnx` files and the recognizer's trunk and fused CTC head, `fp32` the `.onnx` files, `int8` the `.int8-sym.onnx` files; `auto` the FP16 files, the FP32 one where a set lacks one |
 | `--backend ort\|native` | per model | run every model on one backend; by default a model runs on the native int8 backend where the set has its `.int8.onnx`, else on ONNX Runtime |
 | `--workers N` | one per physical core | CPU workers |

@@ -348,8 +348,21 @@ NB_MODULE(carbon_ocr, m) {
              bool share_sessions, double bucket_ratio, bool spaces_from_ink, int64_t det_area,
              double second_pass_target, bool justified, bool flip_needs_dark, bool char_confidence,
              bool word_boxes_at_ink, bool fused_rec_head, bool det_stem, double det_pitch, int beam_width,
-             int beam_topk, float beam_gate, float beam_blank_skip) {
+             int beam_topk, float beam_gate, float beam_blank_skip, bool grid, bool blocks_first,
+             bool turn_by_quarters, double max_skew, double wide_skew_gain, double bullet_join, double dash_cell,
+             double sliver_thin) {
             carbon::EngineOptions o;
+            if (!grid) o.grid.reset();
+            o.order.blocks_first = blocks_first;
+            o.turn_by_quarters = turn_by_quarters;
+            if (!(max_skew >= 0 && max_skew <= 45)) throw carbon::Error("max_skew is in [0, 45]");
+            o.max_skew = max_skew;
+            o.wide_skew_gain = wide_skew_gain;
+            if (o.gate) {
+              o.gate->bullet_join = bullet_join;
+              o.gate->dash_cell = dash_cell;
+              o.gate->sliver_thin = sliver_thin;
+            }
             o.pool.workers = workers;
             o.pool.pin = pin;
             o.rec = rec;
@@ -390,6 +403,11 @@ NB_MODULE(carbon_ocr, m) {
           "word_boxes_at_ink"_a = false, "fused_rec_head"_a = false, "det_stem"_a = false, "det_pitch"_a = 0.0,
           "beam_width"_a = carbon::BeamRule{}.width, "beam_topk"_a = carbon::BeamRule{}.topk,
           "beam_gate"_a = carbon::BeamRule{}.gate, "beam_blank_skip"_a = carbon::BeamRule{}.blank_skip,
+          "grid"_a = true,
+          "blocks_first"_a = carbon::OrderRule{}.blocks_first,
+          "turn_by_quarters"_a = carbon::EngineOptions{}.turn_by_quarters, "max_skew"_a = carbon::EngineOptions{}.max_skew,
+          "wide_skew_gain"_a = carbon::EngineOptions{}.wide_skew_gain, "bullet_join"_a = carbon::GateRule{}.bullet_join,
+          "dash_cell"_a = carbon::GateRule{}.dash_cell, "sliver_thin"_a = carbon::GateRule{}.sliver_thin,
           "A Fullerene set's directory (orient.onnx, det.onnx, <rec>.onnx, <rec>.vocab.json, and order.native.bin "
           "or order.onnx where it has one; order_model another); workers 0 is one per physical core. precision: "
           "the models' files, \"auto\" (the fastest the set has), \"fp32\", \"fp16\" or \"int8\" "
@@ -399,7 +417,11 @@ NB_MODULE(carbon_ocr, m) {
           "carbon::DetRule's (0 for neither). table_spans: the order model's tables laid out again with their "
           "spans (carbon::EngineOptions::table_spans). beam_width, beam_topk, beam_gate, beam_blank_skip: the CTC "
           "prefix beam for the lines under the gate (carbon::EngineOptions::beam, carbon/beam.h); a width under 2 is "
-          "off.")
+          "off. grid: the order model's tables by geometry (carbon::GridRule; False: the model's cells). "
+          "blocks_first: blocks as the same-block head's clusters (carbon::OrderRule). turn_by_quarters, "
+          "max_skew (0 to 45), wide_skew_gain: orientation by quarter turns and deskew past 5 degrees "
+          "(carbon::EngineOptions). bullet_join, dash_cell, sliver_thin: the gate's marks and slivers "
+          "(carbon::GateRule; 0 turns each off).")
       .def_prop_ro("workers", &carbon::Engine::workers)
       .def(
           "ocr",
@@ -475,7 +497,7 @@ NB_MODULE(carbon_ocr, m) {
              int page_batch, int line_batch, int in_flight, int threads, int model_threads, const std::string& rec,
              std::optional<std::filesystem::path> order_model, std::optional<std::filesystem::path> engine_cache,
              const std::string& precision, bool gate, const std::string& block_order, bool table_spans,
-             bool head_fp16_accumulate) {
+             bool head_fp16_accumulate, bool grid) {
             carbon::PipelineOptions o;
             o.head_fp16_accumulate = head_fp16_accumulate;
             o.engine.precision = precision_of(precision);
@@ -483,6 +505,7 @@ NB_MODULE(carbon_ocr, m) {
             if (block_order != "geometry" && block_order != "model") throw carbon::Error("block_order: geometry or model");
             o.engine.blocks_by_geometry = block_order == "geometry";
             o.engine.table_spans = table_spans;
+            if (!grid) o.engine.grid.reset();
             if (device) {
               if (*device != "cpu" && *device != "cuda") throw carbon::Error("device: cpu or cuda");
               o.device = *device == "cuda" ? carbon::Device::kCuda : carbon::Device::kCpu;
@@ -500,12 +523,12 @@ NB_MODULE(carbon_ocr, m) {
           "set"_a, "device"_a = nb::none(), "page_batch"_a = 8, "line_batch"_a = 256, "in_flight"_a = 32,
           "threads"_a = 0, "model_threads"_a = 0, "rec"_a = "rec-latin", "order_model"_a = nb::none(),
           "engine_cache"_a = nb::none(), "precision"_a = "auto", "gate"_a = true, "block_order"_a = "geometry",
-          "table_spans"_a = true, "head_fp16_accumulate"_a = false,
+          "table_spans"_a = true, "head_fp16_accumulate"_a = false, "grid"_a = true,
           "A Fullerene set's directory; device \"cpu\" or \"cuda\" (None: the GPU where this build has CUDA and "
           "TensorRT and a GPU is there); page_batch pages an orientation or detection run, line_batch lines a "
           "recognition run, in_flight pages at once; threads the CPU threads preparing and assembling pages and "
           "model_threads a CPU model run's (0: the physical cores); precision the CPU's files, as Engine's (the "
-          "GPU runs the set's FP16 files); gate, block_order and table_spans as Engine's.")
+          "GPU runs the set's FP16 files); gate, block_order, table_spans and grid as Engine's.")
       .def_prop_ro("device",
                    [](const carbon::Pipeline& p) { return p.device() == carbon::Device::kCuda ? "cuda" : "cpu"; })
       .def(

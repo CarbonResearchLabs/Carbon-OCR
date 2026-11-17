@@ -425,6 +425,31 @@ TEST(Order, BlocksAndTheirLabels) {
   EXPECT_STREQ(block_label_name(99), "Other");
 }
 
+// Blocks first: the chain reads two columns across, line by line, so its runs are four blocks of one line; the
+// same-block head's clusters are the two columns, each in the chain's order, the first line's block first.
+TEST(Order, BlocksFirstFromTheSameBlockHead) {
+  const std::vector<LineBox> boxes = {{0, 0, 90, 10}, {0, 20, 90, 30}, {110, 0, 200, 10}, {110, 20, 200, 30}};
+  Outputs o(4);
+  o.chain({0, 2, 1, 3});
+  o.pair(o.same_block, 0, 1, 6);
+  o.pair(o.same_block, 2, 3, 6);
+  o.pair(o.same_block, 0, 2, -6);
+  o.pair(o.same_block, 1, 3, -6);
+  o.pair(o.same_block, 0, 3, -6);
+  o.pair(o.same_block, 1, 2, -6);
+  const PageOrder runs = decode_order(o.view(), boxes);
+  EXPECT_EQ(runs.blocks.size(), 4u);
+  OrderRule rule;
+  rule.blocks_first = true;
+  const PageOrder p = decode_order(o.view(), boxes, rule);
+  ASSERT_EQ(p.blocks.size(), 2u);
+  EXPECT_EQ(p.blocks[0].lines, (std::vector<size_t>{0, 1}));
+  EXPECT_EQ(p.blocks[1].lines, (std::vector<size_t>{2, 3}));
+  EXPECT_EQ(p.order, (std::vector<size_t>{0, 1, 2, 3}));
+  rule.blocks_first_most = 3;  // a page of more lines: the runs
+  EXPECT_EQ(decode_order(o.view(), boxes, rule).blocks.size(), 4u);
+}
+
 // A 2 x 3 table, one cell of two lines; rows and columns numbered by place.
 TEST(Order, ATablesCells) {
   //   [0]      [1]    [2]

@@ -7,7 +7,11 @@
 // pixels, projected onto the rows of the page turned by each candidate angle;
 // the sum of the squared row counts is largest when the lines are level (their
 // ink falls in few rows, the gaps between them empty).  0.5-degree steps within
-// +-max_degrees, then 0.05-degree steps around the best.
+// +-max_degrees (5 at most), then 0.05-degree steps around the best.  Past 5 degrees
+// (max_degrees up to 45: a page photographed or scanned askew, what orientation's
+// quarter turns leave), 1-degree steps on a quarter of the points find the best wide
+// angle, which half-degree steps on all of them weigh against the narrow search's; a
+// best at the wide search's edge (its whole degrees) is no peak, and is not weighed.
 #pragma once
 
 #include <functional>

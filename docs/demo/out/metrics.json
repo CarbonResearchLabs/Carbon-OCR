@@ -1,124 +1,116 @@
 {
  "page": {
   "words_truth": 255,
-  "words_read": 264,
-  "words_right": 253,
-  "recall": 0.9922,
-  "precision": 0.9583,
+  "words_read": 261,
+  "words_right": 252,
+  "recall": 0.9882,
+  "precision": 0.9655,
   "missed": [
+   "$41.20",
    "1",
    "sooner."
   ],
   "extra": [
-   "___________________________",
    "sooner.1",
    "|",
    "|",
    "|",
-   "|",
-   "|",
+   "|$41.20",
    "•",
    "•",
    "•",
    "•"
   ],
-  "lines": 47,
-  "blocks": 18,
+  "lines": 46,
+  "blocks": 21,
   "order": "model",
   "rotation": 0,
   "skew": 0.0,
-  "confidence_mean": 0.992,
+  "confidence_mean": 0.9987,
   "ms": {
    "1": {
-    "orient": 11.5,
-    "detect": 44.1,
-    "decode": 0.6,
+    "orient": 6.7,
+    "detect": 30.2,
+    "decode": 0.2,
     "second_pass": 0.0,
-    "recognize": 97.7,
-    "total": 151.6,
-    "wall": 151.8
+    "recognize": 65.8,
+    "total": 103.8,
+    "load": 0.0,
+    "wall": 103.9
    },
    "6": {
-    "orient": 11.5,
-    "detect": 15.0,
-    "decode": 0.6,
+    "orient": 5.6,
+    "detect": 24.2,
+    "decode": 0.3,
     "second_pass": 0.0,
-    "recognize": 31.3,
-    "total": 60.3,
-    "wall": 60.5
+    "recognize": 24.1,
+    "total": 54.4,
+    "load": 0.0,
+    "wall": 54.7
    }
   }
  },
  "photo": {
   "words_truth": 255,
-  "words_read": 262,
+  "words_read": 259,
   "words_right": 253,
   "recall": 0.9922,
-  "precision": 0.9656,
+  "precision": 0.9768,
   "missed": [
    "1",
    "sooner."
   ],
   "extra": [
-   "__",
-   "___________________________________",
    "sooner.1",
-   "|",
    "|",
    "•",
    "•",
    "•",
    "•"
   ],
-  "lines": 48,
-  "blocks": 18,
+  "lines": 46,
+  "blocks": 21,
   "order": "model",
   "rotation": 180,
-  "skew": -2.45,
-  "confidence_mean": 0.9861,
+  "skew": -2.5,
+  "confidence_mean": 0.9996,
   "ms": {
    "1": {
-    "orient": 27.1,
-    "detect": 44.2,
-    "decode": 0.8,
+    "orient": 16.5,
+    "detect": 31.5,
+    "decode": 0.3,
     "second_pass": 0.0,
-    "recognize": 91.0,
-    "total": 167.8,
-    "wall": 168.3
+    "recognize": 65.3,
+    "total": 114.5,
+    "load": 0.0,
+    "wall": 114.7
    },
    "6": {
-    "orient": 26.9,
-    "detect": 15.7,
-    "decode": 0.9,
+    "orient": 14.1,
+    "detect": 12.0,
+    "decode": 0.4,
     "second_pass": 0.0,
-    "recognize": 33.1,
-    "total": 76.4,
-    "wall": 77.3
+    "recognize": 12.3,
+    "total": 39.5,
+    "load": 0.0,
+    "wall": 39.8
    }
   }
  },
  "tables": {
   "words_truth": 173,
-  "words_read": 182,
-  "words_right": 168,
-  "recall": 0.9711,
-  "precision": 0.9231,
+  "words_read": 180,
+  "words_right": 171,
+  "recall": 0.9884,
+  "precision": 0.95,
   "missed": [
-   "1,890",
-   "225",
-   "4.0",
-   "52",
-   "6,420"
+   "fixed",
+   "served"
   ],
   "extra": [
-   "1,890|",
-   "225|",
-   "4",
-   "4.0|",
-   "52|",
-   "6,420|",
-   "|",
-   "|",
+   "d",
+   "fixed|",
+   "served|",
    "|",
    "|",
    "|",
@@ -131,33 +123,35 @@
   "order": "model",
   "rotation": 0,
   "skew": 0.0,
-  "confidence_mean": 0.9878,
+  "confidence_mean": 0.9983,
   "ms": {
    "1": {
-    "orient": 10.5,
-    "detect": 38.4,
-    "decode": 0.5,
+    "orient": 7.1,
+    "detect": 30.2,
+    "decode": 0.2,
     "second_pass": 0.0,
-    "recognize": 69.2,
-    "total": 119.8,
-    "wall": 120.2
+    "recognize": 55.6,
+    "total": 94.5,
+    "load": 0.0,
+    "wall": 94.8
    },
    "6": {
-    "orient": 11.5,
-    "detect": 14.7,
-    "decode": 0.5,
+    "orient": 5.0,
+    "detect": 10.6,
+    "decode": 0.2,
     "second_pass": 0.0,
-    "recognize": 38.1,
-    "total": 67.1,
-    "wall": 67.3
+    "recognize": 13.8,
+    "total": 34.3,
+    "load": 0.0,
+    "wall": 34.5
    }
   },
   "cells": {
    "tables_truth": 2,
    "tables_read": 2,
    "cells": 73,
-   "exact": 59,
-   "right_but_rule": 13,
+   "exact": 62,
+   "right_but_rule": 10,
    "rows_truth": [
     8,
     5
@@ -169,59 +163,45 @@
    "wrong": [
     [
      1,
+     0,
      1,
-     1,
-     "6,420",
-     "6,420|"
+     "Homes served",
+     "Homes served| d"
     ],
     [
      1,
+     0,
      2,
+     "Leaks fixed",
+     "Leaks fixed|"
+    ],
+    [
+     1,
+     0,
      3,
-     "4.0",
-     "4.0|"
+     "Hours without water",
+     "Hours without water |"
+    ],
+    [
+     1,
+     1,
+     1,
+     "6,420",
+     "6,420 |"
     ],
     [
      1,
      3,
      1,
      "5,980",
-     "5,980 |"
-    ],
-    [
-     1,
-     4,
-     2,
-     "52",
-     "52|"
-    ],
-    [
-     1,
-     6,
-     1,
-     "1,890",
-     "1,890|"
+     "5,980 "
     ],
     [
      1,
      6,
      2,
      "14",
-     "14 4 |"
-    ],
-    [
-     1,
-     6,
-     3,
-     "1.5",
-     "1.5 |"
-    ],
-    [
-     1,
-     6,
-     5,
-     "+0.0%",
-     "+0.0% "
+     "14 |"
     ],
     [
      1,
@@ -229,6 +209,13 @@
      1,
      "29,470",
      "29,470 |"
+    ],
+    [
+     1,
+     7,
+     4,
+     "99.9%",
+     "99.9% "
     ],
     [
      2,
@@ -239,31 +226,17 @@
     ],
     [
      2,
+     1,
+     4,
+     "1,716",
+     "1,716 |"
+    ],
+    [
+     2,
      2,
      3,
      "71",
-     "71 |"
-    ],
-    [
-     2,
-     3,
-     3,
-     "58",
-     "58 |"
-    ],
-    [
-     2,
-     4,
-     1,
-     "3,745",
-     "3,745 |"
-    ],
-    [
-     2,
-     4,
-     3,
-     "225",
-     "225|"
+     "71 "
     ]
    ]
   }

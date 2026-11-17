@@ -21,10 +21,10 @@ The goal is to be far more accurate than Tesseract and faster than every open en
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/glance-dark.svg">
-  <img src="docs/assets/glance-light.svg" alt="Designed: 2.83 M parameters in fullerene-3M; 10.8 GMAC per Latin page; OmniParseBench headline 44.5 against Tesseract's 5.9. Measured: rec-latin at 62 GMAC/s on one CPU core and 12.8 TMAC/s in FP16 on a laptop RTX 4060; 249 tests, 233 of them in CI" width="100%">
+  <img src="docs/assets/glance-light.svg" alt="Designed: 2.83 M parameters in fullerene-3M; 10.8 GMAC per Latin page; OmniParseBench headline 52.3 against Tesseract's 5.9. Measured: rec-latin at 62 GMAC/s on one CPU core and 12.8 TMAC/s in FP16 on a laptop RTX 4060; 278 tests, 262 of them in CI" width="100%">
 </picture>
 
-The top row is the design budget, counted from the models' layer shapes. The bottom row is measured on random weights, since speed does not depend on the weights (see Measured so far, below).
+The top row is the Latin set: its parameters and its compute for a page, counted from the models' layer shapes, and its score on OmniParseBench. The bottom row is the kernels' speed, measured on random weights since speed does not depend on them, and the tests (Measured so far, below).
 
 ## <img src="docs/assets/chip-02.svg" height="22" alt=""> How it works
 
@@ -33,10 +33,10 @@ The top row is the design budget, counted from the models' layer shapes. The bot
   <img src="docs/assets/pipeline-light.svg" alt="The Carbon-OCR pipeline: input, detect, recognize, order, output; on CPU one worker per core, on GPU many pages in flight" width="100%">
 </picture>
 
-- **Input.** Pages come in as images (PNG, JPEG, BMP, PNM) or PDFs. PDFium renders a PDF in helper processes, so a PDF that crashes it takes down a helper, not your program. When a born-digital page's text layer passes the checks, the page is read from that layer and only its pictures go through OCR.
-- **Orient and deskew.** A small model turns a page by quarter turns when it is sure. A projection search levels what remains, up to 5 degrees.
+- **Input.** Pages come in as images (PNG, JPEG, BMP, PNM) or PDFs. PDFium renders a PDF in helper processes, so a PDF that crashes it takes down a helper, not your program. When a born-digital page's text layer passes the checks, the page is read from that layer, its words set in the lines the detector finds, and only its pictures go through OCR.
+- **Orient and deskew.** A small model turns a page by quarter turns when it is sure. A projection search levels what remains, up to 45 degrees, so a page photographed askew reads too.
 - **Detect and recognize.** A small line detector, then CTC recognizers per script, read every line of every page in flight in a few batched calls. A page of tiny text is detected again at twice the scale and the two passes merged line by line. On the GPU, the recognizer's last layer runs fused with greedy CTC decoding, so the logits never leave the chip: only ids, confidences and frame positions come back. The lines it is unsure of can be read again by a CTC prefix beam (`--beam 8`, off by default), which a language model plugs into.
-- **Order and output.** A reading-order and layout model orders the lines, groups them into labeled blocks and finds tables' cells. Where it is unsure, an XY-cut does the ordering. The result goes out as text, markdown, HTML, JSON, hOCR, ALTO, PAGE XML or a searchable PDF.
+- **Order and output.** A reading-order and layout model orders the lines and groups them into labeled blocks. Where it is unsure, an XY-cut does the ordering. In the blocks it marks as tables, the engine builds the grid from the lines' rows and columns: a table cut in two joined again, a cell set on two lines kept as one, row labels spanning their rows. The result goes out as text, markdown, HTML, JSON, hOCR, ALTO, PAGE XML or a searchable PDF.
 
 On the CPU, a pinned worker per physical core reads pages in parallel, from a list or a stream (`submit` and `next`) that keeps every core busy. Work is cut smaller than a page, so a single page also uses every core. The int8 kernels are picked at run time for the CPU: AVX2, AVX-VNNI, AVX-512, NEON or the Arm dot product. On the GPU, `carbon::Pipeline` batches each model across all the pages in flight. `carbon-ocr serve` keeps a set loaded and reads pages sent over HTTP/1.1, with every client's pages sharing the CPU's workers or the GPU's batches. [docs/ENGINE.md](docs/ENGINE.md) covers the engine in full.
 
@@ -48,16 +48,16 @@ Fullerene is eight small networks, shipped in two sets named by their parameter 
 - **`fullerene-3M`**, the Latin set, 2.83 M parameters: `orient`, `det`, `script`, `rec-latin` and `order`.
 - **`fullerene-10M`**, every script, 10.30 M parameters: the Latin set plus `rec-rtl`, `rec-indic` and `rec-cjk`.
 
-| model | job | in → out | parameters | cost |
-|---|---|---|---|---|
-| `orient` | page orientation | a 512 × 512 thumbnail → 12 angle bins and a vertical flag | 0.34 M | 255 MMAC a page |
-| `det` | line detection | the page at 1024 × 800 → four maps at stride 2 | 0.44 M | 2.09 GMAC a page |
-| `script` | script group of a line | a 32 × 512 crop → 6 groups | 0.06 M | 3.7 MMAC a line |
-| `rec-latin` | read Latin, Cyrillic and Greek | a 32 × W crop → 800 classes per 4 px | 1.51 M | 208 MMAC a 512-px line |
-| `rec-rtl` | read Arabic script and Hebrew | a 32 × W crop → 400 classes per 4 px | 1.41 M | 195 MMAC a line |
-| `rec-indic` | read Indic and Southeast Asian scripts | a 32 × W crop → 1,500 classes per 4 px | 1.69 M | 231 MMAC a line |
-| `rec-cjk` | read Chinese, Japanese and Korean | a 32 × W crop → 12,000 classes per 4 px | 4.37 M | 565 MMAC a line |
-| `order` | reading order, block labels, tables | 16 features per line → an order, 13 labels, table cells | 0.48 M | 22 MMAC a 40-line page |
+| model | job | parameters | cost |
+|---|---|---|---|
+| `orient` | page orientation: 12 angle bins and a vertical flag | 0.34 M | 255 MMAC a page |
+| `det` | line detection | 0.44 M | 2.09 GMAC a page |
+| `script` | the script group of a line | 0.06 M | 3.7 MMAC a line |
+| `rec-latin` | reads Latin, Cyrillic and Greek | 1.51 M | 208 MMAC a 512-px line |
+| `rec-rtl` | reads Arabic script and Hebrew | 1.41 M | 195 MMAC a line |
+| `rec-indic` | reads Indic and Southeast Asian scripts | 1.69 M | 231 MMAC a line |
+| `rec-cjk` | reads Chinese, Japanese and Korean | 4.37 M | 565 MMAC a line |
+| `order` | reading order, block labels, tables | 0.48 M | 22 MMAC a 40-line page |
 
 All the models use ReLU and channels in multiples of 16. Their RepVGG blocks are folded into plain 3×3 convolutions in the shipped files. Each model ships as ONNX in FP32, FP16 and INT8 (Q/DQ), and the engine runs each precision on the CPU and, through TensorRT, on the GPU (`--precision`); the GPU's INT8 is a symmetric file of its own. The recognizers read a 32-px band of the line and give a CTC frame per 4 px of width.
 
@@ -70,13 +70,30 @@ A Latin page is 10.8 GMAC, and 77% of that is recognition. That is why the recog
 
 ## <img src="docs/assets/chip-04.svg" height="22" alt=""> Measured so far
 
-The trained `fullerene-3M` ([on Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M)), read by the engine on all 2,937 pages of OmniParseBench and graded by the benchmark's own grader, against Tesseract 5.5 with its defaults, on the same laptop (5 November 2026): a headline of **44.5** against 5.9 (text 27.3 against 17.8; tables 23.8 and layout 82.5, which Tesseract, writing text alone, scores 0), and **4.06 pages a second on one core** against 0.76 (a median page of 208 ms against 976), 13.6 against 3.2 in six processes (timed on 3 November). One process of 10 workers with 20 pages in flight reads **15.0 pages a second** over the whole set; one page at a time on 6 workers, the median page takes 79 ms. Its FP16 files on the CPU score 44.6. Served over HTTP (`carbon-ocr serve`, 4 November), 48 of the pages sent by 16 to 32 clients at once came back at 18.5 pages a second, the images' decoding included; `ocr` reads the same pages at 19.0, its count without the decoding. On the laptop's RTX 4060 (`carbon-ocr serve --device cuda`, its FP16 files on TensorRT, 32 pages in flight), all 2,937 pages run at **95.2 pages a second** with a headline of 44.4, every page read. Read as users read them, through `carbon-ocr ocr` (a PDF page from its text layer where the layer passes its checks, by OCR otherwise), the same pages score **49.9**, and olmOCR-Bench's PDFs 46.2.
+The trained `fullerene-3M` ([on Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M)) against Tesseract 5.5 with its defaults, on every page of three benchmarks, each graded by its own grader (17 November 2026). The engine's rules were tuned on OmniParseBench. olmOCR-Bench and OmniDocBench were held out, only graded, to check that what helps one benchmark holds on pages it was not tuned on.
 
-**OmniDocBench and olmOCR-Bench** (5 November), each graded by its own grader against Tesseract 5.5, both engines reading the pages as images. On olmOCR-Bench's 1,403 PDFs `fullerene-3M` scores **45.1 ± 0.9** to Tesseract's 34.2: ahead on tables (41.0 to 0.5), on leaving out running headers and footers (75.1 to 40.1), on multi-column pages (68.6 to 52.3) and on long pages of tiny text (60.9 to 60.6); Tesseract reads more of old scans (20.7 to 15.6), and neither writes LaTeX (0 on its math). On OmniDocBench v1.6's 755 English pages Tesseract reads text better, an edit distance of **0.129 to 0.163**, and orders it a little better (0.253 to 0.268); `fullerene-3M` reads their tables (29.2 TEDS to none) and the text of their slides (0.078 to 0.086). It loses most on newspapers (0.297 to 0.097) and on old print, which it finds and misreads.
+| benchmark | `fullerene-3M` | Tesseract 5.5 |
+|---|---|---|
+| OmniParseBench, 2,937 page images: headline | **52.3** | 5.9 |
+| OmniParseBench: text, tables, layout | 27.3, 47.9, 81.7 | 17.8, 0, 0 |
+| OmniParseBench, read as PDFs | **58.6** | not run |
+| olmOCR-Bench, 1,403 PDFs read as images | **45.8** ± 0.9 | 34.2 |
+| olmOCR-Bench, read as PDFs | **47.5** ± 0.9 | not run |
+| OmniDocBench v1.6, 755 English pages: tables (TEDS) | **49.2** | none |
+| OmniDocBench: text (edit distance, lower is better) | 0.171 | **0.129** |
+| OmniDocBench: reading order (edit distance, lower is better) | 0.293 | **0.253** |
+
+Read as PDFs means through `carbon-ocr ocr`, as you would run it: each page from its text layer where the layer passes its checks, its words set in the lines the detector finds, and by OCR otherwise. Setting the words in the detector's lines costs the text pages about 10% of their speed (`--layer-lines layer` skips it). Tesseract writes text alone, so it scores 0 on tables and layout. Where `fullerene-3M` loses: Tesseract reads OmniDocBench's text better and orders it a little better, most of all on newspapers (an edit distance of 0.097 against 0.305). Tesseract also reads more of olmOCR-Bench's old scans (20.7 to 16.0), and neither writes LaTeX (0 on the math tests). [docs/ENGINE.md](docs/ENGINE.md) has each benchmark's breakdown.
+
+**Speed**, on a laptop (Intel Core i7-13620H, RTX 4060 Laptop GPU), 3 to 5 November:
+- **4.06 pages a second on one core** against Tesseract's 0.76 (a median page of 208 ms against 976), and 13.6 against 3.2 in six processes.
+- **15.0 pages a second** in one process of 10 workers with 20 pages in flight; one page at a time on 6 workers, a median page of 79 ms.
+- 18.5 pages a second served over HTTP (`carbon-ocr serve`, 16 to 32 clients at once), the images' decoding included.
+- **95.2 pages a second on the GPU** (`--device cuda`, the FP16 files on TensorRT, 32 pages in flight), every page read, scoring within 0.1 of the CPU.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/fig-bench-dark.svg">
-  <img src="docs/assets/fig-bench-light.svg" alt="OmniParseBench, all 2,937 pages: fullerene-3M scores a headline of 44.5 against Tesseract 5.5's 5.9; text 27.3 against 17.8, tables 23.8 and layout 82.5 against 0." width="100%">
+  <img src="docs/assets/fig-bench-light.svg" alt="OmniParseBench, all 2,937 pages: fullerene-3M scores a headline of 52.3 against Tesseract 5.5's 5.9; text 27.3 against 17.8, tables 47.9 and layout 81.7 against 0." width="100%">
 </picture>
 
 <picture>
@@ -84,14 +101,14 @@ The trained `fullerene-3M` ([on Hugging Face](https://huggingface.co/CarbonResea
   <img src="docs/assets/fig-bench-speed-light.svg" alt="Pages a second: 4.06 against Tesseract's 0.76 on one core, 13.54 against 2.97 in six processes." width="100%">
 </picture>
 
-**Pages, read** (3 November): `fullerene-3M` on three invented pages, a report page, a page of two tables and a rough photo of the first, every picture drawn from the engine's own output. On the report page it found every line, read 253 of 255 words right, ordered 18 blocks and wrote HTML, in 152 ms on one core; it turned the photo 180° and levelled it; it put all 73 table cells in their row and column. Every fault found is listed with where it comes from ([docs/DEMO.md](docs/DEMO.md), [PDF](docs/Carbon-OCR-Demo.pdf), [dark](docs/Carbon-OCR-Demo-Dark.pdf); the scripts in [docs/demo/](docs/demo/)).
+**Pages, read** (17 November): `fullerene-3M` on three invented pages, a report page, a page of two tables and a rough photo of the first, every picture drawn from the engine's own output. On the report page it found every line, read 252 of 255 words right, put 21 blocks in the page's own reading order and wrote HTML, in 104 ms on one core; it turned the photo 180° and levelled it; it put all 73 table cells in their row and column, 62 of them character for character. Every fault found is listed with where it comes from ([docs/DEMO.md](docs/DEMO.md), [PDF](docs/Carbon-OCR-Demo.pdf), [dark](docs/Carbon-OCR-Demo-Dark.pdf); the scripts in [docs/demo/](docs/demo/)).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/demo-read-dark.png">
   <img src="docs/assets/demo-read-light.png" alt="The report page with every line boxed in its block's colour and every block numbered in reading order, beside the HTML the engine wrote for it." width="100%">
 </picture>
 
-The rows below were measured on the same laptop (and its RTX 4060 Laptop GPU) between 27 and 30 October 2026, using random weights, since speed does not depend on them.
+The kernels, measured on the laptop and its RTX 4060 Laptop GPU between 27 and 30 October 2026, on random weights, since speed does not depend on them:
 
 | what | measured |
 |---|---|
@@ -108,15 +125,18 @@ The rows below were measured on the same laptop (and its RTX 4060 Laptop GPU) be
 You need CMake 3.25 or newer (for the presets) and a C++20 compiler: MSVC 2022, GCC 11+ or Clang 14+. CMake downloads the pinned dependencies (ONNX Runtime 1.31.0, PDFium, libdeflate, stb_image and GoogleTest 1.18.0) and checks their SHA-256.
 
 ```shell
-cmake --preset ninja-release        # Linux, macOS, or a Visual Studio developer shell
+# Linux, macOS, or a Visual Studio developer shell
+cmake --preset ninja-release
 cmake --build --preset ninja-release
 ctest --preset ninja-release
 
-cmake --preset vs2022               # Windows, Visual Studio 2022
+# Windows, Visual Studio 2022
+cmake --preset vs2022
 cmake --build --preset vs2022
 ctest --preset vs2022
 
-pip install ./python                # the Python module, carbon_ocr
+# the Python module, carbon_ocr
+pip install ./python
 ```
 
 For the GPU you need CUDA 12.9 or 13.x and an unpacked TensorRT 11 with `TensorRT_ROOT` set to it; then use the `ninja-trt` or `vs2022-trt` preset. [docs/BUILD.md](docs/BUILD.md) covers every preset and option, the GPU build and the Python module.
@@ -124,17 +144,30 @@ For the GPU you need CUDA 12.9 or 13.x and an unpacked TensorRT 11 with `TensorR
 ## <img src="docs/assets/chip-06.svg" height="22" alt=""> Use
 
 ```shell
-carbon-ocr ocr page.png scan.jpg --set models/fullerene-3M          # plain text
-carbon-ocr ocr report.pdf --set models/fullerene-3M --dpi 300       # PDFs and their text layers
-carbon-ocr ocr report.pdf --set models/fullerene-3M --dpi auto      # each page at the dpi its print needs
-carbon-ocr ocr page.png --set models/fullerene-3M --format json     # boxes, words, confidences
-carbon-ocr ocr scan.png --set models/fullerene-3M --format hocr     # or alto, page, markdown, html
+# plain text
+carbon-ocr ocr page.png scan.jpg --set models/fullerene-3M
+
+# PDFs, from their text layers where they pass; at 300 dpi, or at the dpi each page needs
+carbon-ocr ocr report.pdf --set models/fullerene-3M --dpi 300
+carbon-ocr ocr report.pdf --set models/fullerene-3M --dpi auto
+
+# boxes, words and confidences; or hocr, alto, page, markdown, html
+carbon-ocr ocr page.png --set models/fullerene-3M --format json
+carbon-ocr ocr scan.png --set models/fullerene-3M --format hocr
+
+# a searchable PDF
 carbon-ocr ocr scan.pdf --set models/fullerene-3M --format pdf --output searchable.pdf
+
+# on the GPU: FP16 by default, or another precision
 carbon-ocr ocr scans/*.png --set models/fullerene-3M --device cuda --engine-cache .engines
-carbon-ocr ocr scans/*.png --set models/fullerene-3M --device cuda --precision fp32  # FP16 by default
-carbon-ocr serve --set models/fullerene-3M                          # HTTP on 127.0.0.1:8080
+carbon-ocr ocr scans/*.png --set models/fullerene-3M --device cuda --precision fp32
+
+# an HTTP server on 127.0.0.1:8080, and a page sent to it
+carbon-ocr serve --set models/fullerene-3M
 curl --data-binary @page.png "http://127.0.0.1:8080/ocr?format=text"
-carbon-ocr cpus --gemm                                              # the CPU's kernels, timed
+
+# the CPU's kernels, timed
+carbon-ocr cpus --gemm
 ```
 
 `serve` keeps the models loaded and answers each page sent to `POST /ocr` in any of `ocr`'s formats (JSON by default), with every client's pages sharing the CPU's workers or, with `--device cuda`, the GPU's batches.

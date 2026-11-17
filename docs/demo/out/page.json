@@ -6,535 +6,524 @@
  "lines": [
   {
    "box": [
-    128.41219189495564,
-    107.15591832995415,
-    400.285658926789,
-    139.3905371427536
+    128.45380853009132,
+    107.39012509584427,
+    400.2440422916532,
+    139.34739530086517
    ],
    "text": "Harbor Valley Water District",
-   "confidence": 0.999570369720459,
-   "det_score": 0.8884614706039429
+   "confidence": 0.9997877478599548,
+   "det_score": 0.9679896235466003
   },
   {
    "box": [
-    1374.9801530126676,
-    107.30259567499161,
-    1573.6924133590137,
-    139.240163564682
+    1375.4036586293678,
+    109.90589112043381,
+    1573.2689077423133,
+    139.02106136083603
    ],
    "text": "Annual Report 2026",
-   "confidence": 0.9996620416641235,
-   "det_score": 0.8771368861198425
+   "confidence": 0.9999569058418274,
+   "det_score": 0.9895241856575012
   },
   {
    "box": [
-    125.75680724287454,
-    199.09512549638748,
-    1064.8879462337372,
-    277.6720404624939
+    125.69723474090227,
+    198.9202469587326,
+    1064.9475187357095,
+    277.8941750526428
    ],
    "text": "Clean Water for a Growing Valley",
-   "confidence": 0.9998353719711304,
-   "det_score": 0.9742393493652344
+   "confidence": 0.9999474883079529,
+   "det_score": 0.9748938083648682
   },
   {
    "box": [
-    126.31249916086304,
-    274.0320459008217,
-    802.1325071602494,
-    320.2597916126251
+    126.66672201433916,
+    274.77053850889206,
+    733.004580134839,
+    318.63761246204376
    ],
    "text": "A year of new pipes, cleaner rivers and lower bills",
-   "confidence": 0.999217689037323,
-   "det_score": 0.9455167651176453
+   "confidence": 0.9996829032897949,
+   "det_score": 0.9326947927474976
   },
   {
    "box": [
-    131.10831471671045,
-    372.5351810455322,
-    500.7500923629355,
-    415.4476761817932
+    130.88998632997686,
+    369.744074344635,
+    500.96842074966906,
+    414.111590385437
    ],
    "text": "A record year for repairs",
-   "confidence": 0.9999545812606812,
-   "det_score": 0.9161221981048584
+   "confidence": 0.9999845027923584,
+   "det_score": 0.9105391502380371
   },
   {
    "box": [
-    127.66945898005392,
-    426.28368735313416,
-    813.6706168732961,
-    463.4681522846222
+    127.84617196142146,
+    425.6614416837692,
+    813.4939038919287,
+    461.66822612285614
    ],
-   "text": "This year the district replaced more old pipe than in any",
-   "confidence": 0.9999415278434753,
-   "det_score": 0.9891666173934937
+   "text": "This year the district replaced more old pipe than in any year",
+   "confidence": 0.9999762773513794,
+   "det_score": 0.9810035824775696
   },
   {
    "box": [
-    127.79334597581557,
-    465.65048694610596,
-    817.8450863882804,
-    502.0093232393265
+    127.98764958243002,
+    465.17333686351776,
+    817.650782781666,
+    500.2372622489929
    ],
-   "text": "year since it was founded. Crews worked through the",
-   "confidence": 0.9999437928199768,
-   "det_score": 0.9869754314422607
+   "text": "since it was founded. Crews worked through the spring floods",
+   "confidence": 0.9999467730522156,
+   "det_score": 0.9831233620643616
   },
   {
    "box": [
-    127.8723119453594,
-    504.9917161464691,
-    817.7661204187366,
-    540.824294090271
+    127.78622806901123,
+    503.50912511348724,
+    817.8522042950848,
+    539.9153977632523
    ],
-   "text": "spring floods and the dry summer to keep water flowing",
-   "confidence": 0.999875009059906,
-   "det_score": 0.9824112057685852
+   "text": "and the dry summer to keep water flowing to every home on",
+   "confidence": 0.999667227268219,
+   "det_score": 0.9849936366081238
   },
   {
    "box": [
-    127.89325738224458,
-    543.6719179153442,
-    628.6174885090322,
-    579.3649077415466
+    128.1235145347007,
+    543.4665352106094,
+    391.97762326555215,
+    577.6250064373016
    ],
-   "text": "to every home on the east side of the river.",
-   "confidence": 0.9998965263366699,
-   "det_score": 0.9815095067024231
+   "text": "the east side of the river.",
+   "confidence": 0.9999716281890869,
+   "det_score": 0.9839828610420227
   },
   {
    "box": [
-    127.9442387133573,
-    602.3698687553406,
-    817.6941936507387,
-    637.7231001853943
+    127.60073945133483,
+    599.9304533004761,
+    818.0376929127611,
+    637.5728905200958
    ],
-   "text": "Leaks fell by a third across the network. The money saved",
-   "confidence": 0.9997555613517761,
-   "det_score": 0.9862419962882996
+   "text": "Leaks fell by a third across the network. The money saved on",
+   "confidence": 0.9999499320983887,
+   "det_score": 0.9028241038322449
   },
   {
    "box": [
-    127.85286190838337,
-    641.0283029079437,
-    817.7855704557127,
-    676.9905030727386
+    127.5206568509378,
+    638.023453950882,
+    818.1177755131582,
+    676.1995911598206
    ],
-   "text": "on lost water went back into repairs, and the district kept",
-   "confidence": 0.9997366666793823,
-   "det_score": 0.9896371960639954
+   "text": "lost water went back into repairs, and the district kept its rates",
+   "confidence": 0.9998390078544617,
+   "det_score": 0.8838568925857544
   },
   {
    "box": [
-    127.93647640725001,
-    680.2345991134644,
-    611.3808434410433,
-    715.6395614147186
+    127.67617844148772,
+    677.5348246097565,
+    474.093733062937,
+    714.6745085716248
    ],
-   "text": "its rates flat for the second year in a row.",
-   "confidence": 0.9999474287033081,
-   "det_score": 0.9880397319793701
+   "text": "flat for the second year in a row.",
+   "confidence": 0.9999526143074036,
+   "det_score": 0.8845202922821045
   },
   {
    "box": [
-    127.06527806413459,
-    738.4008169174194,
-    388.73750322537234,
-    779.6117663383484
+    126.66923320398921,
+    735.381281375885,
+    389.13354808551776,
+    779.2316198348999
    ],
    "text": "What we finished",
-   "confidence": 0.9998971819877625,
-   "det_score": 0.9785372614860535
+   "confidence": 0.9999390840530396,
+   "det_score": 0.9219798445701599
   },
   {
    "box": [
-    136.4147085004148,
-    791.6276216506958,
-    800.6270108421894,
-    827.8221845626831
+    136.0443805834436,
+    788.5050177574158,
+    753.7154171409559,
+    827.1675825119019
    ],
    "text": "\u2022 Twelve miles of new main under Mill Road and Cedar",
-   "confidence": 0.999327540397644,
-   "det_score": 0.9872384667396545
+   "confidence": 0.9985975027084351,
+   "det_score": 0.8895785212516785
   },
   {
    "box": [
-    166.2569353221792,
-    830.4401993751526,
-    259.28035924166403,
-    868.2759881019592
+    166.4035828948473,
+    829.656171798706,
+    250.53699864750413,
+    866.5146470069885
    ],
    "text": "Avenue.",
-   "confidence": 0.999747097492218,
-   "det_score": 0.9708787202835083
+   "confidence": 0.9999184608459473,
+   "det_score": 0.9838189482688904
   },
   {
    "box": [
-    140.12178191945767,
-    874.0010678768158,
-    616.3889639718192,
-    914.1361594200134
+    139.81146676199774,
+    872.2943425178528,
+    569.4173575110742,
+    914.4974887371063
    ],
    "text": "\u2022 A second pump at the north reservoir.",
-   "confidence": 0.9996318221092224,
-   "det_score": 0.9352499842643738
+   "confidence": 0.992010235786438,
+   "det_score": 0.9207526445388794
   },
   {
    "box": [
-    140.14990921116961,
-    919.0084338188171,
-    633.5542627230908,
-    958.9560747146606
+    139.9373951753985,
+    916.7643368244171,
+    586.484855140657,
+    958.1282496452332
    ],
    "text": "\u2022 Smart meters for four thousand homes.",
-   "confidence": 0.9994964599609375,
-   "det_score": 0.9824565052986145
+   "confidence": 0.9997262954711914,
+   "det_score": 0.9017345905303955
   },
   {
    "box": [
-    135.62942678497353,
-    963.596510887146,
-    689.6550232782375,
-    1005.0244808197021
+    140.07619189854367,
+    963.7840926647186,
+    650.8214060787003,
+    1004.2230129241943
    ],
    "text": "\u2022 A new lab for testing river water every week.",
-   "confidence": 0.9988550543785095,
-   "det_score": 0.9246249794960022
+   "confidence": 0.999629557132721,
+   "det_score": 0.920387327671051
   },
   {
    "box": [
-    126.64782537371107,
-    1023.2090294361115,
-    328.97796476535336,
-    1067.2020375728607
+    126.63026426293605,
+    1022.8935301303864,
+    328.9955258761284,
+    1067.003571987152
    ],
    "text": "Water quality",
-   "confidence": 0.9999684691429138,
-   "det_score": 0.9512457847595215
+   "confidence": 0.9999932050704956,
+   "det_score": 0.939586341381073
   },
   {
    "box": [
-    127.6274795628679,
-    1078.4916937351227,
-    818.0109528012281,
-    1115.955924987793
+    127.3707528482044,
+    1075.559425354004,
+    813.9693230051457,
+    1114.7345781326294
    ],
-   "text": "Every sample taken this year met the state standard. The",
-   "confidence": 0.9999474883079529,
-   "det_score": 0.9873634576797485
+   "text": "Every sample taken this year met the state standard. The new",
+   "confidence": 0.9999675750732422,
+   "det_score": 0.9149395823478699
   },
   {
    "box": [
-    127.73972309946863,
-    1117.7876830101013,
-    817.8987092646274,
-    1154.503881931305
+    127.44859234873775,
+    1115.2809977531433,
+    818.1898400153582,
+    1153.9373993873596
    ],
-   "text": "new lab now tests the river each week instead of each",
-   "confidence": 0.999910831451416,
-   "det_score": 0.9881733655929565
+   "text": "lab now tests the river each week instead of each month, so",
+   "confidence": 0.9999372363090515,
+   "det_score": 0.8986193537712097
   },
   {
    "box": [
-    127.66042755165533,
-    1161.1523151397705,
-    650.3421008933509,
-    1198.3969688415527
+    127.41197472727856,
+    1158.299446105957,
+    487.25300630938386,
+    1197.1998810768127
    ],
-   "text": "month, so problems are found days sooner.1",
-   "confidence": 0.9996597766876221,
-   "det_score": 0.9885748624801636
+   "text": "problems are found days sooner.1",
+   "confidence": 0.9991793036460876,
+   "det_score": 0.9504485130310059
   },
   {
    "box": [
-    885.5317118918398,
-    898.9267587661743,
-    1534.443003658097,
-    927.1042823791504
-   ],
-   "text": "Figure 1. The north reservoir after the new pump was installed.",
-   "confidence": 0.9980620741844177,
-   "det_score": 0.9568647742271423
-  },
-  {
-   "box": [
-    883.796870910413,
-    947.3511815071106,
-    1110.6405500756805,
-    987.0903253555298
-   ],
-   "text": "Looking ahead",
-   "confidence": 0.99997478723526,
-   "det_score": 0.9385093450546265
-  },
-  {
-   "box": [
-    884.33540180269,
-    999.7155427932739,
-    1574.3245223439596,
-    1035.865718126297
-   ],
-   "text": "Next year the district will finish the west side mains and",
-   "confidence": 0.9998475313186646,
-   "det_score": 0.9038447141647339
-  },
-  {
-   "box": [
-    884.2216530280227,
-    1038.638335466385,
-    1570.139914607881,
-    1075.5465745925903
-   ],
-   "text": "open the river trail beside the treatment plant. Residents",
-   "confidence": 0.9998540282249451,
-   "det_score": 0.8966184854507446
-  },
-  {
-   "box": [
-    884.1687729325517,
-    1076.6611814498901,
-    1398.2585342735165,
-    1113.92183303833
-   ],
-   "text": "can follow the work on the district website.",
-   "confidence": 0.9999226331710815,
-   "det_score": 0.893646240234375
-  },
-  {
-   "box": [
-    893.1618849878516,
-    1110.9248518943787,
-    1526.812830562085,
-    1145.5437541007996
-   ],
-   "text": "___________________________",
-   "confidence": 0.6861245632171631,
-   "det_score": 0.8131137490272522
-  },
-  {
-   "box": [
-    884.6823247434517,
-    1148.3352541923523,
-    1556.7841733602145,
-    1182.1734070777893
-   ],
-   "text": "1 Results for every sample are posted on the first Monday of each month.",
-   "confidence": 0.9977967739105225,
-   "det_score": 0.9299505352973938
-  },
-  {
-   "box": [
-    1499.6951043168754,
-    2091.0369515419006,
-    1573.6298008664367,
-    2122.557246685028
-   ],
-   "text": "Page 3",
-   "confidence": 0.9990582466125488,
-   "det_score": 0.8799831867218018
-  },
-  {
-   "box": [
-    128.76788924225664,
-    2092.167294025421,
-    391.33324855799617,
-    2122.0314145088196
-   ],
-   "text": "harborvalleywater.example",
-   "confidence": 0.9995879530906677,
-   "det_score": 0.8996245265007019
-  },
-  {
-   "box": [
-    888.8971257842747,
-    358.718940615654,
-    1002.3797389439173,
-    393.11393797397614
+    889.0675767785227,
+    357.9050153493881,
+    1002.2092879496693,
+    391.16406440734863
    ],
    "text": "| Measure",
-   "confidence": 0.9601631164550781,
-   "det_score": 0.9638411402702332
+   "confidence": 0.9932878017425537,
+   "det_score": 0.9341744780540466
   },
   {
    "box": [
-    1279.9423639270958,
-    357.78168737888336,
-    1342.0551076278975,
-    392.8778052330017
+    1279.692332078473,
+    355.3891509771347,
+    1342.3051394765203,
+    392.15157330036163
    ],
    "text": "2025",
-   "confidence": 0.999994158744812,
-   "det_score": 0.9835217595100403
+   "confidence": 0.9999909400939941,
+   "det_score": 0.8654789328575134
   },
   {
    "box": [
-    1434.7447900977056,
-    358.1715703010559,
-    1492.4359937202462,
-    392.8572177886963
+    1430.2204363566132,
+    355.2429735660553,
+    1492.6619909505928,
+    391.43474996089935
    ],
    "text": "2026",
-   "confidence": 0.9999836683273315,
-   "det_score": 0.9878069162368774
+   "confidence": 0.9999650716781616,
+   "det_score": 0.8601551055908203
   },
   {
    "box": [
-    889.169682094029,
-    407.3030471801758,
-    1143.9529474887777,
-    439.88162875175476
+    893.6978677973885,
+    406.92827701568604,
+    1143.7231182961636,
+    437.9751920700073
    ],
-   "text": "| Miles of pipe replaced",
-   "confidence": 0.9994264245033264,
-   "det_score": 0.9764305949211121
+   "text": "Miles of pipe replaced",
+   "confidence": 0.999980628490448,
+   "det_score": 0.9428829550743103
   },
   {
    "box": [
-    1284.8421712651113,
-    408.3481550216675,
-    1319.9618742468986,
-    439.4359827041626
+    1289.2533074920307,
+    407.55052268505096,
+    1319.849094530725,
+    437.8867447376251
    ],
    "text": "7.5",
-   "confidence": 0.9999600648880005,
-   "det_score": 0.9220630526542664
+   "confidence": 0.9998554587364197,
+   "det_score": 0.9194604158401489
   },
   {
    "box": [
-    1435.485416417176,
-    408.7694764137268,
-    1487.3970108900298,
-    438.5193169116974
+    1435.4878562801857,
+    407.6340854167938,
+    1487.3945710270202,
+    437.3676657676697
    ],
    "text": "12.0",
-   "confidence": 0.9995738863945007,
-   "det_score": 0.9366230368614197
+   "confidence": 0.9999365210533142,
+   "det_score": 0.8515537977218628
   },
   {
    "box": [
-    889.1764999370357,
-    454.54424917697906,
-    1066.5757124523448,
-    487.07739412784576
+    893.56195857341,
+    453.4936994314194,
+    1066.4886103267163,
+    485.44636368751526
    ],
    "text": "| Leaks reported",
-   "confidence": 0.999652624130249,
-   "det_score": 0.9680386185646057
+   "confidence": 0.9905062913894653,
+   "det_score": 0.894564151763916
   },
   {
    "box": [
-    1280.5315810057668,
-    455.2272081375122,
-    1328.5708210169892,
-    486.39656603336334
+    1284.9830438394463,
+    454.7343224287033,
+    1328.4177146940556,
+    484.8833233118057
    ],
    "text": "318",
-   "confidence": 0.9999136924743652,
-   "det_score": 0.9420417547225952
+   "confidence": 0.9999540448188782,
+   "det_score": 0.9213055968284607
   },
   {
    "box": [
-    1431.1426209499198,
-    455.84948658943176,
-    1474.5463803143025,
-    485.8954846858978
+    1431.3780087014065,
+    454.49235439300537,
+    1474.310992562816,
+    482.96964168548584
    ],
    "text": "211",
-   "confidence": 0.9999518990516663,
-   "det_score": 0.9219121336936951
+   "confidence": 0.9999985694885254,
+   "det_score": 0.9762294292449951
   },
   {
    "box": [
-    893.4371172763905,
-    501.0710209608078,
-    1075.2101646452275,
-    533.8556736707687
+    893.545966648724,
+    500.432088971138,
+    1075.1013152728942,
+    532.4913293123245
    ],
    "text": "Samples tested",
-   "confidence": 0.9999448657035828,
-   "det_score": 0.978143572807312
+   "confidence": 0.9999727010726929,
+   "det_score": 0.9568106532096863
   },
   {
    "box": [
-    1288.9841305893078,
-    501.7877459526062,
-    1350.2067670086692,
-    533.9178621768951
+    1285.0662746501782,
+    501.06413662433624,
+    1349.826266437053,
+    530.6584566831589
    ],
    "text": "1,040",
-   "confidence": 0.9999812841415405,
-   "det_score": 0.9514274001121521
+   "confidence": 0.9997137784957886,
+   "det_score": 0.9692628383636475
   },
   {
    "box": [
-    1430.9461480296216,
-    502.20437943935394,
-    1500.532992299076,
-    533.5597455501556
+    1431.3398022175436,
+    501.3564258813858,
+    1500.139338111154,
+    530.08833527565
    ],
    "text": "4,380",
-   "confidence": 0.9999950528144836,
-   "det_score": 0.9463030695915222
+   "confidence": 0.9999945163726807,
+   "det_score": 0.9701652526855469
   },
   {
    "box": [
-    884.8933925701001,
-    548.3376622200012,
-    1126.7374544589768,
-    580.7691812515259
+    884.6412405985797,
+    545.7805573940277,
+    1126.9896064304971,
+    579.892510175705
    ],
    "text": "| Average monthly bill",
-   "confidence": 0.9971780776977539,
-   "det_score": 0.9733707308769226
+   "confidence": 0.997011661529541,
+   "det_score": 0.9181461930274963
   },
   {
    "box": [
-    1271.8624001176256,
-    548.8913267850876,
-    1363.0301409696056,
-    580.5436372756958
-   ],
-   "text": "| $41.20",
-   "confidence": 0.9952223300933838,
-   "det_score": 0.9520396590232849
-  },
-  {
-   "box": [
-    1426.8422574550855,
-    549.5938897132874,
-    1513.233595895104,
-    579.653263092041
+    1280.2710862768586,
+    545.516887307167,
+    1363.2181678318643,
+    578.4222781658173
    ],
    "text": "$41.20",
-   "confidence": 0.999855101108551,
-   "det_score": 0.9361926913261414
+   "confidence": 0.9999313354492188,
+   "det_score": 0.9000137448310852
   },
   {
    "box": [
-    885.2307528219693,
-    595.4783201217651,
-    1276.842572083214,
-    625.6615459918976
+    1426.7354839339416,
+    546.5099692344666,
+    1513.3403694162478,
+    577.2809207439423
+   ],
+   "text": "|$41.20",
+   "confidence": 0.9790067672729492,
+   "det_score": 0.9614642262458801
+  },
+  {
+   "box": [
+    885.154605484491,
+    593.1842625141144,
+    1238.2335108239793,
+    623.8749623298645
    ],
    "text": "Table 1. The district's year at a glance.",
-   "confidence": 0.9995912313461304,
-   "det_score": 0.981968104839325
+   "confidence": 0.9999111890792847,
+   "det_score": 0.9327585101127625
+  },
+  {
+   "box": [
+    885.6434241679465,
+    897.3533928394318,
+    1465.557587210056,
+    924.7864246368408
+   ],
+   "text": "Figure 1. The north reservoir after the new pump was installed.",
+   "confidence": 0.9999778270721436,
+   "det_score": 0.9966880679130554
+  },
+  {
+   "box": [
+    883.8388995183855,
+    947.0225691795349,
+    1110.598521467708,
+    986.4816188812256
+   ],
+   "text": "Looking ahead",
+   "confidence": 0.9999637603759766,
+   "det_score": 0.9431557655334473
+  },
+  {
+   "box": [
+    884.6409257775462,
+    999.2500960826874,
+    1574.0189983691034,
+    1033.3641469478607
+   ],
+   "text": "Next year the district will finish the west side mains and open",
+   "confidence": 0.9995148777961731,
+   "det_score": 0.9822191596031189
+  },
+  {
+   "box": [
+    884.364660482491,
+    1037.3561441898346,
+    1569.9969071534128,
+    1073.3113288879395
+   ],
+   "text": "the river trail beside the treatment plant. Residents can follow",
+   "confidence": 0.9994481801986694,
+   "det_score": 0.9840461611747742
+  },
+  {
+   "box": [
+    884.492950053643,
+    1076.4969408512115,
+    1234.5968097440814,
+    1111.5971565246582
+   ],
+   "text": "the work on the district website.",
+   "confidence": 0.9999339580535889,
+   "det_score": 0.9764053821563721
+  },
+  {
+   "box": [
+    884.4922121918457,
+    1146.5100526809692,
+    1496.797294761378,
+    1181.6151857376099
+   ],
+   "text": "1 Results for every sample are posted on the first Monday of each month.",
+   "confidence": 0.9983606338500977,
+   "det_score": 0.9158998727798462
+  },
+  {
+   "box": [
+    128.75781496918455,
+    2092.1964049339294,
+    391.34332283106824,
+    2122.127664089203
+   ],
+   "text": "harborvalleywater.example",
+   "confidence": 0.9996996521949768,
+   "det_score": 0.8854315876960754
+  },
+  {
+   "box": [
+    1499.7847102535359,
+    2091.507840156555,
+    1573.5401949297764,
+    2122.430968284607
+   ],
+   "text": "Page 3",
+   "confidence": 0.9979110360145569,
+   "det_score": 0.9059666991233826
   }
  ],
  "pictures": [
   [
    885.4614412136535,
-   648.828125,
+   644.53125,
    1573.198482932996,
-   893.75
+   889.453125
   ]
  ],
  "order": "model",
  "blocks": [
   {
    "label": "Page-Header",
-   "confidence": 0.9950856566429138,
+   "confidence": 0.9839760661125183,
    "lines": [
     0
    ],
@@ -542,7 +531,7 @@
   },
   {
    "label": "Page-Header",
-   "confidence": 0.9980014562606812,
+   "confidence": 0.9969900846481323,
    "lines": [
     1
    ],
@@ -550,18 +539,32 @@
   },
   {
    "label": "Section-Header",
-   "confidence": 0.6245143413543701,
+   "confidence": 0.9115772247314453,
    "lines": [
-    2,
-    3
+    2
    ],
    "cells": []
   },
   {
    "label": "Text",
-   "confidence": 0.698142409324646,
+   "confidence": 0.6527236104011536,
    "lines": [
-    4,
+    3
+   ],
+   "cells": []
+  },
+  {
+   "label": "Section-Header",
+   "confidence": 0.9700365662574768,
+   "lines": [
+    4
+   ],
+   "cells": []
+  },
+  {
+   "label": "Text",
+   "confidence": 0.8764342665672302,
+   "lines": [
     5,
     6,
     7,
@@ -571,7 +574,7 @@
   },
   {
    "label": "Text",
-   "confidence": 0.935178816318512,
+   "confidence": 0.946755588054657,
    "lines": [
     9,
     10,
@@ -581,7 +584,7 @@
   },
   {
    "label": "Section-Header",
-   "confidence": 0.9823336601257324,
+   "confidence": 0.9908796548843384,
    "lines": [
     12
    ],
@@ -589,7 +592,7 @@
   },
   {
    "label": "List-Group",
-   "confidence": 0.9944751262664795,
+   "confidence": 0.9847724437713623,
    "lines": [
     13,
     14
@@ -598,7 +601,7 @@
   },
   {
    "label": "List-Group",
-   "confidence": 0.9986852407455444,
+   "confidence": 0.9950742125511169,
    "lines": [
     15
    ],
@@ -606,7 +609,7 @@
   },
   {
    "label": "List-Group",
-   "confidence": 0.9993000626564026,
+   "confidence": 0.998247504234314,
    "lines": [
     16
    ],
@@ -614,7 +617,7 @@
   },
   {
    "label": "List-Group",
-   "confidence": 0.9937329292297363,
+   "confidence": 0.9703208804130554,
    "lines": [
     17
    ],
@@ -622,7 +625,7 @@
   },
   {
    "label": "Section-Header",
-   "confidence": 0.9700844883918762,
+   "confidence": 0.935168445110321,
    "lines": [
     18
    ],
@@ -630,7 +633,7 @@
   },
   {
    "label": "Text",
-   "confidence": 0.9483509063720703,
+   "confidence": 0.9414540529251099,
    "lines": [
     19,
     20,
@@ -639,195 +642,202 @@
    "cells": []
   },
   {
-   "label": "Caption",
-   "confidence": 0.9456329941749573,
+   "label": "Table",
+   "confidence": 0.9835185408592224,
    "lines": [
-    22
-   ],
-   "cells": []
-  },
-  {
-   "label": "Section-Header",
-   "confidence": 0.6783150434494019,
-   "lines": [
-    23
-   ],
-   "cells": []
-  },
-  {
-   "label": "Text",
-   "confidence": 0.9522936940193176,
-   "lines": [
+    22,
+    23,
     24,
     25,
     26,
     27,
-    28
-   ],
-   "cells": []
-  },
-  {
-   "label": "Page-Footer",
-   "confidence": 0.9986425638198853,
-   "lines": [
-    29
-   ],
-   "cells": []
-  },
-  {
-   "label": "Page-Footer",
-   "confidence": 0.9897923469543457,
-   "lines": [
-    30
-   ],
-   "cells": []
-  },
-  {
-   "label": "Table",
-   "confidence": 0.9770408868789673,
-   "lines": [
+    28,
+    29,
+    30,
     31,
     32,
     33,
     34,
     35,
     36,
-    37,
-    38,
-    39,
-    40,
-    41,
-    42,
-    43,
-    44,
-    45,
-    46
+    37
    ],
    "cells": [
     [
      0,
      0,
      [
-      31
+      22
      ]
     ],
     [
      0,
+     1,
+     [
+      23
+     ]
+    ],
+    [
+     0,
+     2,
+     [
+      24
+     ]
+    ],
+    [
+     1,
+     0,
+     [
+      25
+     ]
+    ],
+    [
+     1,
+     1,
+     [
+      26
+     ]
+    ],
+    [
+     1,
+     2,
+     [
+      27
+     ]
+    ],
+    [
+     2,
+     0,
+     [
+      28
+     ]
+    ],
+    [
+     2,
+     1,
+     [
+      29
+     ]
+    ],
+    [
+     2,
+     2,
+     [
+      30
+     ]
+    ],
+    [
+     3,
+     0,
+     [
+      31
+     ]
+    ],
+    [
+     3,
      1,
      [
       32
      ]
     ],
     [
-     0,
+     3,
      2,
      [
       33
      ]
     ],
     [
-     1,
+     4,
      0,
      [
       34
      ]
     ],
     [
-     1,
+     4,
      1,
      [
       35
      ]
     ],
     [
-     1,
+     4,
      2,
      [
       36
      ]
     ],
     [
-     2,
+     5,
      0,
      [
       37
      ]
-    ],
-    [
-     2,
-     1,
-     [
-      38
-     ]
-    ],
-    [
-     2,
-     2,
-     [
-      39
-     ]
-    ],
-    [
-     3,
-     0,
-     [
-      40
-     ]
-    ],
-    [
-     3,
-     1,
-     [
-      41
-     ]
-    ],
-    [
-     3,
-     2,
-     [
-      42
-     ]
-    ],
-    [
-     4,
-     0,
-     [
-      43
-     ]
-    ],
-    [
-     4,
-     1,
-     [
-      44
-     ]
-    ],
-    [
-     4,
-     2,
-     [
-      45
-     ]
-    ],
-    [
-     5,
-     0,
-     [
-      46
-     ]
     ]
    ]
+  },
+  {
+   "label": "Caption",
+   "confidence": 0.9536998271942139,
+   "lines": [
+    38
+   ],
+   "cells": []
+  },
+  {
+   "label": "Section-Header",
+   "confidence": 0.6873955726623535,
+   "lines": [
+    39
+   ],
+   "cells": []
+  },
+  {
+   "label": "Text",
+   "confidence": 0.9748155474662781,
+   "lines": [
+    40,
+    41,
+    42
+   ],
+   "cells": []
+  },
+  {
+   "label": "Text",
+   "confidence": 0.9323167204856873,
+   "lines": [
+    43
+   ],
+   "cells": []
+  },
+  {
+   "label": "Page-Footer",
+   "confidence": 0.9895978569984436,
+   "lines": [
+    44
+   ],
+   "cells": []
+  },
+  {
+   "label": "Page-Footer",
+   "confidence": 0.998142421245575,
+   "lines": [
+    45
+   ],
+   "cells": []
   }
  ],
  "second_pass": false,
  "ms": {
-  "orient": 10.1983,
-  "detect": 39.4738,
-  "decode": 0.5107,
+  "orient": 6.724084,
+  "detect": 30.22987,
+  "decode": 0.251096,
   "second_pass": 0.0,
-  "recognize": 100.2185,
-  "total": 151.5731
+  "recognize": 65.654972,
+  "total": 103.606916,
+  "load": 0.0
  },
- "text": "Harbor Valley Water District\nAnnual Report 2026\nClean Water for a Growing Valley\nA year of new pipes, cleaner rivers and lower bills\nA record year for repairs\nThis year the district replaced more old pipe than in any\nyear since it was founded. Crews worked through the\nspring floods and the dry summer to keep water flowing\nto every home on the east side of the river.\nLeaks fell by a third across the network. The money saved\non lost water went back into repairs, and the district kept\nits rates flat for the second year in a row.\nWhat we finished\n\u2022 Twelve miles of new main under Mill Road and Cedar\nAvenue.\n\u2022 A second pump at the north reservoir.\n\u2022 Smart meters for four thousand homes.\n\u2022 A new lab for testing river water every week.\nWater quality\nEvery sample taken this year met the state standard. The\nnew lab now tests the river each week instead of each\nmonth, so problems are found days sooner.1\nFigure 1. The north reservoir after the new pump was installed.\nLooking ahead\nNext year the district will finish the west side mains and\nopen the river trail beside the treatment plant. Residents\ncan follow the work on the district website.\n___________________________\n1 Results for every sample are posted on the first Monday of each month.\nPage 3\nharborvalleywater.example\n| Measure\n2025\n2026\n| Miles of pipe replaced\n7.5\n12.0\n| Leaks reported\n318\n211\nSamples tested\n1,040\n4,380\n| Average monthly bill\n| $41.20\n$41.20\nTable 1. The district's year at a glance.\n",
- "html": "<header><p>Harbor Valley Water District</p></header>\n<header><p>Annual Report 2026</p></header>\n<h2>Clean Water for a Growing Valley A year of new pipes, cleaner rivers and lower bills</h2>\n<p>A record year for repairs This year the district replaced more old pipe than in any year since it was founded. Crews worked through the spring floods and the dry summer to keep water flowing to every home on the east side of the river.</p>\n<p>Leaks fell by a third across the network. The money saved on lost water went back into repairs, and the district kept its rates flat for the second year in a row.</p>\n<h2>What we finished</h2>\n<ul><li>Twelve miles of new main under Mill Road and Cedar Avenue.</li></ul>\n<ul><li>A second pump at the north reservoir.</li></ul>\n<ul><li>Smart meters for four thousand homes.</li></ul>\n<ul><li>A new lab for testing river water every week.</li></ul>\n<h2>Water quality</h2>\n<p>Every sample taken this year met the state standard. The new lab now tests the river each week instead of each month, so problems are found days sooner.1</p>\n<figure><figcaption>Figure 1. The north reservoir after the new pump was installed.</figcaption></figure>\n<h2>Looking ahead</h2>\n<p>Next year the district will finish the west side mains and open the river trail beside the treatment plant. Residents can follow the work on the district website. ___________________________ 1 Results for every sample are posted on the first Monday of each month.</p>\n<footer><p>Page 3</p></footer>\n<footer><p>harborvalleywater.example</p></footer>\n<table>\n<tr><td>| Measure</td><td>2025</td><td>2026</td></tr>\n<tr><td>| Miles of pipe replaced</td><td>7.5</td><td>12.0</td></tr>\n<tr><td>| Leaks reported</td><td>318</td><td>211</td></tr>\n<tr><td>Samples tested</td><td>1,040</td><td>4,380</td></tr>\n<tr><td>| Average monthly bill</td><td>| $41.20</td><td>$41.20</td></tr>\n<tr><td>Table 1. The district's year at a glance.</td><td></td><td></td></tr>\n</table>\n"
+ "text": "Harbor Valley Water District\nAnnual Report 2026\nClean Water for a Growing Valley\nA year of new pipes, cleaner rivers and lower bills\nA record year for repairs\nThis year the district replaced more old pipe than in any year\nsince it was founded. Crews worked through the spring floods\nand the dry summer to keep water flowing to every home on\nthe east side of the river.\nLeaks fell by a third across the network. The money saved on\nlost water went back into repairs, and the district kept its rates\nflat for the second year in a row.\nWhat we finished\n\u2022 Twelve miles of new main under Mill Road and Cedar\nAvenue.\n\u2022 A second pump at the north reservoir.\n\u2022 Smart meters for four thousand homes.\n\u2022 A new lab for testing river water every week.\nWater quality\nEvery sample taken this year met the state standard. The new\nlab now tests the river each week instead of each month, so\nproblems are found days sooner.1\n| Measure\n2025\n2026\nMiles of pipe replaced\n7.5\n12.0\n| Leaks reported\n318\n211\nSamples tested\n1,040\n4,380\n| Average monthly bill\n$41.20\n|$41.20\nTable 1. The district's year at a glance.\nFigure 1. The north reservoir after the new pump was installed.\nLooking ahead\nNext year the district will finish the west side mains and open\nthe river trail beside the treatment plant. Residents can follow\nthe work on the district website.\n1 Results for every sample are posted on the first Monday of each month.\nharborvalleywater.example\nPage 3\n",
+ "html": "<header><p>Harbor Valley Water District</p></header>\n<header><p>Annual Report 2026</p></header>\n<h2>Clean Water for a Growing Valley</h2>\n<p>A year of new pipes, cleaner rivers and lower bills</p>\n<h2>A record year for repairs</h2>\n<p>This year the district replaced more old pipe than in any year since it was founded. Crews worked through the spring floods and the dry summer to keep water flowing to every home on the east side of the river.</p>\n<p>Leaks fell by a third across the network. The money saved on lost water went back into repairs, and the district kept its rates flat for the second year in a row.</p>\n<h2>What we finished</h2>\n<ul><li>Twelve miles of new main under Mill Road and Cedar Avenue.</li></ul>\n<ul><li>A second pump at the north reservoir.</li></ul>\n<ul><li>Smart meters for four thousand homes.</li></ul>\n<ul><li>A new lab for testing river water every week.</li></ul>\n<h2>Water quality</h2>\n<p>Every sample taken this year met the state standard. The new lab now tests the river each week instead of each month, so problems are found days sooner.1</p>\n<table>\n<tr><td>| Measure</td><td>2025</td><td>2026</td></tr>\n<tr><td>Miles of pipe replaced</td><td>7.5</td><td>12.0</td></tr>\n<tr><td>| Leaks reported</td><td>318</td><td>211</td></tr>\n<tr><td>Samples tested</td><td>1,040</td><td>4,380</td></tr>\n<tr><td>| Average monthly bill</td><td>$41.20</td><td>|$41.20</td></tr>\n<tr><td>Table 1. The district's year at a glance.</td><td></td><td></td></tr>\n</table>\n<figure><figcaption>Figure 1. The north reservoir after the new pump was installed.</figcaption></figure>\n<h2>Looking ahead</h2>\n<p>Next year the district will finish the west side mains and open the river trail beside the treatment plant. Residents can follow the work on the district website.</p>\n<p>1 Results for every sample are posted on the first Monday of each month.</p>\n<footer><p>harborvalleywater.example</p></footer>\n<footer><p>Page 3</p></footer>\n"
 }

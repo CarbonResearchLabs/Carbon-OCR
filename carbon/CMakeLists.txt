@@ -19,6 +19,7 @@ add_library(carbon
   src/cpu/turns.cpp
   src/textlayer.cpp
   src/order.cpp
+  src/tables.cpp
   src/score.cpp
   src/deskew.cpp
   src/output.cpp

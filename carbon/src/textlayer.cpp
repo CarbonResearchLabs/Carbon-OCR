@@ -250,6 +250,106 @@ TextLayer read_text_layer(std::span<const PdfChar> drawn, const GrayView& page, 
   return out;
 }
 
+bool reads_across(const TextLayer& layer) {
+  int lines = 0, across = 0, words = 0, wide = 0;
+  for (const OcrLine& l : layer.lines) {
+    for (const OcrWord& w : l.words) {
+      ++words;
+      wide += w.box.x1 - w.box.x0 >= w.box.y1 - w.box.y0;
+    }
+    if (l.words.size() < 2) continue;
+    ++lines;
+    bool right = l.box.x1 - l.box.x0 >= l.box.y1 - l.box.y0;
+    for (size_t i = 1; right && i < l.words.size(); ++i) {
+      const LineBox &a = l.words[i - 1].box, &b = l.words[i].box;
+      right = b.x0 >= a.x0 + 0.25 * (a.x1 - a.x0);  // the next word starts further right
+    }
+    across += right;
+  }
+  if (lines > 0) return across >= 0.9 * lines;
+  return words > 0 && 2 * wide >= words;  // single words only: most of them wider than tall
+}
+
+bool lines_from_detection(TextLayer& layer, std::span<const LineBox> detected, double tall) {
+  if (!reads_across(layer)) return false;  // a page turned, or set down the page: the layer's own lines
+  const size_t m = detected.size();
+  std::vector<std::vector<OcrWord>> into(m);  // each detected line's words
+  std::vector<OcrLine> rest;                  // the layer's lines, with the words no detected line took
+  for (const OcrLine& l : layer.lines) {
+    std::vector<size_t> at(l.words.size(), m);  // the detected line each word goes into
+    for (size_t j = 0; j < l.words.size(); ++j) {
+      const LineBox& w = l.words[j].box;
+      const double cx = (w.x0 + w.x1) / 2, cy = (w.y0 + w.y1) / 2;
+      const double h = std::max(1.0, w.y1 - w.y0);
+      double least = 1e300;
+      for (size_t k = 0; k < m; ++k) {
+        const LineBox& d = detected[k];
+        if (cx < d.x0 || cx > d.x1 || cy < d.y0 || cy > d.y1 || d.y1 - d.y0 > tall * h) continue;
+        if (area(d) < least) {
+          least = area(d);
+          at[j] = k;
+        }
+      }
+    }
+    // a word no detected line holds (a superscript, a subscript above or below the line's band) stays with its
+    // line's words: in the detected line of its nearest neighbour in the layer's line that went into one
+    const std::vector<size_t> found = at;
+    for (size_t j = 0; j < at.size(); ++j) {
+      if (found[j] < m) continue;
+      for (size_t d = 1; d < at.size(); ++d) {  // the nearest before it first, at each distance
+        if (j >= d && found[j - d] < m) {
+          at[j] = found[j - d];
+          break;
+        }
+        if (j + d < at.size() && found[j + d] < m) {
+          at[j] = found[j + d];
+          break;
+        }
+      }
+    }
+    OcrLine left;
+    left.confidence = 1.0f;
+    for (size_t j = 0; j < l.words.size(); ++j) {
+      const OcrWord& w = l.words[j];
+      if (at[j] < m) {
+        into[at[j]].push_back(w);
+        continue;
+      }
+      if (left.words.empty()) {
+        left.box = w.box;
+      } else {
+        left.box = {std::min(left.box.x0, w.box.x0), std::min(left.box.y0, w.box.y0), std::max(left.box.x1, w.box.x1),
+                    std::max(left.box.y1, w.box.y1)};
+        left.text += ' ';
+      }
+      left.text += w.text;
+      left.words.push_back(w);
+    }
+    if (!left.words.empty()) rest.push_back(std::move(left));
+  }
+  std::vector<OcrLine> lines;
+  for (size_t k = 0; k < m; ++k) {
+    std::vector<OcrWord>& ws = into[k];
+    if (ws.empty()) continue;
+    std::stable_sort(ws.begin(), ws.end(), [](const OcrWord& a, const OcrWord& b) { return a.box.x0 < b.box.x0; });
+    OcrLine l;
+    l.confidence = 1.0f;
+    l.box = ws.front().box;
+    for (size_t i = 0; i < ws.size(); ++i) {
+      const LineBox& b = ws[i].box;
+      l.box = {std::min(l.box.x0, b.x0), std::min(l.box.y0, b.y0), std::max(l.box.x1, b.x1), std::max(l.box.y1, b.y1)};
+      if (i) l.text += ' ';
+      l.text += ws[i].text;
+    }
+    l.words = std::move(ws);
+    lines.push_back(std::move(l));
+  }
+  for (OcrLine& l : rest) lines.push_back(std::move(l));
+  layer.lines = std::move(lines);
+  layer.mcids.assign(layer.lines.size(), -1);
+  return true;
+}
+
 OcrPage page_from_text_layer(const TextLayer& layer, int width, int height) {
   OcrPage page;
   page.width = width;

@@ -156,6 +156,16 @@ std::string file_bytes(const std::filesystem::path& p) {
 // A page's JSON without its timings, which differ from run to run.
 std::string without_ms(const std::string& json) { return json.substr(0, json.rfind(", \"ms\": {")); }
 
+// PAGE XML without its times (Created, LastChange: the second it was written, which two writes may straddle).
+std::string without_times(std::string xml) {
+  for (const char* tag : {"Created", "LastChange"}) {
+    const std::string open = std::string("<") + tag + ">", close = std::string("</") + tag + ">";
+    const size_t a = xml.find(open), b = xml.find(close);
+    if (a != std::string::npos && b != std::string::npos && b > a) xml.erase(a + open.size(), b - a - open.size());
+  }
+  return xml;
+}
+
 // The page tiled n by n, as a PGM: a larger page, read more slowly.
 std::string tiled_pgm(const GrayImage& p, int n) {
   std::string s = "P5\n" + std::to_string(p.width * n) + " " + std::to_string(p.height * n) + "\n255\n";
@@ -236,7 +246,8 @@ TEST(Server, AnswersAPageAsTheEngineAndTheWritersRead) {
   EXPECT_EQ(c.ask(post("/ocr?format=hocr", png)).body, carbon::to_hocr(pages, std::vector<std::string>{"page"}));
   EXPECT_EQ(c.ask(post("/ocr?format=alto&name=scan%201.png", png)).body,
             carbon::to_alto(pages, std::vector<std::string>{"scan 1.png"}));
-  EXPECT_EQ(c.ask(post("/ocr?format=page&name=a.png", png)).body, carbon::to_page_xml(want, "a.png"));
+  EXPECT_EQ(without_times(c.ask(post("/ocr?format=page&name=a.png", png)).body),
+            without_times(carbon::to_page_xml(want, "a.png")));
   EXPECT_EQ(c.ask(post("/ocr?format=markdown", png)).body, carbon::to_markdown(pages));
   EXPECT_EQ(c.ask(post("/ocr?format=html", png)).body, carbon::to_html(pages));
   const Reply pdf = c.ask(post("/ocr?format=pdf", png));

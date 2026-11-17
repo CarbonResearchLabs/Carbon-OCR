@@ -32,4 +32,4 @@ jupyter lab Examples
 | `helpers.py` | finds the model set and `carbon-ocr`, draws pages with their boxes, matches the engine's lines to the truth's |
 | `data/`, `out/` | what the notebooks write as they run: the sample pages and their truths, and the files the command line writes |
 
-The outputs saved in the notebooks come from one run on a laptop's CPU (an Intel Core i7-13620H, Windows 11, Python 3.12). Your times will differ, and so may a few characters on a different CPU's kernels. The pages are drawn, so they are cleaner than most scans: measure the engine on your own pages, as notebook 5 shows, before you rely on its numbers for them.
+The outputs saved in the notebooks come from one run on a CPU (8 cores of an Intel Core i5-13600KF, Linux, Python 3.12). Your times will differ, and so may a few characters on a different CPU's kernels. The pages are drawn, so they are cleaner than most scans: measure the engine on your own pages, as notebook 5 shows, before you rely on its numbers for them.

@@ -60,6 +60,19 @@ struct TextLayer {
 // check (an empty view, data null: no ink check).
 TextLayer read_text_layer(std::span<const PdfChar> chars, const GrayView& page, const TextLayerRule& rule = {});
 
+// The layer's lines made the detector's (LineFinder: the lines it finds on the page's render), so a page read from
+// its text gives the order model the lines OCR would: each word into the smallest detected line that holds its
+// centre and is no more than `tall` times its height, the words of each such line left to right. A word no detected
+// line holds (a superscript or subscript out of the line's band) goes with its nearest word of the same layer line
+// that one does hold; a layer line none of whose words is held stays as it was. Every line's confidence 1; mcids -1
+// (for an untagged page: a tagged one keeps its tree's lines). Only for a page whose text reads across, upright, left
+// to right (reads_across): a page turned or set down the page keeps the layer's own lines, and false is returned.
+bool lines_from_detection(TextLayer& layer, std::span<const LineBox> detected, double tall = 2.0);
+
+// Whether a layer's text reads across the page, upright, left to right: at least 9 in 10 of its lines of two words
+// or more wider than tall, each word starting right of the one before; with no such line, most words wider than tall.
+bool reads_across(const TextLayer& layer);
+
 // The page its text layer reads as: its lines split at wide gaps (split_lines with
 // SplitRule::justified: a table row's cells, a column gutter, not a justified line's
 // stretched spaces), in reading order (the XY-cut the engine puts OCR's lines in),

@@ -395,7 +395,7 @@ struct Pipeline::Impl {
         PagePtr p = std::move(batch[i]);
         for_page(*p, [&] {
           p->out.rotation = detail::rotation_of(std::span<const float>(z.data() + i * classes, classes),
-                                                *e.turn_probability);
+                                                *e.turn_probability, e.turn_by_quarters);
           p->thumb = {};
           cpu_task([this, page = p](int) {
             for_page(*page, [&] {

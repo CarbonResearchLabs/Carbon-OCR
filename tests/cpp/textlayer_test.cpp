@@ -211,6 +211,57 @@ TEST(TextLayer, APageSplitsItsLinesAtWideGaps) {
   EXPECT_EQ(just.lines[0].text, "justified text stretched across its column");
 }
 
+// The layer's line across two table cells (one space between them, too narrow to split) made the detector's two
+// lines, each word into the detected line that holds it; a line no detected box takes, and a box far taller than
+// the words, leave the layer's lines as they were.
+TEST(TextLayer, LinesFromTheDetectorsLines) {
+  std::vector<PdfChar> chars;
+  put_line(chars, U"Total cost 12", 10, 50);  // words at x 10-60, 70-110 and 120-140, y 34-54
+  chars.push_back(generated(U'\n'));
+  put_line(chars, U"Note", 10, 120);
+  TextLayer layer = read_text_layer(chars, GrayView{nullptr, 0, 0, 0});
+  ASSERT_EQ(layer.lines.size(), 2u);
+  EXPECT_EQ(layer.lines[0].text, "Total cost 12");
+  const std::vector<LineBox> detected = {{5, 30, 112, 58}, {115, 30, 145, 58}, {0, 90, 400, 170}};
+  EXPECT_TRUE(reads_across(layer));
+  EXPECT_TRUE(lines_from_detection(layer, detected));
+  ASSERT_EQ(layer.lines.size(), 3u);
+  EXPECT_EQ(layer.lines[0].text, "Total cost");
+  EXPECT_EQ(layer.lines[0].box.x0, 10);
+  EXPECT_EQ(layer.lines[0].box.x1, 110);
+  EXPECT_EQ(layer.lines[0].words.size(), 2u);
+  EXPECT_EQ(layer.lines[1].text, "12");
+  EXPECT_EQ(layer.lines[2].text, "Note");  // the box over it is four of its heights tall: not a line of its
+  EXPECT_EQ(layer.mcids, (std::vector<int>{-1, -1, -1}));
+  const OcrPage page = page_from_text_layer(layer, 400, 200);
+  ASSERT_EQ(page.lines.size(), 3u);
+  EXPECT_EQ(page.source, "text layer");
+
+  // A superscript out of the detected line's band goes with its line's words, not a line of its own.
+  std::vector<PdfChar> sup;
+  put_line(sup, U"area m ", 10, 50);
+  put_line(sup, U"2", 80, 44);  // raised 6 px, past the detected line's end: in no detected line
+  TextLayer s = read_text_layer(sup, GrayView{nullptr, 0, 0, 0});
+  ASSERT_EQ(s.lines.size(), 1u);
+  ASSERT_EQ(s.lines[0].words.size(), 3u);
+  EXPECT_TRUE(lines_from_detection(s, std::vector<LineBox>{{5, 36, 80, 56}}));
+  ASSERT_EQ(s.lines.size(), 1u);
+  EXPECT_EQ(s.lines[0].text, "area m 2");
+
+  // A page turned upside down (each line's words right to left on the page) keeps the layer's lines.
+  TextLayer turned;
+  OcrLine l;
+  l.text = "upside down";
+  l.box = {10, 30, 120, 50};
+  l.words = {{{70, 30, 120, 50}, "upside", 1}, {{10, 30, 60, 50}, "down", 1}};
+  turned.lines = {l};
+  turned.mcids = {-1};
+  EXPECT_FALSE(reads_across(turned));
+  EXPECT_FALSE(lines_from_detection(turned, std::vector<LineBox>{{5, 25, 125, 55}}));
+  ASSERT_EQ(turned.lines.size(), 1u);
+  EXPECT_EQ(turned.lines[0].text, "upside down");
+}
+
 // A tagged page reads in its structure tree's order, not the page's geometry, its blocks the elements' roles;
 // an untagged or barely tagged one as before.
 TEST(TextLayer, ATaggedPageTakesItsTreesOrder) {

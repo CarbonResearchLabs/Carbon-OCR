@@ -4,7 +4,10 @@
 //   carbon-ocr ocr IMAGE|PDF... --set DIR [--rec rec-latin] [--backend ort|native]
 //                           [--precision auto|fp32|fp16|int8]
 //                           [--dpi 200|auto] [--text-layer auto|off] [--hybrid auto|off] [--second-pass auto|off]
+//                           [--layer-lines layer|detected]
 //                           [--gate auto|off] [--block-order geometry|model]
+//                           [--grid on|off] [--blocks-first on|off] [--turn bin|quarters] [--max-skew D]
+//                           [--wide-skew-gain F]
 //                           [--format text|json|hocr|alto|page|markdown|html|pdf] [--out-dir DIR]
 //                           [--output FILE] [--text-out FILE] [--text-only] [--image-dpi 300] [--as-given]
 //                           [--workers N] [--no-pin] [--device cpu|cuda] [--batch 8] [--in-flight N]
@@ -161,11 +164,16 @@ struct Args {
   double dpi = 200;  // ocr: a PDF's pages
   std::string text_layer = "auto";  // ocr: auto, a page's text layer where it passes; off
   std::string hybrid = "auto";      // ocr: auto, the pictures of a page read from its text layer read by OCR; off
+  std::string layer_lines = "detected";  // ocr: a text layer's lines the detector's, or "layer": PDFium's
   std::string second_pass = "auto";  // ocr: auto, tiny text detected again at twice the scale; off
   std::string gate = "auto";         // ocr, serve: auto, lines that are not text dropped (carbon::GateRule); off
   std::string prefetch = "on";       // serve on the GPU: the next group's pages uploaded while the current is read
   std::string head_accumulate = "fp32";  // the GPU's fused head: its products summed in fp32 or fp16
   std::string table_spans = "on";       // ocr, serve: the order model's tables laid out again with spans
+  std::string grid = "on";              // ocr, serve: the order model's tables by geometry (carbon::GridRule)
+  std::string blocks_first = "off";     // ocr, serve: blocks as the same-block head's clusters (carbon::OrderRule)
+  std::string turn = "bin";             // ocr, serve: orientation's turn by its likeliest bin, or by quarters
+  std::optional<double> max_skew, wide_skew_gain;  // ocr, serve: deskew's range and its gain past 5 degrees
   std::string spaces = "model";         // ocr, serve: spaces as the recognizer reads them, or borne out by the ink
   std::string block_order = "geometry";  // ocr, serve: the order model's blocks by geometry, or as the model gave them
   std::optional<double> second_pass_share, single_pixel;  // ocr, serve: carbon::DetRule's, where given (0: off)
@@ -196,9 +204,12 @@ struct Args {
                "usage: carbon-ocr ocr IMAGE|PDF... --set DIR [--rec NAME] [--workers N]\n"
                "                        [--no-pin] [--backend ort|native] [--precision auto|fp32|fp16|int8]\n"
                "                        [--dpi N|auto] [--text-layer auto|off]\n"
-               "                        [--hybrid auto|off] [--second-pass auto|off] [--gate auto|off]\n"
+               "                        [--hybrid auto|off] [--layer-lines layer|detected]\n"
+               "                        [--second-pass auto|off] [--gate auto|off]\n"
                "                        [--block-order geometry|model] [--second-pass-share F] [--single-pixel F]\n"
                "                        [--table-spans on|off] [--spaces model|ink]\n"
+               "                        [--grid on|off] [--blocks-first on|off] [--turn bin|quarters]\n"
+               "                        [--max-skew D] [--wide-skew-gain F]\n"
                "                        [--beam N] [--beam-gate F] [--beam-topk N]\n"
                "                        [--format text|json|hocr|alto|page|markdown|html|pdf] [--out-dir DIR]\n"
                "                        [--output FILE] [--text-out FILE] [--text-only] [--image-dpi N]\n"
@@ -229,6 +240,16 @@ int to_int(std::string_view flag, const std::string& v, int lo) {
     usage(std::string(flag) + " takes a whole number >= " + std::to_string(lo) + ", got '" + v + "'");
   }
   return static_cast<int>(n);
+}
+
+double to_double(std::string_view flag, const std::string& v, double lo, double hi) {
+  char* end = nullptr;
+  const double x = std::strtod(v.c_str(), &end);
+  if (end == v.c_str() || *end || !(x >= lo && x <= hi)) {
+    usage(std::string(flag) + " takes a number from " + std::to_string(lo) + " to " + std::to_string(hi) + ", got '" +
+          v + "'");
+  }
+  return x;
 }
 
 // "x=1x1x32x256" -> ("x", [1, 1, 32, 256])
@@ -342,6 +363,9 @@ Args parse(int argc, char** argv) {
     } else if (arg == "--hybrid") {
       a.hybrid = value();
       if (a.hybrid != "auto" && a.hybrid != "off") usage("--hybrid takes auto or off");
+    } else if (arg == "--layer-lines") {
+      a.layer_lines = value();
+      if (a.layer_lines != "layer" && a.layer_lines != "detected") usage("--layer-lines takes layer or detected");
     } else if (arg == "--second-pass") {
       a.second_pass = value();
       if (a.second_pass != "auto" && a.second_pass != "off") usage("--second-pass takes auto or off");
@@ -363,6 +387,19 @@ Args parse(int argc, char** argv) {
     } else if (arg == "--block-order") {
       a.block_order = value();
       if (a.block_order != "geometry" && a.block_order != "model") usage("--block-order takes geometry or model");
+    } else if (arg == "--grid") {
+      a.grid = value();
+      if (a.grid != "on" && a.grid != "off") usage("--grid takes on or off");
+    } else if (arg == "--blocks-first") {
+      a.blocks_first = value();
+      if (a.blocks_first != "on" && a.blocks_first != "off") usage("--blocks-first takes on or off");
+    } else if (arg == "--turn") {
+      a.turn = value();
+      if (a.turn != "bin" && a.turn != "quarters") usage("--turn takes bin or quarters");
+    } else if (arg == "--max-skew") {
+      a.max_skew = to_double(arg, value(), 0, 45);
+    } else if (arg == "--wide-skew-gain") {
+      a.wide_skew_gain = to_double(arg, value(), 1, 100);
     } else if (arg == "--beam") {
       a.beam = to_int(arg, value(), 0);
     } else if (arg == "--beam-topk") {
@@ -1176,6 +1213,11 @@ carbon::EngineOptions engine_options(const Args& a) {
   if (a.gate == "off") o.gate.reset();                       // every line kept, text or not
   o.blocks_by_geometry = a.block_order == "geometry";
   o.table_spans = a.table_spans != "off";
+  if (a.grid == "off") o.grid.reset();
+  o.order.blocks_first = a.blocks_first == "on";
+  o.turn_by_quarters = a.turn == "quarters";
+  if (a.max_skew) o.max_skew = *a.max_skew;
+  if (a.wide_skew_gain) o.wide_skew_gain = *a.wide_skew_gain;
   if (a.spaces == "ink") o.spaces = carbon::SpaceRule{};  // unsure spaces the ink does not bear out dropped
   o.beam.width = a.beam;  // under 2: off
   o.beam.topk = a.beam_topk;
@@ -1291,6 +1333,7 @@ int ocr(const Args& a) {
                         (a.text_layer == "auto" && a.hybrid == "auto" ? carbon::kPdfPictures : 0u);
   std::atomic<size_t> next_page{0};
   auto produce = [&] {
+    std::optional<carbon::LineFinder> finder;  // this producer's detector, for a text layer's lines
     for (size_t i; !stop && (i = next_page++) < n_pages;) {
       try {
         const auto& [file, number] = sources[i];
@@ -1310,6 +1353,13 @@ int ocr(const Args& a) {
           if (layer.check.usable) {
             // a tagged page in its tree's order and roles, else the XY-cut's, the order model's after
             text_pages[i] = carbon::page_from_tagged_layer(layer, pg.structure, pg.image.width, pg.image.height);
+            // The detector's lines, for a page whose text reads across upright (a turned one keeps the layer's)
+            if (a.layer_lines == "detected" && text_pages[i]->order != "tagged" && carbon::reads_across(layer)) {
+              if (!finder) finder.emplace(a.set, o);
+              carbon::TextLayer detected = layer;
+              carbon::lines_from_detection(detected, finder->find(pg.image.view()));
+              text_pages[i] = carbon::page_from_text_layer(detected, pg.image.width, pg.image.height);
+            }
             if (a.hybrid == "auto") {  // its pictures' own text, which the layer does not hold
               text_pages[i]->pictures = std::move(pg.pictures);
               std::vector<carbon::LineBox> to_read =

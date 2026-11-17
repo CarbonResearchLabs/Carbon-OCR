@@ -14,11 +14,12 @@
 // Built with -mavx2 -mfma -mf16c (/arch:AVX2).
 
 #include <immintrin.h>
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>  // _BitScanForward
+#endif
 
-#include <bit>
 #include <cmath>
 #include <cstring>
-#include <vector>
 
 #include "epilogue_avx2.h"
 #include "kernels.h"
@@ -1151,69 +1152,88 @@ void ctc_argmax_avx2(const float* logits, int classes, int frames, int t_n, int3
   }
 }
 
+namespace {
+
+// The lowest set bit's index of a nonzero mask (no std::countr_zero: no template here).
+inline int lowest_bit(unsigned m) {
+#if defined(_MSC_VER) && !defined(__clang__)
+  unsigned long i = 0;
+  _BitScanForward(&i, m);
+  return static_cast<int>(i);
+#else
+  return __builtin_ctz(m);
+#endif
+}
+
+}  // namespace
+
 void ctc_topk_avx2(const float* logits, int classes, int frames, int t_n, int k, int32_t* ids, float* logp,
                    float* blank) {
   // The reference's (kernels.cpp, ctc_topk) on 8 frames a vector, its last frames the reference's own loop: each
   // frame's best, then its sum of exp_neg(logit - best) over every class in class order, each lane its own frame's
   // operations in the reference's order (the same bits); then the top k but the blank, a class tried against a
-  // frame's k-th only in the lanes it beats it in (most classes beat none once the first k are in).
-  const int nv = t_n / 8, full = 8 * nv;
-  thread_local std::vector<float> best, sum, kth;
-  best.assign(static_cast<size_t>(full) + 8, -INFINITY);
-  sum.assign(static_cast<size_t>(full) + 8, 0.0f);
-  kth.assign(static_cast<size_t>(t_n), -INFINITY);
-  for (int c = 0; c < classes; ++c) {
-    const float* row = logits + static_cast<size_t>(c) * frames;
-    for (int v = 0; v < nv; ++v) {
-      const __m256 x = _mm256_loadu_ps(row + 8 * v), b = _mm256_loadu_ps(best.data() + 8 * v);
-      _mm256_storeu_ps(best.data() + 8 * v, _mm256_blendv_ps(b, x, _mm256_cmp_ps(x, b, _CMP_GT_OQ)));
-    }
-    for (int t = full; t < t_n; ++t) best[t] = row[t] > best[t] ? row[t] : best[t];
-  }
-  for (int c = 0; c < classes; ++c) {
-    const float* row = logits + static_cast<size_t>(c) * frames;
-    for (int v = 0; v < nv; ++v) {
-      const __m256 d = _mm256_sub_ps(_mm256_loadu_ps(row + 8 * v), _mm256_loadu_ps(best.data() + 8 * v));
-      _mm256_storeu_ps(sum.data() + 8 * v, _mm256_add_ps(_mm256_loadu_ps(sum.data() + 8 * v), exp_neg8(d)));
-    }
-    for (int t = full; t < t_n; ++t) sum[t] = sum[t] + exp_neg(row[t] - best[t]);
-  }
-  std::fill(logp, logp + static_cast<size_t>(t_n) * k, -INFINITY);
-  std::fill(ids, ids + static_cast<size_t>(t_n) * k, 0);
-  auto insert = [&](int t, float v, int c) {  // the reference's insertion: a later class must beat a kept one
-    float* lt = logp + static_cast<size_t>(t) * k;
-    int32_t* it = ids + static_cast<size_t>(t) * k;
-    int j = k - 1;
-    for (; j > 0 && lt[j - 1] < v; --j) {
-      lt[j] = lt[j - 1];
-      it[j] = it[j - 1];
-    }
-    lt[j] = v;
-    it[j] = c;
-    kth[t] = lt[k - 1];
-  };
-  if (k > 0) {
-    for (int c = 1; c < classes; ++c) {
-      const float* row = logits + static_cast<size_t>(c) * frames;
+  // frame's k-th only in the lanes it beats it in (most classes beat none once the first k are in). The frames
+  // 256 at a time, each one's work its own, in buffers on the stack (no std::vector: no template here).
+  constexpr int kChunk = 256;
+  alignas(32) float best[kChunk], sum[kChunk], kth[kChunk];
+  for (int t0 = 0; t0 < t_n; t0 += kChunk) {
+    const int n = t_n - t0 < kChunk ? t_n - t0 : kChunk, nv = n / 8, full = 8 * nv;
+    const float* base = logits + t0;
+    int32_t* cids = ids + static_cast<size_t>(t0) * k;
+    float* clogp = logp + static_cast<size_t>(t0) * k;
+    for (int t = 0; t < n; ++t) best[t] = -INFINITY, sum[t] = 0.0f, kth[t] = -INFINITY;
+    for (int c = 0; c < classes; ++c) {
+      const float* row = base + static_cast<size_t>(c) * frames;
       for (int v = 0; v < nv; ++v) {
-        int more = _mm256_movemask_ps(
-            _mm256_cmp_ps(_mm256_loadu_ps(row + 8 * v), _mm256_loadu_ps(kth.data() + 8 * v), _CMP_GT_OQ));
-        while (more != 0) {
-          const int q = std::countr_zero(static_cast<unsigned>(more));
-          insert(8 * v + q, row[8 * v + q], c);
-          more &= more - 1;
+        const __m256 x = _mm256_loadu_ps(row + 8 * v), bv = _mm256_load_ps(best + 8 * v);
+        _mm256_store_ps(best + 8 * v, _mm256_blendv_ps(bv, x, _mm256_cmp_ps(x, bv, _CMP_GT_OQ)));
+      }
+      for (int t = full; t < n; ++t) best[t] = row[t] > best[t] ? row[t] : best[t];
+    }
+    for (int c = 0; c < classes; ++c) {
+      const float* row = base + static_cast<size_t>(c) * frames;
+      for (int v = 0; v < nv; ++v) {
+        const __m256 d = _mm256_sub_ps(_mm256_loadu_ps(row + 8 * v), _mm256_load_ps(best + 8 * v));
+        _mm256_store_ps(sum + 8 * v, _mm256_add_ps(_mm256_load_ps(sum + 8 * v), exp_neg8(d)));
+      }
+      for (int t = full; t < n; ++t) sum[t] = sum[t] + exp_neg(row[t] - best[t]);
+    }
+    for (size_t i = 0; i < static_cast<size_t>(n) * k; ++i) clogp[i] = -INFINITY, cids[i] = 0;
+    auto insert = [&](int t, float v, int c) {  // the reference's insertion: a later class must beat a kept one
+      float* lt = clogp + static_cast<size_t>(t) * k;
+      int32_t* it = cids + static_cast<size_t>(t) * k;
+      int j = k - 1;
+      for (; j > 0 && lt[j - 1] < v; --j) {
+        lt[j] = lt[j - 1];
+        it[j] = it[j - 1];
+      }
+      lt[j] = v;
+      it[j] = c;
+      kth[t] = lt[k - 1];
+    };
+    if (k > 0) {
+      for (int c = 1; c < classes; ++c) {
+        const float* row = base + static_cast<size_t>(c) * frames;
+        for (int v = 0; v < nv; ++v) {
+          int more = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_loadu_ps(row + 8 * v), _mm256_load_ps(kth + 8 * v),
+                                                      _CMP_GT_OQ));
+          while (more != 0) {
+            const int q = lowest_bit(static_cast<unsigned>(more));
+            insert(8 * v + q, row[8 * v + q], c);
+            more &= more - 1;
+          }
+        }
+        for (int t = full; t < n; ++t) {
+          if (row[t] > kth[t]) insert(t, row[t], c);
         }
       }
-      for (int t = full; t < t_n; ++t) {
-        if (row[t] > kth[t]) insert(t, row[t], c);
-      }
     }
-  }
-  for (int t = 0; t < t_n; ++t) {
-    const float off = best[t] + std::log(sum[t]);
-    float* lt = logp + static_cast<size_t>(t) * k;
-    for (int j = 0; j < k; ++j) lt[j] = lt[j] - off;
-    blank[t] = logits[t] - off;
+    for (int t = 0; t < n; ++t) {
+      const float off = best[t] + logf(sum[t]);
+      float* lt = clogp + static_cast<size_t>(t) * k;
+      for (int j = 0; j < k; ++j) lt[j] = lt[j] - off;
+      blank[t0 + t] = base[t] - off;
+    }
   }
 }
 

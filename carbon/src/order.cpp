@@ -280,14 +280,37 @@ PageOrder decode_order(const OrderOutputs& out, std::span<const LineBox> boxes, 
   } else {
     for (size_t k = 1; k + 1 < chain.size(); ++k) po.order.push_back(chain[k] - 1);
   }
-  // blocks: runs of the order whose neighbours share a block
-  const std::vector<float> links = whole ? std::vector<float>{} : out.pairs->chain(0, po.order);
-  for (size_t k = 0; k < N; ++k) {
-    const size_t i = po.order[k];
-    if (k == 0 || sigmoid(whole ? out.same_block[po.order[k - 1] * N + i] : links[k - 1]) < rule.join) {
-      po.blocks.emplace_back();
+  if (rule.blocks_first && !po.fallback && N <= static_cast<size_t>(rule.blocks_first_most)) {
+    // Blocks first: the same-block head's clusters over every line (average linkage), each block's lines in
+    // the chain's order, the blocks in the order of their first lines
+    std::vector<size_t> place(N);
+    for (size_t k = 0; k < N; ++k) place[po.order[k]] = k;
+    std::vector<std::vector<size_t>> groups;
+    if (whole) {
+      groups = cluster(po.order, [&](size_t a, size_t c) { return out.same_block[po.order[a] * N + po.order[c]]; },
+                       rule.join);
+    } else {
+      const std::vector<float> among = out.pairs->among(0, po.order);
+      groups = cluster(po.order, [&](size_t a, size_t c) { return among[a * N + c]; }, rule.join);
     }
-    po.blocks.back().lines.push_back(i);
+    for (auto& g : groups) std::sort(g.begin(), g.end(), [&](size_t x, size_t y) { return place[x] < place[y]; });
+    std::sort(groups.begin(), groups.end(), [&](const auto& x, const auto& y) { return place[x[0]] < place[y[0]]; });
+    po.order.clear();
+    for (auto& g : groups) {
+      po.order.insert(po.order.end(), g.begin(), g.end());
+      po.blocks.emplace_back();
+      po.blocks.back().lines = std::move(g);
+    }
+  } else {
+    // blocks: runs of the order whose neighbours share a block
+    const std::vector<float> links = whole ? std::vector<float>{} : out.pairs->chain(0, po.order);
+    for (size_t k = 0; k < N; ++k) {
+      const size_t i = po.order[k];
+      if (k == 0 || sigmoid(whole ? out.same_block[po.order[k - 1] * N + i] : links[k - 1]) < rule.join) {
+        po.blocks.emplace_back();
+      }
+      po.blocks.back().lines.push_back(i);
+    }
   }
   for (OrderBlock& b : po.blocks) {
     std::vector<double> mean(kBlockLabels, 0.0);

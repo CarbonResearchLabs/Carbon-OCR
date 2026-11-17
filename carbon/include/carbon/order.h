@@ -82,6 +82,11 @@ struct OrderRule {
   double min_sure = 0.5;  // the chain's mean link probability below which the XY-cut's order is used
   int sweeps = 4;         // repair sweeps at most
   float join = 0.5f;      // the pairwise probability that puts two lines in one block, cell, row or column
+  // Blocks first: a page's blocks the same-block head's clusters over all its lines (average linkage at
+  // `join`), not the runs of the chain, each block's lines in the chain's order and the blocks in the order of their
+  // first lines; on a page of at most blocks_first_most lines (the clusters cost n^2). False: the runs (default).
+  bool blocks_first = false;
+  int blocks_first_most = 1500;
 };
 
 struct TableCell {
