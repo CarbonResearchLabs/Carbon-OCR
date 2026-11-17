@@ -72,6 +72,18 @@ void ctc_head_argmax(const void* features, const void* weight, const float* bias
                      int frames, int32_t* ids, float* probs, void* stream = nullptr,
                      bool fp16_accumulate = false);
 
+// The beam's candidates (carbon/beam.h) on the GPU, for the lines it reads again (src/cuda/beam.cu).  ctc_topk:
+// of device logits [n][classes][frames] (float32), lines rows[j] (device int32, n_rows of them), each its first
+// lengths[j] frames (device int32): ids [n_rows][frames][k] (int32), logp [n_rows][frames][k] and blank
+// [n_rows][frames] (float32), all device memory, as cpu::ctc_topk gives them but for the GPU's exp (the last few
+// bits); k at most 16.  ctc_head_logits: the fused head's logits (ctc_head_argmax's features, weight and bias) of
+// lines rows[j]: logits [n_rows][classes][frames] (float32), each summed in float32 in k's order, within about 1e-3
+// of the tensor cores' sums.  Both asynchronous on `stream`.
+void ctc_topk(const float* logits, int classes, int frames, const int32_t* rows, const int32_t* lengths, int n_rows,
+              int k, int32_t* ids, float* logp, float* blank, void* stream = nullptr);
+void ctc_head_logits(const void* features, const void* weight, const float* bias, const int32_t* rows, int n_rows,
+                     int k, int classes, int frames, float* logits, void* stream = nullptr);
+
 // A model's input from gray pixels in device memory: n bytes in, n ink values out
 // (1 - v / 255: ink 1, paper 0), float16 when fp16 (TensorRT's .fp16.onnx inputs)
 // else float32; the CPU's carbon::ink_input values, rounded to float16 once.

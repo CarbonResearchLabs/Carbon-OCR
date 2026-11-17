@@ -151,13 +151,29 @@ class CpuModels final : public PipelineModels {
     Tensor x = Tensor::empty(DType::kFloat32, {m, 1, h, bw});
     float* px = x.data<float>().data();
     for (size_t i = 0; i < crops.size(); ++i) px[i] = 1.0f - crops[i] / 255.0f;
-    const Tensor logits = std::move(rec_->run(std::span<const Tensor>(&x, 1))[0]);
-    const Shape& s = logits.shape();
+    logits_ = std::move(rec_->run(std::span<const Tensor>(&x, 1))[0]);
+    const Shape& s = logits_.shape();
     lengths.resize(m);
     for (int i = 0; i < m; ++i) {
       lengths[i] = std::min<int32_t>(static_cast<int32_t>(s[2]), widths[i] / crop.frame_px);
     }
-    lines = ctc_greedy(logits.data<float>().data(), m, static_cast<int>(s[1]), static_cast<int>(s[2]), lengths);
+    lengths_ = lengths;
+    lines = ctc_greedy(logits_.data<float>().data(), m, static_cast<int>(s[1]), static_cast<int>(s[2]), lengths);
+  }
+
+  // From the last run's logits, kept until the next.
+  bool candidates(std::span<const int32_t> rows, int topk, std::vector<FrameCandidates>& out) override {
+    const Shape& s = logits_.shape();
+    if (s.size() != 3) return false;
+    const int m = static_cast<int>(s[0]), classes = static_cast<int>(s[1]), frames = static_cast<int>(s[2]);
+    const float* l = logits_.data<float>().data();
+    out.clear();
+    for (const int32_t r : rows) {
+      if (r < 0 || r >= m) throw Error("candidates: line " + std::to_string(r) + " of a run of " + std::to_string(m));
+      out.push_back(frame_candidates(l + static_cast<size_t>(r) * classes * frames, classes, frames,
+                                     lengths_[static_cast<size_t>(r)], std::clamp(topk, 0, classes - 1)));
+    }
+    return true;
   }
 
   const Session& rec() const { return *rec_; }
@@ -165,6 +181,8 @@ class CpuModels final : public PipelineModels {
  private:
   std::unique_ptr<Session> orient_, det_, rec_;
   std::vector<GrayView> pages_;
+  Tensor logits_;                // the last recognize run's, for candidates
+  std::vector<int32_t> lengths_;
 };
 
 }  // namespace
@@ -190,6 +208,14 @@ struct Pipeline::Impl {
     OcrPage out;
     int ph = 0, pw = 0;      // the detector's padded size
     Clock::time_point start, lines_start;
+    // The lines under the beam's gate (EngineOptions::beam), read by finish on a CPU thread: the line, its
+    // frames, its candidates.
+    struct Unsure {
+      size_t line;
+      int32_t length;
+      FrameCandidates frames;
+    };
+    std::vector<Unsure> unsure;
   };
   using PagePtr = std::shared_ptr<Page>;  // shared: a CPU task's copy of it
 
@@ -554,9 +580,11 @@ struct Pipeline::Impl {
           }
         }
       }
-      std::vector<int32_t> page_of, lengths;
+      std::vector<int32_t> page_of, lengths, gated;
       std::vector<LineBox> boxes;
       std::vector<CtcLine> decoded;
+      std::vector<FrameCandidates> cands;
+      std::vector<int8_t> unsure;
       for (size_t a = 0; a < items.size();) {
         size_t b = a;
         while (b < items.size() && items[b].bucket == items[a].bucket && b - a < static_cast<size_t>(o.line_batch)) {
@@ -581,9 +609,37 @@ struct Pipeline::Impl {
           a = b;
           continue;
         }
+        // The lines under the beam's gate: their candidates now, while the run's outputs are there, their beam on
+        // a CPU thread with the rest of the page's finish; a device that gives none leaves them greedy.
+        unsure.assign(b - a, -1);
+        if (e.beam.on()) {
+          gated.clear();
+          for (size_t i = a; i < b; ++i) {
+            if (!errors[items[i].page] &&
+                detail::decoded_confidence(decoded[i - a], vocab, e.char_confidence) < e.beam.gate) {
+              gated.push_back(static_cast<int32_t>(i - a));
+            }
+          }
+          try {
+            if (!gated.empty() && models->candidates(gated, e.beam.topk, cands)) {
+              for (size_t j = 0; j < gated.size(); ++j) {
+                const size_t i = a + static_cast<size_t>(gated[j]);
+                group[items[i].page]->unsure.push_back(
+                    {static_cast<size_t>(items[i].line), lengths[static_cast<size_t>(gated[j])], std::move(cands[j])});
+                unsure[static_cast<size_t>(gated[j])] = 1;
+              }
+            }
+          } catch (...) {
+            const std::exception_ptr ep = std::current_exception();
+            for (const int32_t r : gated) {
+              std::exception_ptr& err = errors[items[a + static_cast<size_t>(r)].page];
+              if (!err) err = ep;
+            }
+          }
+        }
         for (size_t i = a; i < b; ++i) {
           std::exception_ptr& err = errors[items[i].page];
-          if (err) continue;
+          if (err || unsure[i - a] > 0) continue;
           try {
             detail::read_line(group[items[i].page]->out.lines[items[i].line], decoded[i - a], lengths[i - a],
                               e.crop, vocab, nullptr, 0, nullptr, e.char_confidence);
@@ -606,6 +662,11 @@ struct Pipeline::Impl {
 
   void finish(Page& p, int k) {
     OcrPage& out = p.out;
+    for (Page::Unsure& u : p.unsure) {  // the beam's lines (EngineOptions::beam), as the CPU engine reads them
+      const CtcLine d = ctc_beam(u.frames, e.beam, e.language_model.get()).line;
+      detail::read_line(out.lines[u.line], d, u.length, e.crop, vocab, nullptr, 0, nullptr, e.char_confidence);
+    }
+    p.unsure.clear();
     out.ms.recognize = ms_since(p.lines_start);
     detail::finish_page(out, order[k].get(), e);  // the gate, the split and the order, as the CPU engine's
     out.ms.total = ms_since(p.start);

@@ -575,6 +575,101 @@ void ctc_head(const float* features, int k, int frames, int t_n, const PackedHea
   }
 }
 
+void rec_head_logits(const float* features, int k, int frames, int t_n, const PackedHead& head, float* logits,
+                     Isa isa) {
+  if (t_n <= 0 || head.classes <= 0) return;
+  if (k != head.k) throw Error("rec_head_logits: features of " + std::to_string(k) + " channels, a head of " +
+                               std::to_string(head.k));
+  check(isa, "rec_head_logits");
+  thread_local std::vector<float> tile;  // [classes][kHeadFrames], ctc_head's tile
+  tile.resize(static_cast<size_t>(head.classes) * kHeadFrames);
+  const int blocks = (head.classes + kHeadBlock - 1) / kHeadBlock;
+  for (int t0 = 0; t0 < t_n; t0 += kHeadFrames) {
+    const int nt = std::min(kHeadFrames, t_n - t0);
+    bool done = false;
+#if defined(CARBON_KERNEL_AVX2)
+    if (dw_kernel(isa) == Isa::kAvx2 && t0 + kHeadFrames <= frames) {
+      detail::head_tile_avx2(features, k, frames, t0, head.w.data(), head.b.data(), head.classes, tile.data());
+      done = true;
+    }
+#endif
+    if (!done) {
+      for (int cb = 0; cb < blocks; ++cb) {  // ctc_head's reference: each logit an FMA chain from its bias, j in order
+        for (int q = 0; q < kHeadBlock && cb * kHeadBlock + q < head.classes; ++q) {
+          const int c = cb * kHeadBlock + q;
+          for (int t = 0; t < nt; ++t) {
+            float acc = head.b[static_cast<size_t>(c)];
+            for (int j = 0; j < k; ++j) {
+              acc = std::fma(head.w[(static_cast<size_t>(cb) * k + j) * kHeadBlock + q],
+                             features[static_cast<size_t>(j) * frames + t0 + t], acc);
+            }
+            tile[static_cast<size_t>(c) * kHeadFrames + t] = acc;
+          }
+        }
+      }
+    }
+    for (int c = 0; c < head.classes; ++c) {
+      std::copy_n(tile.data() + static_cast<size_t>(c) * kHeadFrames, nt, logits + static_cast<size_t>(c) * frames + t0);
+    }
+  }
+}
+
+void ctc_topk(const float* logits, int classes, int frames, int t_n, int k, int32_t* ids, float* logp, float* blank,
+              Isa isa) {
+  if (t_n <= 0 || classes <= 0) return;
+  if (k < 0 || k > classes - 1) {
+    throw Error("ctc_topk: k = " + std::to_string(k) + " for " + std::to_string(classes) + " classes (0 to " +
+                std::to_string(classes - 1) + ")");
+  }
+  check(isa, "ctc_topk");
+#if defined(CARBON_KERNEL_AVX2)
+  if (dw_kernel(isa) == Isa::kAvx2) {
+    detail::ctc_topk_avx2(logits, classes, frames, t_n, k, ids, logp, blank);
+    return;
+  }
+#endif
+  // The reference.
+  const float neg = -std::numeric_limits<float>::infinity();
+  thread_local std::vector<float> best, sum;
+  best.assign(static_cast<size_t>(t_n), neg);
+  sum.assign(static_cast<size_t>(t_n), 0.0f);
+  // Class by class, along the frames (the layout's fast axis), as ctc_argmax reads them: its sums' terms in its order.
+  for (int c = 0; c < classes; ++c) {
+    const float* row = logits + static_cast<size_t>(c) * frames;
+    for (int t = 0; t < t_n; ++t) best[t] = row[t] > best[t] ? row[t] : best[t];
+  }
+  for (int c = 0; c < classes; ++c) {
+    const float* row = logits + static_cast<size_t>(c) * frames;
+    for (int t = 0; t < t_n; ++t) sum[t] = sum[t] + detail::exp_neg(row[t] - best[t]);
+  }
+  std::fill(logp, logp + static_cast<size_t>(t_n) * k, neg);
+  std::fill(ids, ids + static_cast<size_t>(t_n) * k, 0);
+  if (k > 0) {
+    for (int c = 1; c < classes; ++c) {  // the blank apart; a later class must beat a kept one, so ties keep the lower
+      const float* row = logits + static_cast<size_t>(c) * frames;
+      for (int t = 0; t < t_n; ++t) {
+        const float v = row[t];
+        float* lt = logp + static_cast<size_t>(t) * k;
+        if (!(v > lt[k - 1])) continue;
+        int32_t* it = ids + static_cast<size_t>(t) * k;
+        int j = k - 1;
+        for (; j > 0 && lt[j - 1] < v; --j) {
+          lt[j] = lt[j - 1];
+          it[j] = it[j - 1];
+        }
+        lt[j] = v;
+        it[j] = c;
+      }
+    }
+  }
+  for (int t = 0; t < t_n; ++t) {
+    const float off = best[t] + std::log(sum[t]);
+    float* lt = logp + static_cast<size_t>(t) * k;
+    for (int j = 0; j < k; ++j) lt[j] = lt[j] - off;
+    blank[t] = logits[t] - off;
+  }
+}
+
 void bgrx_to_gray(const uint8_t* src, int64_t src_stride, int w, int h, uint8_t* dst, int64_t dst_stride, Isa isa) {
   if (w <= 0 || h <= 0) return;
   check(isa, "bgrx_to_gray");

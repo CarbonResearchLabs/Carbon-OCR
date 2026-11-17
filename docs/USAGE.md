@@ -48,6 +48,9 @@ By default the pages run in parallel on the CPU, one worker per physical core. `
 | `--block-order geometry\|model` | `geometry` | the order model's blocks in order by their geometry, a page's columns first; `model`: as the model ordered them |
 | `--table-spans on\|off` | `on` | the order model's tables with their spanning cells (`colspan`, `rowspan`) |
 | `--spaces model\|ink` | `model` | `ink`: drop a space the recognizer is unsure of where the line's ink shows no gap (the CPU only) |
+| `--beam N` | 0 | read the lines the recognizer is unsure of again by a CTC prefix beam of N prefixes (8 is the width to ask for); under 2: off, every line greedy |
+| `--beam-gate F` | 0.9 | the confidence under which a line goes to the beam; 0: none, 2: every line |
+| `--beam-topk N` | 5 | the classes each frame offers the beam besides the blank |
 | `--as-given` | off | no quarter turns and no deskew: the page as given |
 | `--precision auto\|fp32\|fp16\|int8` | `auto` | the files the models run. On the CPU: `fp16` the set's `.fp16.onnx` on the engine's own kernels, `int8` its `.int8.onnx`, `fp32` its `.onnx`; `auto` as below. On the GPU: `fp16` the `.fp16.onnx` files and the recognizer's trunk and fused CTC head, `fp32` the `.onnx` files, `int8` the `.int8-sym.onnx` files; `auto` the FP16 files, the FP32 one where a set lacks one |
 | `--backend ort\|native` | per model | run every model on one backend; by default a model runs on the native int8 backend where the set has its `.int8.onnx`, else on ONNX Runtime |

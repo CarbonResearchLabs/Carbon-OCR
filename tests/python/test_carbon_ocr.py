@@ -179,6 +179,35 @@ def test_ctc_greedy_and_collapse():
     assert [l[0] for l in full] == [l[0] for l in part]
 
 
+def test_ctc_beam_is_greedy_at_width_one_and_never_less_probable():
+    rng = np.random.default_rng(2)
+    z = (rng.normal(size=(32, 9, 24)) * 0.7).astype(np.float32)  # flat: where a beam and greedy part
+    lengths = rng.integers(1, 25, 32).astype(np.int32)
+    greedy = carbon_ocr.ctc_greedy(z, lengths)
+    one, one_scores = carbon_ocr.ctc_beam(z, lengths, width=1, topk=8)
+    for g, b in zip(greedy, one):
+        assert b[0] == g[0] and b[1] == g[1]
+        assert b[2] == pytest.approx(g[2], abs=1e-5)
+    _, wide_scores = carbon_ocr.ctc_beam(z, lengths, width=8, topk=8, blank_skip=1.0)
+    assert all(w >= o - 1e-9 for w, o in zip(wide_scores, one_scores))
+    assert any(w > o + 1e-9 for w, o in zip(wide_scores, one_scores))
+    # a blank between two equal classes keeps both; with none between, they are one
+    rep = np.zeros((2, 3, 3), np.float32)
+    for t, c in enumerate([1, 0, 1]):
+        rep[0, c, t] = 8.0
+    for t, c in enumerate([1, 1, 0]):
+        rep[1, c, t] = 8.0
+    lines, _ = carbon_ocr.ctc_beam(rep, np.array([3, 3], np.int32), width=4, topk=2)
+    assert lines[0][0] == [1, 1] and lines[1][0] == [1]
+
+
+def test_the_engine_with_the_beam_reads_clear_lines_as_greedy():
+    page = carbon_ocr.load_image(str(DATA / "fake-set" / "page.png"))
+    plain = carbon_ocr.Engine(str(DATA / "fake-set"), workers=1).ocr([page])[0]
+    beamed = carbon_ocr.Engine(str(DATA / "fake-set"), workers=1, beam_width=8, beam_gate=2.0).ocr([page])[0]
+    assert [l["text"] for l in beamed["lines"]] == [l["text"] for l in plain["lines"]]
+
+
 DATA = __import__("pathlib").Path(__file__).resolve().parents[1] / "data"
 
 

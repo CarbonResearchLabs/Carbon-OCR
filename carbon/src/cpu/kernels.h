@@ -82,6 +82,7 @@ void dwconv_u8s8_avx2(Rows<uint8_t>, int32_t, const int8_t*, int, int, const Epi
 void dwconv_f32_neon(Rows<float>, const float*, int, int, const Epilogue&);
 void dwconv_u8s8_neon(Rows<uint8_t>, int32_t, const int8_t*, int, int, const Epilogue&);
 void ctc_argmax_avx2(const float*, int, int, int, int32_t*, float*);
+void ctc_topk_avx2(const float*, int, int, int, int, int32_t*, float*, float*);
 ByteCounts count_beyond_avx2(const uint8_t*, int, int, int64_t, int, int);
 void bgrx_to_gray_avx2(const uint8_t*, int64_t, int, int, uint8_t*, int64_t);
 void softmax_rows_avx2(float* rows, int n_rows, int n, float scale);

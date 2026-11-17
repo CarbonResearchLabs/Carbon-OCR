@@ -1275,6 +1275,13 @@ void Engine::Impl::read_lines(Job& j, std::span<const size_t> lines, int k) {
                         ids.data() + static_cast<size_t>(i) * frames, probs.data() + static_cast<size_t>(i) * frames);
         }
         decoded = ctc_collapse(ids.data(), probs.data(), m, frames, lengths);
+        detail::beam_lines(decoded, lengths, rec_head->head.classes, frames, o, vocab,
+                           [&](size_t i, std::vector<float>& scratch) {  // the head's logits, for this line alone
+                             scratch.resize(static_cast<size_t>(rec_head->head.classes) * frames);
+                             cpu::rec_head_logits(fv + i * kk * frames, kk, frames, lengths[i], rec_head->head,
+                                                  scratch.data());
+                             return static_cast<const float*>(scratch.data());
+                           });
         return;
       }
       if (v.dtype != DType::kFloat32 || v.shape.size() != 3 || v.shape[0] != m) {
@@ -1283,7 +1290,11 @@ void Engine::Impl::read_lines(Job& j, std::span<const size_t> lines, int k) {
       for (int i = 0; i < m; ++i) {
         lengths[i] = std::min<int32_t>(static_cast<int32_t>(v.shape[2]), widths[i] / o.crop.frame_px);
       }
-      decoded = ctc_greedy(v.as<float>(), m, static_cast<int>(v.shape[1]), static_cast<int>(v.shape[2]), lengths);
+      const int classes = static_cast<int>(v.shape[1]), frames = static_cast<int>(v.shape[2]);
+      decoded = ctc_greedy(v.as<float>(), m, classes, frames, lengths);
+      detail::beam_lines(decoded, lengths, classes, frames, o, vocab, [&](size_t i, std::vector<float>&) {
+        return v.as<float>() + i * classes * frames;
+      });
     });
     if (o.spaces || o.word_boxes_at_ink) {  // each crop's columns of ink, for its spaces and its words' boxes
       std::vector<uint8_t> ink(static_cast<size_t>(bw));
@@ -1632,6 +1643,25 @@ bool ink_columns(const uint8_t* crop, int width, int h, int64_t stride, const Cr
   const int t = (darkest + p90) / 2;
   for (int x = 0; x < width; ++x) out[x] = low[static_cast<size_t>(x)] < t;
   return true;
+}
+
+float decoded_confidence(const CtcLine& d, const std::vector<std::string>& vocab, bool char_confidence) {
+  // read_line's sums, in its order
+  if (!char_confidence) {
+    double sum = 0;
+    for (float p : d.probs) sum += p;
+    return d.ids.empty() ? 0.0f : static_cast<float>(sum / d.ids.size());
+  }
+  double sum = 0;
+  int64_t chars = 0;
+  for (size_t c = 0; c < d.ids.size(); ++c) {
+    const int32_t id = d.ids[c];
+    if (id <= 0 || static_cast<size_t>(id) >= vocab.size()) continue;
+    if (vocab[static_cast<size_t>(id)].find_first_not_of(" \t") == std::string::npos) continue;  // a space
+    sum += d.probs[c];
+    ++chars;
+  }
+  return chars ? static_cast<float>(sum / static_cast<double>(chars)) : 0.0f;
 }
 
 void read_line(OcrLine& line, const CtcLine& d, int32_t length, const CropRule& crop,

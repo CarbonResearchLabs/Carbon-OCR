@@ -450,8 +450,10 @@ class CudaModels final : public PipelineModels {
       if (!cpu_) cpu_ = cpu_pipeline_models(set_, cpu_o_, std::clamp(cpu_topology().default_workers(), 1, 4));
       cpu_->set_pages(host_pages_, {});
       cpu_->recognize(page_of, boxes, bw, crop, lines, lengths);
+      last_on_cpu_ = true;
       return;
     }
+    last_on_cpu_ = false;
     check(cudaSetDevice(gpu_), "cudaSetDevice");
     const cudaStream_t s = rec_s_.s;
     const int m = static_cast<int>(boxes.size()), h = crop.height, frames = bw / crop.frame_px;
@@ -476,6 +478,7 @@ class CudaModels final : public PipelineModels {
       rec_s_.sync();
       set_lengths(m, frames, crop, lengths);
       lines = ctc_collapse(ids_host_.as<int32_t>(), probs_host_.as<float>(), m, frames, lengths);
+      last_frames_ = frames;
     } else {
       const Shape out_shape = rec_->output_shapes({&in, 1})[0];  // [m, classes, frames]
       const std::vector<DeviceTensor> y = {{logits_.p, DType::kFloat32, out_shape}};
@@ -483,7 +486,75 @@ class CudaModels final : public PipelineModels {
       rec_s_.sync();
       set_lengths(m, static_cast<int>(out_shape[2]), crop, lengths);
       lines = cuda::ctc_greedy(logits_.as<float>(), m, classes_, static_cast<int>(out_shape[2]), lengths, s);
+      last_frames_ = static_cast<int>(out_shape[2]);
     }
+    last_lengths_ = lengths;
+  }
+
+  // The beam's candidates of lines of the last run, made on the GPU from what the run left there (the fused
+  // head's features, made logits for those lines alone, or the logits), only they copied back.
+  bool candidates(std::span<const int32_t> rows, int topk, std::vector<FrameCandidates>& out) override {
+    if (last_on_cpu_) return cpu_->candidates(rows, topk, out);
+    out.clear();
+    const int n = static_cast<int>(rows.size()), m = static_cast<int>(last_lengths_.size()), frames = last_frames_;
+    if (n == 0) return true;
+    const int k = std::clamp(topk, 0, std::min(classes_ - 1, 16));
+    check(cudaSetDevice(gpu_), "cudaSetDevice");
+    const cudaStream_t s = rec_s_.s;
+    beam_up_.reserve(static_cast<size_t>(3) * n * sizeof(int32_t));
+    int32_t* up = beam_up_.as<int32_t>();  // the rows, their frames, and 0 to n - 1 (the head's logits' own rows)
+    for (int j = 0; j < n; ++j) {
+      if (rows[j] < 0 || rows[j] >= m) {
+        throw Error("candidates: line " + std::to_string(rows[j]) + " of a run of " + std::to_string(m));
+      }
+      up[j] = rows[j];
+      up[n + j] = last_lengths_[static_cast<size_t>(rows[j])];
+      up[2 * n + j] = j;
+    }
+    beam_idx_.reserve(static_cast<size_t>(3) * n * sizeof(int32_t));
+    check(cudaMemcpyAsync(beam_idx_.p, up, static_cast<size_t>(3) * n * sizeof(int32_t), cudaMemcpyHostToDevice, s),
+          "beam rows");
+    const int32_t* d_rows = beam_idx_.as<int32_t>();
+    const float* logits = logits_.as<float>();
+    const int32_t* logit_rows = d_rows;
+    if (fused_) {
+      beam_logits_.reserve(static_cast<size_t>(n) * classes_ * frames * sizeof(float));
+      cuda::ctc_head_logits(features_.p, head_w_.p, head_b_.as<float>(), d_rows, n, k_, classes_, frames,
+                            beam_logits_.as<float>(), s);
+      logits = beam_logits_.as<float>();
+      logit_rows = d_rows + 2 * n;
+    }
+    const size_t cells = static_cast<size_t>(n) * frames * std::max(k, 1);
+    beam_ids_.reserve(cells * sizeof(int32_t));
+    beam_logp_.reserve(cells * sizeof(float));
+    beam_blank_.reserve(static_cast<size_t>(n) * frames * sizeof(float));
+    cuda::ctc_topk(logits, classes_, frames, logit_rows, d_rows + n, n, k, beam_ids_.as<int32_t>(),
+                   beam_logp_.as<float>(), beam_blank_.as<float>(), s);
+    beam_ids_host_.reserve(beam_ids_.bytes);
+    beam_logp_host_.reserve(beam_logp_.bytes);
+    beam_blank_host_.reserve(beam_blank_.bytes);
+    const size_t got = static_cast<size_t>(n) * frames * k;
+    check(cudaMemcpyAsync(beam_ids_host_.p, beam_ids_.p, got * sizeof(int32_t), cudaMemcpyDeviceToHost, s), "beam ids");
+    check(cudaMemcpyAsync(beam_logp_host_.p, beam_logp_.p, got * sizeof(float), cudaMemcpyDeviceToHost, s),
+          "beam log-probabilities");
+    check(cudaMemcpyAsync(beam_blank_host_.p, beam_blank_.p, static_cast<size_t>(n) * frames * sizeof(float),
+                          cudaMemcpyDeviceToHost, s),
+          "beam blanks");
+    rec_s_.sync();
+    const int32_t* ids = beam_ids_host_.as<int32_t>();
+    const float* logp = beam_logp_host_.as<float>();
+    const float* blank = beam_blank_host_.as<float>();
+    for (int j = 0; j < n; ++j) {  // each line's own frames, from rows `frames` apart
+      FrameCandidates f;
+      f.frames = std::clamp(up[n + j], 0, frames);
+      f.k = k;
+      const size_t at = static_cast<size_t>(j) * frames * k, cut = static_cast<size_t>(f.frames) * k;
+      f.ids.assign(ids + at, ids + at + cut);
+      f.logp.assign(logp + at, logp + at + cut);
+      f.blank.assign(blank + static_cast<size_t>(j) * frames, blank + static_cast<size_t>(j) * frames + f.frames);
+      out.push_back(std::move(f));
+    }
+    return true;
   }
 
  private:
@@ -647,6 +718,12 @@ class CudaModels final : public PipelineModels {
   std::thread uploader_;  // started last in the constructor, so a constructor that throws has none to join
   Pinned ids_host_, probs_host_, widths_host_;
   std::vector<cuda::DevicePage> device_pages_;
+  // the last recognize run, for the beam's candidates
+  bool last_on_cpu_ = false;
+  int last_frames_ = 0;
+  std::vector<int32_t> last_lengths_;
+  DeviceMem beam_idx_, beam_logits_, beam_ids_, beam_logp_, beam_blank_;
+  Pinned beam_up_, beam_ids_host_, beam_logp_host_, beam_blank_host_;
 };
 
 }  // namespace

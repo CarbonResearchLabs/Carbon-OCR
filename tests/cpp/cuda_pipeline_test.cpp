@@ -12,7 +12,9 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
+#include <memory>
 #include <vector>
 
 #include "carbon/deskew.h"
@@ -102,6 +104,54 @@ TEST(CudaPipeline, ReadsPagesAsTheCpuDeviceDoesAtEveryPrecision) {
     }
     EXPECT_GE(pipe.stats().pages_per_detect_run(), 1.0);
   }
+}
+
+// Counts its calls from any thread; every class alike (ln 0.2).
+class Counting : public LanguageModel {
+ public:
+  uint64_t start() const override { return 1; }
+  float score(uint64_t state, int32_t c, uint64_t& next) const override {
+    calls.fetch_add(1);
+    next = state * 1315423911u + static_cast<uint64_t>(c);
+    return -1.609438f;
+  }
+  mutable std::atomic<int64_t> calls{0};
+};
+
+// The beam (EngineOptions::beam) on every line, its candidates from the GPU (cuda::ctc_topk; the wide line's from
+// the CPU device it is read on): the lines the CPU device's beam reads, a language model asked on both.
+TEST(CudaPipeline, ReadsUnsureLinesByTheBeamAsTheCpuDeviceDoes) {
+  if (!cuda_pipeline_available()) GTEST_SKIP() << "no GPU, or no TensorRT in this build";
+  const GrayImage page = load_image(kSet / "page.png");
+  const GrayImage tiny = tiny_page();
+  const GrayImage wide = wide_line_page();
+  const GrayView kinds[] = {page.view(), tiny.view(), wide.view()};
+  std::vector<GrayView> pages;
+  for (int i = 0; i < 9; ++i) pages.push_back(kinds[i % 3]);
+  auto beamed = [](PipelineOptions o, std::shared_ptr<const LanguageModel> lm) {
+    o.engine.beam.width = 8;
+    o.engine.beam.gate = 2.0f;  // every line
+    o.engine.beam.alpha = 0.2f;
+    o.engine.language_model = std::move(lm);
+    return o;
+  };
+  PipelineOptions cpu;
+  cpu.device = Device::kCpu;
+  auto lm_cpu = std::make_shared<Counting>();
+  const std::vector<OcrPage> want = Pipeline(kSet, beamed(cpu, lm_cpu)).ocr(pages);
+  auto lm_gpu = std::make_shared<Counting>();
+  Pipeline pipe(kSet, beamed(gpu_options(Precision::kFp32, true), lm_gpu));
+  const std::vector<OcrPage> got = pipe.ocr(pages);
+  ASSERT_EQ(got.size(), want.size());
+  for (size_t p = 0; p < got.size(); ++p) {
+    ASSERT_EQ(got[p].lines.size(), want[p].lines.size()) << "page " << p;
+    for (size_t i = 0; i < got[p].lines.size(); ++i) {
+      EXPECT_EQ(got[p].lines[i].text, want[p].lines[i].text) << "page " << p << " line " << i;
+      EXPECT_NEAR(got[p].lines[i].confidence, want[p].lines[i].confidence, 1e-3);
+    }
+  }
+  EXPECT_GT(lm_cpu->calls.load(), 0);
+  EXPECT_GT(lm_gpu->calls.load(), 0);
 }
 
 TEST(CudaPipeline, Fp16NeedsTheTrunkAndFusedHead) {

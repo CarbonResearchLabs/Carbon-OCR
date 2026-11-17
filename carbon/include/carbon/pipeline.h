@@ -130,6 +130,15 @@ class PipelineModels {
   // frame_px, at most the model's frames).
   virtual void recognize(std::span<const int32_t> page_of, std::span<const LineBox> boxes, int bw,
                          const CropRule& crop, std::vector<CtcLine>& lines, std::vector<int32_t>& lengths) = 0;
+  // The beam's candidates (carbon/beam.h) of the lines rows[j] of the last recognize run (asked before the next):
+  // each its frames' topk likeliest classes but the blank, and the blank, over its own frames (the run's
+  // lengths). False: this device gives none, and those lines keep their greedy decoding (the default).
+  virtual bool candidates(std::span<const int32_t> rows, int topk, std::vector<FrameCandidates>& out) {
+    (void)rows;
+    (void)topk;
+    (void)out;
+    return false;
+  }
 };
 
 class Pipeline {

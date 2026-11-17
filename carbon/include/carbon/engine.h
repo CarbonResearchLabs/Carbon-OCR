@@ -31,6 +31,7 @@
 #include <string_view>
 #include <vector>
 
+#include "carbon/beam.h"
 #include "carbon/detect.h"
 #include "carbon/image.h"
 #include "carbon/lines.h"
@@ -179,6 +180,12 @@ struct EngineOptions {
   // (the default).
   double det_pitch = 0;
   DetRule det;
+  // The CTC prefix beam for the lines the recognizer is unsure of (carbon/beam.h): a line whose
+  // confidence (as above: read_line's) is under beam.gate read again over its frames' beam.topk likeliest classes,
+  // scored with language_model where one is given (beam.alpha its weight, beam.beta a character's bonus). Every
+  // line is decoded greedily first; the rest keep it. beam.width under 2: off (the default), every line greedy.
+  BeamRule beam;
+  std::shared_ptr<const LanguageModel> language_model;
   // The crop rule the recognizer reads lines by. A recognizer that carries its own (its ONNX
   // file's carbon.crop.height, pad_v and pad_h, written at export) sets those three.
   CropRule crop;

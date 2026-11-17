@@ -5,6 +5,7 @@ add_library(carbon
   src/tensor.cpp
   src/session.cpp
   src/lines.cpp
+  src/beam.cpp
   src/detect.cpp
   src/det_head.cpp
   src/engine.cpp
@@ -67,7 +68,7 @@ carbon_warnings(carbon_serve)
 
 if(CARBON_WITH_CUDA)
   target_sources(carbon PRIVATE src/cuda/lines.cu src/cuda/ctc_head.cu src/cuda/detect.cu
-                 src/cuda/pipeline.cu)
+                 src/cuda/pipeline.cu src/cuda/beam.cu)
   # -fmad=false: the same rounding as the CPU code, so the crops are the same bytes.
   set_source_files_properties(src/cuda/lines.cu PROPERTIES COMPILE_OPTIONS -fmad=false)
   target_link_libraries(carbon PRIVATE CUDA::cudart_static)

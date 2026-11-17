@@ -169,7 +169,10 @@ struct Args {
   std::string spaces = "model";         // ocr, serve: spaces as the recognizer reads them, or borne out by the ink
   std::string block_order = "geometry";  // ocr, serve: the order model's blocks by geometry, or as the model gave them
   std::optional<double> second_pass_share, single_pixel;  // ocr, serve: carbon::DetRule's, where given (0: off)
-  std::string out_dir;               // ocr --format page: a file a page here
+  int beam = 0;  // ocr, serve: the CTC prefix beam's width for unsure lines (carbon::BeamRule); under 2: off
+  int beam_topk = carbon::BeamRule{}.topk;
+  float beam_gate = carbon::BeamRule{}.gate;
+  std::string out_dir;              // ocr --format page: a file a page here
   std::string output;                // ocr: the file to write (pdf needs one); empty: standard output
   std::string text_out;              // ocr: also the pages' text, to this file
   bool text_only = false;            // ocr --format pdf: the text layer alone, no images
@@ -196,6 +199,7 @@ struct Args {
                "                        [--hybrid auto|off] [--second-pass auto|off] [--gate auto|off]\n"
                "                        [--block-order geometry|model] [--second-pass-share F] [--single-pixel F]\n"
                "                        [--table-spans on|off] [--spaces model|ink]\n"
+               "                        [--beam N] [--beam-gate F] [--beam-topk N]\n"
                "                        [--format text|json|hocr|alto|page|markdown|html|pdf] [--out-dir DIR]\n"
                "                        [--output FILE] [--text-out FILE] [--text-only] [--image-dpi N]\n"
                "                        [--as-given] [--device cpu|cuda] [--batch N] [--in-flight N]\n"
@@ -359,6 +363,16 @@ Args parse(int argc, char** argv) {
     } else if (arg == "--block-order") {
       a.block_order = value();
       if (a.block_order != "geometry" && a.block_order != "model") usage("--block-order takes geometry or model");
+    } else if (arg == "--beam") {
+      a.beam = to_int(arg, value(), 0);
+    } else if (arg == "--beam-topk") {
+      a.beam_topk = to_int(arg, value(), 1);
+    } else if (arg == "--beam-gate") {
+      const std::string v = value();
+      char* end = nullptr;
+      const double x = std::strtod(v.c_str(), &end);
+      if (end == v.c_str() || *end || !(x >= 0 && x <= 2)) usage(arg + " takes a number from 0 to 2");
+      a.beam_gate = static_cast<float>(x);
     } else if (arg == "--second-pass-share" || arg == "--single-pixel") {
       const std::string v = value();
       char* end = nullptr;
@@ -1163,6 +1177,9 @@ carbon::EngineOptions engine_options(const Args& a) {
   o.blocks_by_geometry = a.block_order == "geometry";
   o.table_spans = a.table_spans != "off";
   if (a.spaces == "ink") o.spaces = carbon::SpaceRule{};  // unsure spaces the ink does not bear out dropped
+  o.beam.width = a.beam;  // under 2: off
+  o.beam.topk = a.beam_topk;
+  o.beam.gate = a.beam_gate;
   if (a.second_pass_share) o.det.second_pass_share = *a.second_pass_share;
   if (a.single_pixel) o.det.single_pixel = static_cast<float>(*a.single_pixel);
   if (a.as_given) {  // the page as given (OCRmyPDF turns and deskews pages itself, and grafts the text back)

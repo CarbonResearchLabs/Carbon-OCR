@@ -25,6 +25,7 @@
 #include <tuple>
 #include <vector>
 
+#include "carbon/beam.h"
 #include "carbon/detect.h"
 #include "carbon/engine.h"
 #include "carbon/output.h"
@@ -346,7 +347,8 @@ NB_MODULE(carbon_ocr, m) {
              const std::string& block_order, float single_pixel, double second_pass_share, bool table_spans,
              bool share_sessions, double bucket_ratio, bool spaces_from_ink, int64_t det_area,
              double second_pass_target, bool justified, bool flip_needs_dark, bool char_confidence,
-             bool word_boxes_at_ink, bool fused_rec_head, bool det_stem, double det_pitch) {
+             bool word_boxes_at_ink, bool fused_rec_head, bool det_stem, double det_pitch, int beam_width,
+             int beam_topk, float beam_gate, float beam_blank_skip) {
             carbon::EngineOptions o;
             o.pool.workers = workers;
             o.pool.pin = pin;
@@ -374,6 +376,10 @@ NB_MODULE(carbon_ocr, m) {
             o.fused_rec_head = fused_rec_head;
             o.det_stem = det_stem;
             o.det_pitch = det_pitch;
+            o.beam.width = beam_width;
+            o.beam.topk = beam_topk;
+            o.beam.gate = beam_gate;
+            o.beam.blank_skip = beam_blank_skip;
             new (e) carbon::Engine(set, o);
           },
           "set"_a, "workers"_a = 0, "pin"_a = true, "rec"_a = "rec-latin", "order_model"_a = nb::none(),
@@ -382,6 +388,8 @@ NB_MODULE(carbon_ocr, m) {
           "table_spans"_a = true, "share_sessions"_a = true, "bucket_ratio"_a = 1.3, "spaces_from_ink"_a = false, "det_area"_a = 0,
           "second_pass_target"_a = 0.0, "justified"_a = false, "flip_needs_dark"_a = true, "char_confidence"_a = true,
           "word_boxes_at_ink"_a = false, "fused_rec_head"_a = false, "det_stem"_a = false, "det_pitch"_a = 0.0,
+          "beam_width"_a = carbon::BeamRule{}.width, "beam_topk"_a = carbon::BeamRule{}.topk,
+          "beam_gate"_a = carbon::BeamRule{}.gate, "beam_blank_skip"_a = carbon::BeamRule{}.blank_skip,
           "A Fullerene set's directory (orient.onnx, det.onnx, <rec>.onnx, <rec>.vocab.json, and order.native.bin "
           "or order.onnx where it has one; order_model another); workers 0 is one per physical core. precision: "
           "the models' files, \"auto\" (the fastest the set has), \"fp32\", \"fp16\" or \"int8\" "
@@ -389,7 +397,9 @@ NB_MODULE(carbon_ocr, m) {
           "line. block_order: the order model's blocks ordered by \"geometry\" (carbon::EngineOptions::"
           "blocks_by_geometry) or as the \"model\" gave them. single_pixel, second_pass_share: "
           "carbon::DetRule's (0 for neither). table_spans: the order model's tables laid out again with their "
-          "spans (carbon::EngineOptions::table_spans).")
+          "spans (carbon::EngineOptions::table_spans). beam_width, beam_topk, beam_gate, beam_blank_skip: the CTC "
+          "prefix beam for the lines under the gate (carbon::EngineOptions::beam, carbon/beam.h); a width under 2 is "
+          "off.")
       .def_prop_ro("workers", &carbon::Engine::workers)
       .def(
           "ocr",
@@ -859,6 +869,41 @@ NB_MODULE(carbon_ocr, m) {
       },
       "logits"_a, "lengths"_a,
       "CTC greedy decoding of logits [n, classes, frames]: per line (ids, start frames, probabilities).");
+
+  m.def(
+      "ctc_beam",
+      [](nb::ndarray<const float, nb::ndim<3>, nb::c_contig, nb::device::cpu> logits,
+         nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> lengths, int width, int topk,
+         float blank_skip, float alpha, float beta) {
+        const int n = static_cast<int>(logits.shape(0)), c = static_cast<int>(logits.shape(1)),
+                  t = static_cast<int>(logits.shape(2));
+        if (static_cast<int>(lengths.shape(0)) < n) throw carbon::Error("ctc_beam: lengths is shorter than the batch");
+        carbon::BeamRule r;
+        r.width = width;
+        r.topk = topk;
+        r.blank_skip = blank_skip;
+        r.alpha = alpha;
+        r.beta = beta;
+        std::vector<carbon::CtcLine> lines(static_cast<size_t>(n));
+        std::vector<double> scores(static_cast<size_t>(n));
+        {
+          nb::gil_scoped_release unlocked;
+          for (int i = 0; i < n; ++i) {
+            const carbon::FrameCandidates f = carbon::frame_candidates(
+                logits.data() + static_cast<size_t>(i) * c * t, c, t, lengths.data()[i], std::min(topk, c - 1));
+            carbon::BeamLine b = carbon::ctc_beam(f, r);
+            lines[static_cast<size_t>(i)] = std::move(b.line);
+            scores[static_cast<size_t>(i)] = b.ctc;
+          }
+        }
+        return std::make_pair(to_python(std::move(lines)), std::move(scores));
+      },
+      "logits"_a, "lengths"_a, "width"_a = 8, "topk"_a = 5, "blank_skip"_a = 0.999f, "alpha"_a = 0.0f, "beta"_a = 0.0f,
+      "The engine's CTC prefix beam (carbon/beam.h) over logits [n, classes, frames] (or their log-softmax), line i "
+      "its first lengths[i] frames, each frame's topk likeliest classes but the blank (at most classes - 1) and the "
+      "blank; no language model, so alpha and beta weigh none but beta's bonus a character. Width 1 is greedy. "
+      "Returns (lines, scores): per line (ids, start frames, probabilities) as ctc_greedy's, and its ln P over the "
+      "frames' candidates.");
 
   m.def(
       "ctc_collapse",

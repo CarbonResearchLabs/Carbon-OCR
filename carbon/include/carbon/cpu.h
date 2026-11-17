@@ -323,6 +323,19 @@ PackedHead pack_rec_head(const float* w, const float* b, int k, int classes);  /
 // every version gives the reference's bits. Vectors along the frames: avx2 for every x86-64 set; the reference else.
 void ctc_head(const float* features, int k, int frames, int t_n, const PackedHead& head, int32_t* ids, float* probs,
               Isa isa = best_isa());
+// The same head's logits for one line, written: logits[c][t] for its first t_n frames (rows `frames` apart; the
+// columns past t_n are not written), the same bits as ctc_head sums them (so its argmax is ctc_head's ids). The
+// beam's (carbon/beam.h): the few lines it reads again, whose frames' candidates need every class's logit.
+void rec_head_logits(const float* features, int k, int frames, int t_n, const PackedHead& head, float* logits,
+                     Isa isa = best_isa());
+
+// The beam's candidates (carbon/beam.h, frame_candidates): from one line's logits [classes][frames], its first t_n
+// frames, each frame's k likeliest classes but the blank, best first (ties to the lower id), ids[t * k + j], with
+// their log-probabilities logp[t * k + j], and the blank's, blank[t]: each the logit less the frame's best and ln of
+// ctc_argmax's sum (the same exp_neg terms in class order), so exp of the best class's is ctc_argmax's probability.
+// k from 0 to classes - 1. Vectors along the frames: avx2 for every x86-64 set (the same bits); the reference else.
+void ctc_topk(const float* logits, int classes, int frames, int t_n, int k, int32_t* ids, float* logp, float* blank,
+              Isa isa = best_isa());
 
 // det_head: the line detector's head (fullerene det) in one pass.  From x[in][h4][w4] (the FPN's stride-4 features):
 // a 1x1 convolution to `mid` channels and ReLU, a nearest 2x upsample, a depthwise 3x3 (padding 1) and ReLU, and a

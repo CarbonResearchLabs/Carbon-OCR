@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -97,6 +98,67 @@ TEST(BatchPipeline, ReadsPagesAsTheEngineDoes) {
   EXPECT_TRUE(got[3].second_pass);
   EXPECT_EQ(got[3].lines.size(), 6u);
   EXPECT_GT(got[3].ms.second_pass, 0.0);
+}
+
+// A language model that dislikes every class but the blank's neighbours alike: each class costs ln 0.2, the line's
+// end ln 0.5. It counts its calls, from any thread.
+class Counting : public LanguageModel {
+ public:
+  uint64_t start() const override { return 1; }
+  float score(uint64_t state, int32_t c, uint64_t& next) const override {
+    calls.fetch_add(1);
+    next = state * 1315423911u + static_cast<uint64_t>(c);
+    return std::log(0.2f);
+  }
+  float end(uint64_t) const override { return std::log(0.5f); }
+  mutable std::atomic<int64_t> calls{0};
+};
+
+// The beam (EngineOptions::beam) on the lines under its gate: the pipeline reads them as the engine does (its
+// candidates from the device, the beam on a CPU thread), with a language model and without; clear lines read as
+// greedy; a gate of 0 sends none to it.
+TEST(BatchPipeline, ReadsUnsureLinesByTheBeamAsTheEngineDoes) {
+  const GrayImage page = load_image(kSet / "page.png");
+  const GrayImage tiny = tiny_page();
+  const GrayView kinds[] = {page.view(), tiny.view()};
+  std::vector<GrayView> pages;
+  for (int i = 0; i < 6; ++i) pages.push_back(kinds[i % 2]);
+  EngineOptions plain;
+  plain.pool.workers = 2;
+  const std::vector<OcrPage> greedy = Engine(kSet, plain).ocr(pages);
+  for (const bool with_lm : {false, true}) {
+    EngineOptions eo = plain;
+    eo.beam.width = 8;
+    eo.beam.gate = 2.0f;  // every line read again
+    auto lm = std::make_shared<Counting>();
+    if (with_lm) {
+      eo.language_model = lm;
+      eo.beam.alpha = 0.3f;
+      eo.beam.beta = 0.1f;
+    }
+    const std::vector<OcrPage> want = Engine(kSet, eo).ocr(pages);
+    const int64_t engine_calls = lm->calls.load();
+    PipelineOptions po = cpu_options();
+    po.engine = eo;
+    const std::vector<OcrPage> got = Pipeline(kSet, po).ocr(pages);
+    ASSERT_EQ(got.size(), pages.size());
+    for (size_t i = 0; i < got.size(); ++i) expect_same(got[i], want[i], static_cast<int>(i));
+    if (with_lm) {
+      EXPECT_GT(engine_calls, 0);
+      EXPECT_EQ(lm->calls.load(), 2 * engine_calls);  // the pipeline's beam asked it as much as the engine's
+    } else {
+      for (size_t i = 0; i < got.size(); ++i) EXPECT_EQ(got[i].text(), greedy[i].text()) << "page " << i;
+    }
+  }
+  EngineOptions none = plain;
+  none.beam.width = 8;
+  none.beam.gate = 0.0f;
+  auto lm = std::make_shared<Counting>();
+  none.language_model = lm;
+  none.beam.alpha = 1.0f;
+  const std::vector<OcrPage> same = Engine(kSet, none).ocr(pages);
+  EXPECT_EQ(lm->calls.load(), 0);
+  for (size_t i = 0; i < same.size(); ++i) expect_same(same[i], greedy[i], static_cast<int>(i));
 }
 
 // Many pages in flight: a detection run holds several pages of a size, a

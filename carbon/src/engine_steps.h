@@ -6,6 +6,7 @@
 // tables.
 #pragma once
 
+#include <algorithm>
 #include <functional>
 #include <optional>
 #include <span>
@@ -99,6 +100,27 @@ void place_detection(const Detection& first, const GrayView& upright, int dw, in
 void read_line(OcrLine& line, const CtcLine& d, int32_t length, const CropRule& crop,
                const std::vector<std::string>& vocab, const uint8_t* ink = nullptr, int ink_width = 0,
                const SpaceRule* spaces = nullptr, bool char_confidence = false, bool words_at_ink = false);
+
+// The confidence read_line gives a line from its decoding, without reading it: the mean probability of its
+// characters, its spaces left out (char_confidence), or of every id the decoder kept; 0 with none. The beam's gate.
+float decoded_confidence(const CtcLine& d, const std::vector<std::string>& vocab, bool char_confidence);
+
+// The lines of a recognition run under the beam's gate (EngineOptions::beam) read again: for each line i of the
+// run whose decoded[i] is under it, logits_of(i, scratch) its logits [classes][frames] (null: not read again),
+// and decoded[i] the beam's. Nothing where the beam is off.
+template <class LogitsOf>
+void beam_lines(std::vector<CtcLine>& decoded, std::span<const int32_t> lengths, int classes, int frames,
+                const EngineOptions& o, const std::vector<std::string>& vocab, LogitsOf&& logits_of) {
+  if (!o.beam.on() || classes < 2) return;
+  std::vector<float> scratch;
+  for (size_t i = 0; i < decoded.size(); ++i) {
+    if (decoded_confidence(decoded[i], vocab, o.char_confidence) >= o.beam.gate) continue;
+    const float* logits = logits_of(i, scratch);
+    if (!logits) continue;
+    const FrameCandidates f = frame_candidates(logits, classes, frames, lengths[i], std::min(o.beam.topk, classes - 1));
+    decoded[i] = ctc_beam(f, o.beam, o.language_model.get()).line;
+  }
+}
 
 // A crop's columns that hold ink (SpaceRule): out[x] 1 or 0 for x < width, of an h-row crop `stride` bytes a row;
 // false (out untouched) where the crop's contrast is under 32 levels.
