@@ -56,6 +56,10 @@ struct SplitRule {
   // `space`, and a line of one gap splits only at `always`, so a narrow justified column's wide spaces do not
   // split its lines. False: `space` (the default).
   bool justified = false;
+  // A line's first word that is a list's bullet alone (GateRule::bullet_join puts a lone one there) stays with the
+  // word after it within this many line heights, however wide its spaces say the gap is (0: it splits as any word).
+  // A dash is not held: it can be an empty cell's.
+  double marker = 2.5;
 };
 
 // Tables from geometry, for a page the order model gave no blocks: lines (split at
@@ -94,6 +98,9 @@ struct TableRule {
 //      first-column label over the rows next to it whose first cells are empty and which hold a number spans them,
 //      set at the top of its group where the first label has none above it, else in the middle (each row the
 //      nearer label's); a row whose first cell spans columns (a section's) bounds the groups.
+//   7. Header cells between two header rows: a header row each of whose cells takes only columns that neither the
+//      row above nor the row below has, its lines' middle between theirs (a "Route" and a "Year" beside a heading
+//      that spans the quarters, level with neither it nor the quarters), joins the row above, each cell two rows tall.
 // Each cell's lines are a line each in the writers' tables.
 struct GridRule {
   double merge_gap = 1.5;
@@ -133,6 +140,13 @@ struct GateRule {
   float lone_sure = 0.6f;
   double bullet_join = 2.5;
   double dash_cell = 1.0;
+  // After the split: a piece of at most overlap_chars characters whose box lies over another, longer line on its row
+  // by more than overlap_share of its own width is dropped (the detector found a rule's piece beside a cell, which
+  // the cell's line read already; a table's "d" beside "Homes served|"), and a | at a line's edge, beside its text,
+  // is taken off (edge_bars: a column rule the line took in, read as |; 0 keeps it).
+  int overlap_chars = 2;
+  double overlap_share = 0.2;
+  bool edge_bars = true;
 };
 
 // Spaces the recognizer read where the ink does not part the characters: a space whose
@@ -269,7 +283,9 @@ struct EngineOptions {
   std::filesystem::path lm;
   std::optional<float> lm_alpha, lm_beta;
   // A second model that rescores the beam's beam.width best readings of a line (carbon/tlm.h): rescorer where given,
-  // else this file, else the set's tlm-<group>.bin where it has one; "off": none. Each reading's score gains
+  // else this file, else, under lm_mode transformer or both, the set's tlm-<group>.bin (the beam set by hand, auto,
+  // reads with the set's n-gram alone: the transformer gains little over it at about four times the CPU's time);
+  // "off": none. Each reading's score gains
   // beam.rescore times its ln P after the line above it on the page, as read (or after the line's start where it
   // has none); a page's gated lines are rescored together once all its lines are read. tlm_alpha sets
   // beam.rescore (none: the file's tuned weight).
@@ -334,7 +350,7 @@ struct OcrPage {
   std::vector<LineBox> pictures;
   struct Dropped {            // a line the gate took for something other than text (GateRule)
     OcrLine line;
-    std::string why;          // "empty", "rules", "sliver", "picture", "lone"
+    std::string why;          // "empty", "rules", "sliver", "picture", "lone", "overlap"
   };
   std::vector<Dropped> dropped;
   PictureMask picture_mask;   // the detector's, for the gate while the page is read; cleared once it is

@@ -110,7 +110,9 @@ std::shared_ptr<NgramModel> NgramModel::open(const std::filesystem::path& file) 
     throw Error(what + ": not an n-gram model (CRBNGRM1)");
   }
   const NgramHeader* h = reinterpret_cast<const NgramHeader*>(d);
-  if (h->version != 1) throw Error(what + ": version " + std::to_string(h->version) + ", not 1");
+  if (h->version != 1 && h->version != 2) {
+    throw Error(what + ": version " + std::to_string(h->version) + ", not 1 or 2");
+  }
   if (h->order < 1 || h->order > kNgramMaxOrder) throw Error(what + ": order " + std::to_string(h->order));
   if (h->classes < 2 || h->bits != static_cast<uint32_t>(std::bit_width(h->classes))) {
     throw Error(what + ": " + std::to_string(h->classes) + " classes at " + std::to_string(h->bits) + " bits");
@@ -124,16 +126,29 @@ std::shared_ptr<NgramModel> NgramModel::open(const std::filesystem::path& file) 
     throw Error(what + ": its unigrams lie past its end");
   }
   m->h_ = h;
+  m->version_ = static_cast<int>(h->version);
   m->uni_ = reinterpret_cast<const NgramUnigram*>(d + u.offset);
+  if (m->version_ == 2) {
+    const uint64_t cb = h->codebooks, need = uint64_t{kNgramMaxOrder + 1} * 2 * kNgramCodes * sizeof(float);
+    if (cb % 8 || cb < sizeof(NgramHeader) || cb + need > size) throw Error(what + ": its codebooks lie past its end");
+    m->codes_ = reinterpret_cast<const float*>(d + cb);
+  }
   for (uint32_t n = 2; n <= h->order; ++n) {
     const NgramTable& t = h->tables[n];
-    if (t.capacity == 0 || !std::has_single_bit(t.capacity) || t.count >= t.capacity || t.offset % 16 ||
-        t.offset + t.capacity * sizeof(NgramEntry) > size) {
+    const uint64_t stride = m->version_ == 1 ? sizeof(NgramEntry) : n == h->order ? kNgramSlotTop : kNgramSlot;
+    const bool shape = m->version_ == 1 ? std::has_single_bit(t.capacity) && t.offset % 16 == 0 : t.offset % 8 == 0;
+    const uint64_t tail = m->version_ == 1 ? 0 : 8;
+    if (t.capacity == 0 || !shape || t.count >= t.capacity || t.capacity > (size - t.offset) / stride ||
+        t.offset + t.capacity * stride + tail > size) {
       throw Error(what + ": order " + std::to_string(n) + "'s table does not fit the file");
     }
-    m->tab_[n] = reinterpret_cast<const NgramEntry*>(d + t.offset);
-    m->mask_[n] = t.capacity - 1;
-    m->shift_[n] = 64 - std::countr_zero(t.capacity);
+    m->tab_[n] = d + t.offset;
+    m->cap_[n] = t.capacity;
+    m->stride_[n] = static_cast<uint32_t>(stride);
+    if (m->version_ == 1) {
+      m->mask_[n] = t.capacity - 1;
+      m->shift_[n] = 64 - std::countr_zero(t.capacity);
+    }
   }
   m->bits_ = static_cast<int>(h->bits);
   m->max_ctx_ = static_cast<int>(h->order) - 1;
@@ -143,20 +158,45 @@ std::shared_ptr<NgramModel> NgramModel::open(const std::filesystem::path& file) 
 
 size_t NgramModel::bytes() const { return map_->size; }
 
-inline const NgramEntry* NgramModel::slot(int n, uint64_t key) const {
-  return tab_[n] + (mask_[n] ? key >> shift_[n] : 0);
+inline const void* NgramModel::slot(int n, uint64_t key) const {
+  if (version_ == 1) return tab_[n] + (mask_[n] ? key >> shift_[n] : 0) * sizeof(NgramEntry);
+  return tab_[n] + ngram_home(key, cap_[n]) * stride_[n];
 }
 
-// Linear probing from the key's slot to the key or an empty slot (the tables are at most half full, so a probe
-// reads one or two cache lines).
-inline const NgramEntry* NgramModel::find(int n, uint64_t key) const {
-  const NgramEntry* base = tab_[n];
-  uint64_t i = mask_[n] ? key >> shift_[n] : 0;
+// Linear probing from the key's slot to the key or an empty slot. Version 1: full keys, the tables at most half
+// full. Version 2: tags, the tables at most `load` full; a slot read as 8 bytes (every table has 8 after it), its
+// tag the low 4, its codes the next 2 (order N: 1).
+inline bool NgramModel::lookup(int n, uint64_t key, float& logp, float& bow) const {
+  if (version_ == 1) {
+    const NgramEntry* base = reinterpret_cast<const NgramEntry*>(tab_[n]);
+    uint64_t i = mask_[n] ? key >> shift_[n] : 0;
+    for (;;) {
+      const NgramEntry* e = base + i;
+      if (e->key == key) {
+        logp = e->logp;
+        bow = e->bow;
+        return true;
+      }
+      if (e->key == 0) return false;
+      i = (i + 1) & mask_[n];
+    }
+  }
+  const uint8_t* base = tab_[n];
+  const uint64_t cap = cap_[n];
+  const uint32_t stride = stride_[n], tag = ngram_tag(key);
+  uint64_t i = ngram_home(key, cap);
   for (;;) {
-    const NgramEntry* e = base + i;
-    if (e->key == key) return e;
-    if (e->key == 0) return nullptr;
-    i = (i + 1) & mask_[n];
+    uint64_t w;
+    std::memcpy(&w, base + i * stride, sizeof(w));
+    const uint32_t t = static_cast<uint32_t>(w);
+    if (t == tag) {
+      const float* cb = codes_ + static_cast<size_t>(n) * 2 * kNgramCodes;
+      logp = cb[(w >> 32) & 0xff];
+      bow = stride == kNgramSlot ? cb[kNgramCodes + ((w >> 40) & 0xff)] : 0.0f;
+      return true;
+    }
+    if (t == 0) return false;
+    if (++i == cap) i = 0;
   }
 }
 
@@ -181,16 +221,17 @@ float NgramModel::score(uint64_t state, int32_t c, uint64_t& next) const {
   int k = std::min(len, max_ctx_);
   for (; k >= 1; --k) {
     const uint64_t ck = ctx & low_bits(k * bits_);
-    if (const NgramEntry* e = find(k + 1, ngram_key(ck, k, static_cast<uint32_t>(c)))) {
-      logp = bo + e->logp;
+    float lp = 0.0f, bw = 0.0f;
+    if (lookup(k + 1, ngram_key(ck, k, static_cast<uint32_t>(c)), lp, bw)) {
+      logp = bo + lp;
       matched = k + 1;
       break;
     }
     // back off: the context's own weight, the context an n-gram of order k
     if (k == 1) {
       bo += uni_[ck].bow;
-    } else if (const NgramEntry* b = find(k, ngram_key(ck >> bits_, k - 1, static_cast<uint32_t>(ck & token_mask_)))) {
-      bo += b->bow;
+    } else if (lookup(k, ngram_key(ck >> bits_, k - 1, static_cast<uint32_t>(ck & token_mask_)), lp, bw)) {
+      bo += bw;
     }
   }
   if (k == 0) logp = bo + uni_[c].logp;
@@ -255,14 +296,15 @@ void NgramModel::score_batch(std::span<const uint64_t> states, std::span<const i
     size_t kept = 0;
     for (size_t j = 0; j < q.size(); ++j) {
       Q x = q[j];
-      if (const NgramEntry* e = find(x.k + 1, x.key)) {
-        finish(x, x.bo + e->logp, x.k + 1);
+      float lp = 0.0f, bw = 0.0f;
+      if (lookup(x.k + 1, x.key, lp, bw)) {
+        finish(x, x.bo + lp, x.k + 1);
         continue;
       }
       if (x.k == 1) {
         x.bo += uni_[x.bkey].bow;
-      } else if (const NgramEntry* b = find(x.k, x.bkey)) {
-        x.bo += b->bow;
+      } else if (lookup(x.k, x.bkey, lp, bw)) {
+        x.bo += bw;
       }
       if (--x.k == 0) {
         finish(x, x.bo + uni_[x.c].logp, 1);

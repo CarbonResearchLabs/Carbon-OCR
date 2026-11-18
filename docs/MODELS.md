@@ -322,7 +322,7 @@ Which files each path opens:
 |---|---|
 | the CPU engine (`carbon::Engine`, `Pipeline` on the CPU) | `orient`, `det` and the recognizer as `.int8.onnx` where the set has it, else `.onnx`; `det.onnx` too, for detection on several threads; `<rec>.vocab.json`; `order.native.bin`, else `order.onnx` (without either, the XY-cut) |
 | the GPU pipeline (`Pipeline` on CUDA) | at `--precision auto`, the default: `orient.fp16.onnx` and `det.fp16.onnx` (else their `.onnx`), `<rec>.features.fp16.onnx` and `<rec>.head.bin` (else `<rec>.onnx`); at `fp32` the `.onnx` files, at `int8` the `.int8-sym.onnx` files; `<rec>.vocab.json`; the order model as on the CPU |
-| the language models, either path, with the beam on (`--lm-mode`, or `--beam`) | `lm-<group>.bin` and `tlm-<group>.bin`, the group the recognizer's name after `rec-` (`latin` for `rec-latin`), each where the set has it; `--lm` and `--tlm` name other files (`tlm-latin.fp16.bin`, say) |
+| the language models, either path, with the beam on (`--lm-mode`, or `--beam`) | `lm-<group>.bin` and `tlm-<group>.bin`, the group the recognizer's name after `rec-` (`latin` for `rec-latin`), each where the set has it and the mode names it (`--beam` alone: `lm-<group>.bin`); `--lm` and `--tlm` name other files (`tlm-latin.fp16.bin`, say) |
 
 ## <img src="assets/chip-10.svg" height="22" alt=""> The metadata and checks the engine reads
 

@@ -962,6 +962,7 @@ NB_MODULE(carbon_ocr, m) {
           [](const carbon::NgramModel& lm) {
             const carbon::NgramHeader& h = lm.header();
             nb::dict d;
+            d["version"] = h.version;
             d["order"] = h.order;
             d["classes"] = h.classes;
             d["vocab_hash"] = h.vocab_hash;

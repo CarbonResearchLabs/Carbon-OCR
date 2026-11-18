@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <utility>
@@ -220,7 +221,7 @@ struct Lines {
         cells.push_back(std::move(cell));
       }
     }
-    row_labels(cells, static_cast<int>(joined.size()));
+    row_labels(cells, header_spans(cells, static_cast<int>(joined.size())));
     for (OcrCell& c : cells) {
       std::stable_sort(c.lines.begin(), c.lines.end(), [&](int a, int b) {
         return centre_y(box(a)) != centre_y(box(b)) ? centre_y(box(a)) < centre_y(box(b)) : box(a).x0 < box(b).x0;
@@ -229,6 +230,62 @@ struct Lines {
     std::stable_sort(cells.begin(), cells.end(),
                      [](const OcrCell& x, const OcrCell& y) { return x.row != y.row ? x.row < y.row : x.col < y.col; });
     return cells;
+  }
+
+  // GridRule 7: header cells set between two header rows span both: a heading such as "Route" or "Year" beside a
+  // heading that spans columns, level with neither it nor the headings under it. A header row (one above the first
+  // row that holds a number) each of whose cells takes only columns that neither the row above nor the row below
+  // has, and whose lines' middle lies between theirs, joins the row above, each of its cells two rows tall. The
+  // rows after it move up one. Returns the rows left.
+  int header_spans(std::vector<OcrCell>& cells, int nrows) const {
+    std::vector<char> value(static_cast<size_t>(nrows), 0);
+    for (const OcrCell& c : cells) {
+      for (int i : c.lines) value[static_cast<size_t>(c.row)] |= number(i);
+    }
+    int data = 0;
+    while (data < nrows && !value[static_cast<size_t>(data)]) ++data;
+    auto covers = [&](int r, int col) {  // a cell of row r, or one spanning down into it, over this column
+      for (const OcrCell& c : cells) {
+        if (c.row <= r && r < c.row + c.row_span && col >= c.col && col < c.col + c.col_span) return true;
+      }
+      return false;
+    };
+    auto middle = [&](int r) {  // the mean middle of the lines of row r's own cells
+      double s = 0;
+      int n = 0;
+      for (const OcrCell& c : cells) {
+        if (c.row != r) continue;
+        for (int i : c.lines) {
+          s += centre_y(box(i));
+          ++n;
+        }
+      }
+      return n ? s / n : std::numeric_limits<double>::quiet_NaN();
+    };
+    for (int r = 1; r + 1 < data;) {
+      bool apart = true, any = false;
+      for (const OcrCell& c : cells) {
+        if (c.row != r) continue;
+        any = true;
+        for (int k = c.col; k < c.col + c.col_span && apart; ++k) apart = !covers(r - 1, k) && !covers(r + 1, k);
+      }
+      const double above = middle(r - 1), here = middle(r), below = middle(r + 1);
+      if (!any || !apart || !(above < here && here < below)) {
+        ++r;
+        continue;
+      }
+      for (OcrCell& c : cells) {
+        if (c.row == r) {
+          c.row = r - 1;
+          c.row_span = 2;
+        } else if (c.row > r) {
+          --c.row;
+        }
+      }
+      --nrows;
+      --data;
+    }
+    return nrows;
   }
 
   // GridRule 6: a first-column label over the data rows next to it whose first cells are empty (rows that hold a

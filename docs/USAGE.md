@@ -51,10 +51,10 @@ By default the pages run in parallel on the CPU, one worker per physical core. `
 | `--table-spans on\|off` | `on` | with `--grid off`, the order model's tables with their spanning cells (`colspan`, `rowspan`) |
 | `--blocks-first on\|off` | `off` | the order model's blocks as its same-block scores' clusters, not the runs of its order |
 | `--spaces model\|ink` | `model` | `ink`: drop a space the recognizer is unsure of where the line's ink shows no gap (the CPU only) |
-| `--beam N` | 0 | read the lines the recognizer is unsure of again by a CTC prefix beam of N prefixes (8 is the width to ask for), with the set's language models where it ships them; under 2: off, every line greedy |
+| `--beam N` | 0 | read the lines the recognizer is unsure of again by a CTC prefix beam of N prefixes (8 is the width to ask for), with the set's n-gram where it ships one (the transformer only with `--tlm` or an `--lm-mode` that names it); under 2: off, every line greedy |
 | `--beam-gate F` | 0.9 | the confidence under which a line goes to the beam; 0: none, 2: every line |
 | `--beam-topk N` | 5 | the classes each frame offers the beam besides the blank |
-| `--lm-mode auto\|none\|ngram\|transformer\|both` | `auto` | the language models as one switch. `ngram`: the lines under the gate read again by a beam of 8 with the set's n-gram (`lm-<group>.bin`); `transformer`: the beam's best readings rescored by the set's transformer (`tlm-<group>.bin`), each after the line above it; `both`: the two. Each model at the weights and gate tuned into its file; a mode whose model the set lacks is an error. `none`: greedy; `auto`: as `--beam`, `--lm` and `--tlm` set it |
+| `--lm-mode auto\|none\|ngram\|transformer\|both` | `auto` | the language models as one switch. `ngram`: the lines under the gate read again by a beam of 8 with the set's n-gram (`lm-<group>.bin`); `transformer`: the beam's best readings rescored by the set's transformer (`tlm-<group>.bin`), each after the line above it; `both`: the two. Each model at the weights and gate tuned into its file; a mode whose model the set lacks is an error. `none`: greedy; `auto`: as `--beam`, `--lm` and `--tlm` set it (`--beam` alone: the set's n-gram; the transformer only from `--tlm`) |
 | `--lm-gate F` | the file's | under a mode, the confidence under which a line goes to the beam, 0 to 2 |
 | `--lm FILE\|off` | the set's | the n-gram the beam reads with; `off`: none |
 | `--lm-alpha F`, `--lm-beta F` | the file's | the n-gram's weight, and a bonus a character |

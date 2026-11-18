@@ -629,6 +629,41 @@ TEST(Gate, DropsPiecesReadOutOfPicturesAndLoneMarks) {
   EXPECT_EQ(p.dropped[1].why, "lone");
 }
 
+// A table's column rules, as the demo's page of tables read them (docs/DEMO.md): a cell's line that took in the
+// rule beside it ("Homes served|", "6,420 |") loses the bar, its words and box with it; a piece of the rule the
+// detector found apart, over the cell's line, read as "d", is dropped; a one-letter cell clear of its neighbours,
+// and a bar inside a line, stay.
+TEST(Gate, ColumnRulesTakenOffCells) {
+  OcrPage p;
+  p.width = p.height = 1700;
+  OcrLine served = gate_line({403, 385, 577, 422}, "Homes served|", 0.96f, 0.5f);
+  served.words = {{{403, 385, 480, 422}, "Homes", 0.99f}, {{490, 385, 577, 422}, "served|", 0.93f}};
+  OcrLine count = gate_line({511, 438, 585, 471}, "6,420 |", 0.998f, 0.9f);
+  count.words = {{{511, 438, 570, 471}, "6,420", 0.999f}, {{580, 438, 585, 471}, "|", 0.99f}};
+  p.lines = {served,
+             gate_line({571, 388, 585, 419}, "d", 0.956f, 0.9f),     // the rule's piece, over "served|"
+             count,
+             gate_line({700, 438, 714, 471}, "P", 0.9f, 0.9f),       // a cell of one letter, clear of the others
+             gate_line({800, 438, 1000, 471}, "a | b", 0.95f, 0.9f)};  // a bar between words: the text's
+  detail::gate_pieces(p, GateRule{});
+  EXPECT_EQ(texts_of(p.lines), (std::vector<std::string>{"Homes served", "6,420", "P", "a | b"}));
+  ASSERT_EQ(p.dropped.size(), 1u);
+  EXPECT_EQ(p.dropped[0].why, "overlap");
+  EXPECT_EQ(p.dropped[0].line.text, "d");
+  EXPECT_EQ(p.lines[0].words.back().text, "served");
+  ASSERT_EQ(p.lines[1].words.size(), 1u);  // the bar's word gone, the box to the number's edge
+  EXPECT_EQ(p.lines[1].box.x1, 570);
+  GateRule keep;
+  keep.edge_bars = false;
+  keep.overlap_chars = 0;
+  OcrPage q;
+  q.width = q.height = 1700;
+  q.lines = {gate_line({403, 385, 577, 422}, "Homes served|", 0.96f, 0.5f),
+             gate_line({571, 388, 585, 419}, "d", 0.956f, 0.9f)};
+  detail::gate_pieces(q, keep);
+  EXPECT_EQ(texts_of(q.lines), (std::vector<std::string>{"Homes served|", "d"}));
+}
+
 // The order model's blocks in two columns, the model reading across them: by geometry, the left column's blocks
 // come first. The gap between a column's paragraphs (60 px) is wider than the gutter (50 px) in pixels, but the
 // gutter is 5 character widths and the gap 3 line heights, so the columns are cut first.
@@ -901,6 +936,53 @@ TEST(Gate, TablesByGeometrySpanTheirRowLabels) {
             std::string::npos)
       << html;
   EXPECT_NE(html.find("<tr><td>Group</td><td>Item</td><td>Value</td></tr>"), std::string::npos) << html;
+}
+
+// Tables by geometry, a two-row header: "Route" and "Year" are set between the heading that spans the quarters and
+// the quarters under it, level with neither; each spans both header rows (GridRule 7), so the quarters are the
+// second row alone, under the spanning heading. A heading's second line in its own column stays its cell's line.
+TEST(Gate, TablesByGeometryHeaderCellsSpanTwoHeaderRows) {
+  OcrPage p;
+  p.width = p.height = 1000;
+  const double qx[4] = {300, 420, 540, 660};
+  p.lines.push_back(gate_line({300, 0, 700, 20}, "Passengers (thousands)", 1, 1));
+  p.lines.push_back(gate_line({100, 20, 180, 40}, "Route", 1, 1));
+  p.lines.push_back(gate_line({820, 18, 880, 38}, "Year", 1, 1));
+  for (int q = 0; q < 4; ++q) p.lines.push_back(gate_line({qx[q], 40, qx[q] + 40, 60}, ("Q" + std::to_string(q + 1)).c_str(), 1, 1));
+  const char* routes[] = {"Harbour", "Island", "Evening"};
+  for (int r = 0; r < 3; ++r) {
+    const double y = 75.0 + 30 * r;
+    p.lines.push_back(gate_line({100, y, 200, y + 20}, routes[r], 1, 1));
+    for (int q = 0; q < 4; ++q) p.lines.push_back(gate_line({qx[q], y, qx[q] + 40, y + 20}, std::to_string(10 + q + r).c_str(), 1, 1));
+    p.lines.push_back(gate_line({820, y, 870, y + 20}, std::to_string(50 + r).c_str(), 1, 1));
+  }
+  std::vector<int> all(p.lines.size());
+  std::iota(all.begin(), all.end(), 0);
+  p.blocks = {{"Table", 0.8f, all, {}}};
+  detail::tables_by_geometry(p, GridRule{});
+  ASSERT_EQ(p.blocks.size(), 1u);
+  const std::vector<OcrCell>& c = p.blocks[0].cells;
+  int route = -1, year = -1, q1 = -1;
+  for (size_t k = 0; k < c.size(); ++k) {
+    const std::string& t = p.lines[static_cast<size_t>(c[k].lines[0])].text;
+    if (t == "Route") route = static_cast<int>(k);
+    if (t == "Year") year = static_cast<int>(k);
+    if (t == "Q1") q1 = static_cast<int>(k);
+  }
+  ASSERT_GE(route, 0);
+  ASSERT_GE(year, 0);
+  ASSERT_GE(q1, 0);
+  EXPECT_EQ(c[static_cast<size_t>(route)].row, 0);
+  EXPECT_EQ(c[static_cast<size_t>(route)].row_span, 2);
+  EXPECT_EQ(c[static_cast<size_t>(year)].row, 0);
+  EXPECT_EQ(c[static_cast<size_t>(year)].row_span, 2);
+  EXPECT_EQ(c[static_cast<size_t>(q1)].row, 1);
+  int rows = 0;
+  for (const OcrCell& x : c) rows = std::max(rows, x.row + x.row_span);
+  EXPECT_EQ(rows, 5);  // two header rows and three of routes
+  const std::string html = to_html_body(p);
+  EXPECT_NE(html.find("<td rowspan=\"2\">Route</td>"), std::string::npos) << html;
+  EXPECT_NE(html.find("<tr><td>Q1</td><td>Q2</td><td>Q3</td><td>Q4</td></tr>"), std::string::npos) << html;
 }
 
 // The detector alone (a text layer's page) finds the lines the engine reads, where it reads them.

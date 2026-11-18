@@ -498,7 +498,10 @@ std::vector<OcrLine> split_lines(std::vector<OcrLine> lines, const SplitRule& ru
       p.confidence = n ? static_cast<float>(conf / static_cast<double>(n)) : 0.0f;
       out.push_back(std::move(p));
     };
+    // a list's bullet first: its item's indent is no gutter
+    const bool held = rule.marker > 0 && is_bullet(lone_char(l.words[0].text)) && gaps[0] < rule.marker;
     for (size_t i = 1; i < l.words.size(); ++i) {
+      if (i == 1 && held) continue;
       if (gaps[i - 1] >= rule.always || gaps[i - 1] >= cut) {
         piece(from, i);
         from = i;
@@ -1879,6 +1882,9 @@ float attach_rescorer(EngineOptions& o, const std::filesystem::path& set, const 
   if (!o.beam.on() || o.rescorer || o.tlm == "off") return 0;
   std::filesystem::path file = o.tlm;
   if (file.empty()) {
+    // the set's own transformer only where a mode names it: by hand (auto) the beam reads with the n-gram alone,
+    // since the transformer gains little over the n-gram at about four times the CPU's time
+    if (o.lm_mode == LmMode::kAuto) return 0;
     file = set / ("tlm-" + model_group(o) + ".bin");
     if (!std::filesystem::exists(file)) return 0;
   }
@@ -2030,6 +2036,43 @@ void read_line(OcrLine& line, const CtcLine& d, int32_t length, const CropRule& 
 
 // ---------------------------------------------------------------- the gate (GateRule)
 
+// A | at a line's edge, beside its text (GateRule::edge_bars): a column rule the line took in. Taken off the text
+// and its words, with the spaces next to it; a word of bars alone goes, the line's box to its next word's edge. A
+// line with no letter or digit is left as it is (the whole-line gate's).
+static void trim_edge_bars(OcrLine& l) {
+  if (kinds_of(l.text).alnum == 0) return;
+  auto bars = [](const std::string& s) { return !s.empty() && s.find_first_not_of("| ") == std::string::npos; };
+  auto strip = [](std::string& s) {  // the run of bars and spaces at each end, where a bar is in it
+    size_t a = 0, b = s.size();
+    while (a < b && (s[a] == '|' || s[a] == ' ')) ++a;
+    if (s.find('|') >= a) a = 0;
+    while (b > a && (s[b - 1] == '|' || s[b - 1] == ' ')) --b;
+    if (s.find('|', b) == std::string::npos) b = s.size();
+    s = s.substr(a, b - a);
+  };
+  const std::string before = l.text;
+  strip(l.text);
+  if (l.text == before || l.words.empty()) return;
+  const std::vector<OcrWord> words = l.words;
+  while (!l.words.empty() && bars(l.words.back().text)) l.words.pop_back();
+  while (!l.words.empty() && bars(l.words.front().text)) l.words.erase(l.words.begin());
+  if (l.words.empty()) {  // the words are not the text's: they stay as they were
+    l.words = words;
+    return;
+  }
+  strip(l.words.front().text);
+  if (l.words.size() > 1) strip(l.words.back().text);
+  if (l.words.size() != words.size()) {
+    double x0 = l.words.front().box.x0, x1 = l.words.front().box.x1;
+    for (const OcrWord& w : l.words) {
+      x0 = std::min(x0, w.box.x0);
+      x1 = std::max(x1, w.box.x1);
+    }
+    if (bars(words.front().text)) l.box.x0 = x0;
+    if (bars(words.back().text)) l.box.x1 = x1;
+  }
+}
+
 void gate_whole_lines(OcrPage& page, const GateRule& rule) {
   const size_t n = page.lines.size();
   // The lone marks first (GateRule: bullet_join, dash_cell): a list's marker into the line on its right, an empty
@@ -2135,12 +2178,29 @@ void gate_pieces(OcrPage& page, const GateRule& rule) {
     }
     if (!beside) why[i] = "lone";
   }
+  for (size_t i = 0; i < n; ++i) {  // a short piece over a longer line on its row: that line read its ink
+    const OcrLine& l = page.lines[i];
+    const int chars = kinds_of(l.text).chars();
+    if (why[i] || rule.overlap_chars <= 0 || chars == 0 || chars > rule.overlap_chars) continue;
+    const double h = std::max(1.0, l.box.y1 - l.box.y0), w = std::max(1.0, l.box.x1 - l.box.x0);
+    for (size_t j = 0; j < n; ++j) {
+      if (j == i || why[j] || kinds_of(page.lines[j].text).chars() <= chars) continue;
+      const LineBox& b = page.lines[j].box;
+      const double over = std::min(l.box.y1, b.y1) - std::max(l.box.y0, b.y0);
+      const double across = std::min(l.box.x1, b.x1) - std::max(l.box.x0, b.x0);
+      if (over >= 0.5 * std::min(h, b.y1 - b.y0) && across > rule.overlap_share * w) {
+        why[i] = "overlap";
+        break;
+      }
+    }
+  }
   std::vector<OcrLine> kept;
   kept.reserve(n);
   for (size_t i = 0; i < n; ++i) {
     if (why[i]) {
       page.dropped.push_back({std::move(page.lines[i]), why[i]});
     } else {
+      if (rule.edge_bars) trim_edge_bars(page.lines[i]);
       kept.push_back(std::move(page.lines[i]));
     }
   }

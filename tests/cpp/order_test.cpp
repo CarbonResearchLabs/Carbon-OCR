@@ -581,6 +581,23 @@ TEST(Split, LinesAtWideGaps) {
   EXPECT_EQ(split_lines({words_line({{0, 30}, {44, 70}, {84, 120}})}).size(), 3u);
   // a gap of 1.5 h splits whatever the spaces
   EXPECT_EQ(split_lines({words_line({{0, 30}, {41, 70}, {100, 130}})}).size(), 2u);
+  // a list's bullet first, its item 2 h after it: one line (SplitRule::marker), as a letter there would not be
+  {
+    OcrLine item = words_line({{0, 10}, {50, 80}, {85, 120}});
+    item.words[0].text = "•";
+    EXPECT_EQ(split_lines({item}).size(), 1u);
+    item.words[0].text = "x";
+    EXPECT_EQ(split_lines({item}).size(), 2u);
+    item.words[0].text = "-";  // a dash can be an empty cell's: not held
+    EXPECT_EQ(split_lines({item}).size(), 2u);
+    item.words[0].text = "•";
+    SplitRule off;
+    off.marker = 0;
+    EXPECT_EQ(split_lines({item}, off).size(), 2u);
+    OcrLine far = words_line({{0, 10}, {70, 100}, {105, 130}});  // 3 h: past the marker's reach
+    far.words[0].text = "•";
+    EXPECT_EQ(split_lines({far}).size(), 2u);
+  }
   // words out of order (a text layer's): each piece's box spans its words, never x1 < x0
   OcrLine back = words_line({{0, 30}, {35, 60}, {100, 140}});
   std::swap(back.words[0].box, back.words[1].box);
