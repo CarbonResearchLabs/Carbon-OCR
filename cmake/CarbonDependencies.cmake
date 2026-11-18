@@ -5,50 +5,73 @@ include(FetchContent)
 
 # ----------------------------------------------------------------- ONNX Runtime
 #
-# A prebuilt release.  ONNXRUNTIME_ROOT points at an unpacked release instead
-# (offline builds, another version, a GPU build).
+# A prebuilt release, from Microsoft's NuGet package of it (Microsoft.ML.OnnxRuntime),
+# laid out under the build tree as the release archives are (include/, lib/).
+# The archives came from github.com/microsoft/onnxruntime, offline since 17
+# November 2026; the package's libraries for the platforms here, Windows' import
+# library and its headers (but for their line ends) are the same bytes as the
+# pinned archives' (onnxruntime-linux-x64 and -win-x64-1.31.0, SHA-256
+# cc5c72ba... and 3958d8a4...).  ONNXRUNTIME_ROOT points at an unpacked release
+# instead (offline builds, another version, a GPU build).
 
 set(CARBON_ORT_VERSION 1.31.0)
+set(CARBON_ORT_SHA256 7e35fdb4f5adb62f01e60798e2e5ed05108f5fbbe1cca03fbcc37903cf7c5e3b)  # the .nupkg
 
 if(CARBON_WITH_ONNXRUNTIME)
   set(ONNXRUNTIME_ROOT "" CACHE PATH "Unpacked ONNX Runtime release (empty: download ${CARBON_ORT_VERSION})")
   if(NOT ONNXRUNTIME_ROOT)
+    # the package's folder for this platform; on Linux and macOS its library's file, and the name the build's
+    # binaries load it by (its soname, its install name), which a copy beside it takes
     if(WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
-      set(_ort_asset onnxruntime-win-x64-${CARBON_ORT_VERSION}.zip)
-      set(_ort_sha256 3958d8a44984160692c1b4ffd0de3cb48f8c39f9d34bb31e433db06e30b82195)
+      set(_ort_rid win-x64)
     elseif(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
-      set(_ort_asset onnxruntime-osx-arm64-${CARBON_ORT_VERSION}.tgz)
-      set(_ort_sha256 1031b36dd3bdaa8d976a6130d9cf2a05e9be320b93ae804f8427b91dc3432afc)
+      set(_ort_rid osx-arm64)
+      set(_ort_file libonnxruntime.dylib)
+      set(_ort_loaded libonnxruntime.1.dylib)
     elseif(UNIX AND NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-      set(_ort_asset onnxruntime-linux-x64-${CARBON_ORT_VERSION}.tgz)
-      set(_ort_sha256 cc5c72baf5ae5c8238a6841f0897227be2d02826b9cf98eaf02fdefaeeb03a57)
+      set(_ort_rid linux-x64)
+      set(_ort_file libonnxruntime.so)
+      set(_ort_loaded libonnxruntime.so.1)
     else()
       message(FATAL_ERROR "No pinned ONNX Runtime download for ${CMAKE_SYSTEM_NAME} "
                           "${CMAKE_SYSTEM_PROCESSOR}: set ONNXRUNTIME_ROOT to an unpacked release")
     endif()
+    set(_ort_pkg microsoft.ml.onnxruntime)
     FetchContent_Declare(onnxruntime
-      URL https://github.com/microsoft/onnxruntime/releases/download/v${CARBON_ORT_VERSION}/${_ort_asset}
-      URL_HASH SHA256=${_ort_sha256}
+      URL https://api.nuget.org/v3-flatcontainer/${_ort_pkg}/${CARBON_ORT_VERSION}/${_ort_pkg}.${CARBON_ORT_VERSION}.nupkg
+      URL_HASH SHA256=${CARBON_ORT_SHA256}
+      DOWNLOAD_NAME onnxruntime-${CARBON_ORT_VERSION}.zip  # a .nupkg is a zip; the name has it extracted as one
       DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
     FetchContent_MakeAvailable(onnxruntime)
-    set(_ort_root ${onnxruntime_SOURCE_DIR})
+    set(_ort_root ${CMAKE_BINARY_DIR}/onnxruntime-${CARBON_ORT_VERSION})
+    file(COPY ${onnxruntime_SOURCE_DIR}/build/native/include DESTINATION ${_ort_root})
+    file(GLOB _ort_libs ${onnxruntime_SOURCE_DIR}/runtimes/${_ort_rid}/native/*)
+    file(COPY ${_ort_libs} DESTINATION ${_ort_root}/lib)
+    set(_ort_include ${_ort_root}/include)
+    if(_ort_file)
+      file(COPY_FILE ${_ort_root}/lib/${_ort_file} ${_ort_root}/lib/${_ort_loaded} ONLY_IF_DIFFERENT)
+      set(_ort_library ${_ort_root}/lib/${_ort_file})
+    endif()
   else()
     set(_ort_root ${ONNXRUNTIME_ROOT})
+    find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+      PATHS ${_ort_root}/include ${_ort_root}/include/onnxruntime
+      NO_DEFAULT_PATH REQUIRED)
+    set(_ort_include ${ONNXRUNTIME_INCLUDE_DIR})
+    if(NOT WIN32)
+      find_library(ONNXRUNTIME_LIBRARY onnxruntime PATHS ${_ort_root}/lib NO_DEFAULT_PATH REQUIRED)
+      set(_ort_library ${ONNXRUNTIME_LIBRARY})
+    endif()
   endif()
 
-  find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
-    PATHS ${_ort_root}/include ${_ort_root}/include/onnxruntime
-    NO_DEFAULT_PATH REQUIRED)
   add_library(onnxruntime::onnxruntime SHARED IMPORTED GLOBAL)
-  set_target_properties(onnxruntime::onnxruntime PROPERTIES
-    INTERFACE_INCLUDE_DIRECTORIES ${ONNXRUNTIME_INCLUDE_DIR})
+  set_target_properties(onnxruntime::onnxruntime PROPERTIES INTERFACE_INCLUDE_DIRECTORIES ${_ort_include})
   if(WIN32)
     set_target_properties(onnxruntime::onnxruntime PROPERTIES
       IMPORTED_LOCATION ${_ort_root}/lib/onnxruntime.dll
       IMPORTED_IMPLIB ${_ort_root}/lib/onnxruntime.lib)
   else()
-    find_library(ONNXRUNTIME_LIBRARY onnxruntime PATHS ${_ort_root}/lib NO_DEFAULT_PATH REQUIRED)
-    set_target_properties(onnxruntime::onnxruntime PROPERTIES IMPORTED_LOCATION ${ONNXRUNTIME_LIBRARY})
+    set_target_properties(onnxruntime::onnxruntime PROPERTIES IMPORTED_LOCATION ${_ort_library})
   endif()
 endif()
 

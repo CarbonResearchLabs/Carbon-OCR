@@ -1,6 +1,7 @@
 // The transformer language model on a GPU (cuda_transformer_lm, src/cuda/tlm.cu) against the CPU's
 // (TransformerLM): the same model file, random weights, the same scores to FP16's rounding; a page's lines in one
-// run the lines one by one; the readings longer than the window the CPU's exactly.
+// run the lines one by one; the readings longer than the window in windows, as the CPU's; callers at once each as
+// alone.
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
 
@@ -9,8 +10,10 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <exception>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "carbon/error.h"
@@ -56,6 +59,18 @@ std::vector<std::vector<int32_t>> readings_of(std::mt19937& g, int classes, size
 // A reading's tolerance: FP16 products, its tokens' log-probabilities each a few thousandths of a nat off.
 double tolerance(size_t tokens) { return 0.02 + 0.004 * static_cast<double>(tokens); }
 
+// A reading longer than a window of ctx tokens, scored in windows of ctx / 2: its tokens', and each window's and each
+// line's end taken back out (a few hundredths of a nat each).
+double window_tolerance(size_t tokens, int ctx) {
+  const size_t step = static_cast<size_t>(ctx / 2), windows = (tokens + step - 1) / step;
+  return tolerance(tokens + 1) + 0.02 * static_cast<double>(2 * windows - 1);
+}
+
+// A reading's tolerance against the CPU's, after a context of `context` tokens, in a model of window ctx.
+double tolerance_of(size_t tokens, size_t context, int ctx) {
+  return static_cast<int>(tokens) + 1 > ctx ? window_tolerance(tokens, ctx) : tolerance(tokens + context);
+}
+
 TEST(CudaTlm, ScoresAsTheCpuDoes) {
   if (!have_gpu()) GTEST_SKIP() << "no GPU";
   for (const int heads : {4, 2, 1}) {  // heads 32, 64 and 128 wide
@@ -80,13 +95,16 @@ TEST(CudaTlm, ScoresAsTheCpuDoes) {
     cases.push_back({{B}, {{}, {3}, {3, 4}}});                              // an empty reading; one a prefix of another
     cases.push_back({{B}, readings_of(g, classes, 40, 1)});                 // one reading
     cases.push_back({{B}, {random_tokens(g, classes, 63)}});                // the longest the window holds
+    cases.push_back({{B}, {random_tokens(g, classes, 64)}});                // one past it: two windows
+    cases.push_back({above, readings_of(g, classes, 150, 4)});              // longer than the window: in windows
+    cases.push_back({above, {random_tokens(g, classes, 150), random_tokens(g, classes, 20), {}}});  // long and short
     for (size_t c = 0; c < cases.size(); ++c) {
       const Case& k = cases[c];
       std::vector<double> want(k.readings.size()), got(k.readings.size());
       cpu->score(k.context, k.readings, want);
       gpu->score(k.context, k.readings, got);
       for (size_t r = 0; r < want.size(); ++r) {
-        EXPECT_NEAR(got[r], want[r], tolerance(k.readings[r].size() + 1))
+        EXPECT_NEAR(got[r], want[r], tolerance_of(k.readings[r].size(), 1, 64))
             << "heads " << heads << ", case " << c << ", reading " << r;
       }
     }
@@ -144,7 +162,7 @@ TEST(CudaTlm, APagesLinesInOneRunAreEachLinesAlone) {
     contexts.push_back(ctx);
     readings.push_back(readings_of(g, classes, 5 + static_cast<size_t>(l) * 3 % 60, 1 + l % 8));
   }
-  readings.push_back(readings_of(g, classes, 200, 3));  // longer than the window: the CPU's, in its windows
+  readings.push_back(readings_of(g, classes, 200, 3));  // longer than the window: in windows, as the CPU's
   contexts.push_back({classes});
   readings.push_back({});  // none
   contexts.push_back({classes});
@@ -159,15 +177,67 @@ TEST(CudaTlm, APagesLinesInOneRunAreEachLinesAlone) {
     cpu->score(contexts[l], readings[l], want);
     for (size_t r = 0; r < alone.size(); ++r) {
       EXPECT_NEAR(page[l][r], alone[r], 1e-3) << "line " << l << ", reading " << r;
-      EXPECT_NEAR(page[l][r], want[r], tolerance(readings[l][r].size() + contexts[l].size()))
+      EXPECT_NEAR(page[l][r], want[r], tolerance_of(readings[l][r].size(), contexts[l].size(), 128))
           << "line " << l << ", reading " << r;
     }
   }
-  EXPECT_EQ(page[40], [&] {  // the long line: the CPU's model itself
-    std::vector<double> v(readings[40].size());
-    cpu->score(contexts[40], readings[40], v);
-    return v;
-  }());
+  ASSERT_GT(readings[40][0].size() + 1, 128u);  // the long line is longer than the window
+}
+
+// Callers at once, more than the runs a rescorer holds (8): each page's scores exactly as when it runs alone (the same
+// rows in the same order through the same kernels), on whichever run and stream it gets, long lines and all.
+TEST(CudaTlm, CallersAtOnceScoreAsEachAlone) {
+  if (!have_gpu()) GTEST_SKIP() << "no GPU";
+  const int classes = 97;
+  const auto file = random_model("gpu-callers", 128, 2, 4, 256, 128, classes, 9u);
+  const auto gpu = cuda_transformer_lm(file, 0);
+  constexpr int kPages = 12, kRounds = 4;
+  struct Page {
+    std::vector<std::vector<int32_t>> contexts;
+    std::vector<std::vector<std::vector<int32_t>>> readings;
+  };
+  std::vector<Page> pages(kPages);
+  std::mt19937 g(29u);
+  for (int p = 0; p < kPages; ++p) {
+    for (int l = 0; l < 6 + p; ++l) {
+      std::vector<int32_t> ctx{classes};
+      const auto above = random_tokens(g, classes, 5 + static_cast<size_t>(l) * 4);
+      ctx.insert(ctx.end(), above.begin(), above.end());
+      ctx.push_back(classes);
+      pages[p].contexts.push_back(ctx);
+      const size_t len = p % 3 == 0 && l == 2 ? 300 : 8 + static_cast<size_t>(l * 7 + p) % 70;  // a long line a third
+      pages[p].readings.push_back(readings_of(g, classes, len, 1 + (l + p) % 8));
+    }
+  }
+  auto score = [&](const Page& page) {
+    std::vector<RescoreQuery> q;
+    for (size_t l = 0; l < page.contexts.size(); ++l) q.push_back({page.contexts[l], page.readings[l]});
+    std::vector<std::vector<double>> out(q.size());
+    gpu->score_lines(q, out);
+    return out;
+  };
+  std::vector<std::vector<std::vector<double>>> alone(kPages);
+  for (int p = 0; p < kPages; ++p) alone[p] = score(pages[p]);
+  std::vector<std::vector<std::vector<std::vector<double>>>> got(kPages);
+  std::vector<std::string> errors(kPages);
+  std::vector<std::thread> callers;
+  for (int p = 0; p < kPages; ++p) {
+    got[p].resize(kRounds);
+    callers.emplace_back([&, p] {
+      try {
+        for (int r = 0; r < kRounds; ++r) got[p][r] = score(pages[(p + r) % kPages]);
+      } catch (const std::exception& e) {
+        errors[p] = e.what();
+      }
+    });
+  }
+  for (auto& t : callers) t.join();
+  for (int p = 0; p < kPages; ++p) {
+    EXPECT_EQ(errors[p], "") << "caller " << p;
+    for (int r = 0; r < kRounds; ++r) {
+      EXPECT_EQ(got[p][r], alone[(p + r) % kPages]) << "caller " << p << ", round " << r;
+    }
+  }
 }
 
 TEST(CudaTlm, RefusesWhatItDoesNotRun) {

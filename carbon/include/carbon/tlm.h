@@ -94,8 +94,10 @@ class LineRescorer {
 
 // The same model on a GPU (src/cuda/tlm.cu): a page's lines rescored in one run, every product on the tensor
 // cores (FP16 in, FP32 sums, the bias, GELU and residual fused), the layer norms, attention and log-softmax a warp a
-// row; within a few hundredths of a nat of the CPU's. Lines longer than its window go to the CPU's model. Throws
-// Error where CUDA is not built in, or where the model's heads are not 32, 64 or 128 wide.
+// row; within a few hundredths of a nat of the CPU's. A line longer than its window is scored in windows, as the
+// CPU's model scores it, in the same run. Callers at once run at once, each on a stream and buffers of its own (up to
+// 8; more wait for one). Throws Error where CUDA is not built in, or where the model's heads are not 32, 64 or 128
+// wide.
 std::shared_ptr<LineRescorer> cuda_transformer_lm(const std::filesystem::path& file, int gpu = 0);
 
 class TransformerLM final : public LineRescorer {

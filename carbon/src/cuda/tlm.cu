@@ -20,14 +20,26 @@
 // context's other rows are only keys and values there. The head's columns are padded to 8 (the vector loads);
 // `pick` takes each target's log-softmax over the real ones, a warp a target. The tokens, the row descriptors
 // and the picked log-probabilities are all that cross the bus, one copy each way a pass, from pinned memory.
+//
+// A line with a reading longer than the window runs as the CPU's model scores it, in pieces that each fit: its
+// readings that fit, each alone after the line's context, and each longer one in windows, each window after the one
+// before, less the line's end after every window but the last. The pieces are queries of the same run as the page's
+// other lines, so nothing of a page waits on the CPU.
+//
+// Each caller runs on a state of its own (a stream, the passes it lays out, their device and pinned memory), taken
+// from a pool of up to kRuns and given back when its run ends; only the weights are shared. Workers' pages run on
+// their own streams at once, not one after another.
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -356,10 +368,40 @@ struct Pass {
   int head_rows() const { return all ? static_cast<int>(tok.size()) : static_cast<int>(last.size()); }
 };
 
-// Where a pick's log-probability goes: a line and its reading (-1: every reading of the line).
+// Where a pick's log-probability goes: a query of the run and its reading (-1: every reading of the query).
 struct To {
   int32_t line, reading;
 };
+
+// Where a reading of a query of the run goes: added to out[line][reading], times sign (-1: a line's end taken back
+// out of a window that is not the line's last).
+struct Part {
+  int32_t line, reading;
+  double sign;
+};
+
+// One caller's run: its stream, the passes it lays out, and the device and pinned memory they take, grown when asked
+// and never shrunk.
+struct Run {
+  cudaStream_t s = nullptr;
+  Pass shared, rest;
+  std::vector<To> sto, rto;
+  Buf<float> cache, x, xa, xb, xg, qkv, logits, picks_s, picks_r;
+  Buf<__half> h16, att, ff;
+  Buf<int32_t> ints_s, ints_r;
+  Pinned<int32_t> stage_s, stage_r;
+  Pinned<float> back_s, back_r;
+  Run() = default;
+  Run(const Run&) = delete;
+  Run& operator=(const Run&) = delete;
+  ~Run() {
+    if (s) cudaStreamDestroy(s);
+  }
+};
+
+// The runs callers can hold at once; a caller past them waits for one. Each keeps device memory for the largest page
+// it has run.
+constexpr size_t kRuns = 8;
 
 class CudaTlm final : public LineRescorer {
  public:
@@ -375,7 +417,6 @@ class CudaTlm final : public LineRescorer {
     }
     tp_ = (static_cast<int>(h_.tokens) + 7) / 8 * 8;
     OnDevice on(gpu_);
-    ck(cudaStreamCreateWithFlags(&s_, cudaStreamNonBlocking), "cudaStreamCreate");
     // the weights from the file again (the CPU's model keeps its own, packed for its kernels): FP32's and FP16's as they
     // compute (FP16's widened, so exactly the file's halves again here); INT8's int8 values, with the sums' scales and
     // the inputs' quantization
@@ -437,10 +478,6 @@ class CudaTlm final : public LineRescorer {
       f32(shead_, s);
     }
   }
-  ~CudaTlm() override {
-    if (s_) cudaStreamDestroy(s_);
-  }
-
   int boundary() const override { return static_cast<int>(h_.classes); }
 
   void score(std::span<const int32_t> context, std::span<const std::vector<int32_t>> readings,
@@ -465,24 +502,68 @@ class CudaTlm final : public LineRescorer {
         }
       }
     }
-    std::lock_guard lk(m_);
-    Pass& S = shared_;
-    Pass& R = rest_;
-    S.clear();
-    R.clear();
-    S.all = false;
-    sto_.clear();
-    rto_.clear();
+    // the run's queries, each of whose readings fits the window, and where each reading's log-probability goes
+    std::vector<RescoreQuery> qs;
+    std::vector<std::vector<Part>> parts;
+    std::deque<std::vector<int32_t>> pieces;  // the windows' tokens and contexts (a deque: they stay where they are)
+    static const std::vector<int32_t> none;  // the reading a line's end alone is scored as
     for (size_t l = 0; l < queries.size(); ++l) {
       const RescoreQuery& q = queries[l];
       out[l].assign(q.readings.size(), 0.0);
       if (q.readings.empty()) continue;
       size_t longest = 0;
       for (const auto& r : q.readings) longest = std::max(longest, r.size());
-      if (static_cast<int>(longest) + 1 > C) {  // longer than the window: the CPU's model, in its windows
-        cpu_->score(q.context, q.readings, out[l]);
+      const int32_t line = static_cast<int32_t>(l);
+      if (static_cast<int>(longest) + 1 <= C) {  // the line as it is
+        qs.push_back(q);
+        parts.emplace_back();
+        for (size_t r = 0; r < q.readings.size(); ++r) parts.back().push_back({line, static_cast<int32_t>(r), 1.0});
         continue;
       }
+      // longer than the window: as the CPU's model scores it (TransformerLM::score)
+      for (size_t r = 0; r < q.readings.size(); ++r) {
+        const auto& rd = q.readings[r];
+        const int32_t reading = static_cast<int32_t>(r);
+        if (static_cast<int>(rd.size()) + 1 <= C) {  // a reading that fits: alone, after the whole context
+          qs.push_back({q.context, std::span<const std::vector<int32_t>>(&rd, 1)});
+          parts.push_back({{line, reading, 1.0}});
+          continue;
+        }
+        // windows of ctx / 2 tokens, each after the one before (the first after the context's last token); every
+        // window but the last less the line's end after it
+        const size_t step = static_cast<size_t>(C / 2);
+        const std::vector<int32_t>* ctx = &pieces.emplace_back(q.context.end() - 1, q.context.end());
+        for (size_t a = 0; a < rd.size(); a += step) {
+          const size_t b = std::min(rd.size(), a + step);
+          const std::vector<int32_t>& piece = pieces.emplace_back(rd.begin() + static_cast<std::ptrdiff_t>(a),
+                                                                  rd.begin() + static_cast<std::ptrdiff_t>(b));
+          qs.push_back({*ctx, std::span<const std::vector<int32_t>>(&piece, 1)});
+          parts.push_back({{line, reading, 1.0}});
+          if (b < rd.size()) {
+            std::vector<int32_t>& both = pieces.emplace_back(*ctx);
+            both.insert(both.end(), piece.begin(), piece.end());
+            qs.push_back({both, std::span<const std::vector<int32_t>>(&none, 1)});
+            parts.push_back({{line, reading, -1.0}});
+          }
+          ctx = &piece;
+        }
+      }
+    }
+    if (qs.empty()) return;
+    OnDevice on(gpu_);
+    Lease lease(*this);
+    Run& job = *lease.run;
+    Pass& S = job.shared;
+    Pass& R = job.rest;
+    S.clear();
+    R.clear();
+    S.all = false;
+    job.sto.clear();
+    job.rto.clear();
+    for (size_t l = 0; l < qs.size(); ++l) {
+      const RescoreQuery& q = qs[l];
+      size_t longest = 0;
+      for (const auto& r : q.readings) longest = std::max(longest, r.size());
       // the context, its oldest tokens dropped to fit the window with the longest reading (as the CPU's)
       const size_t keep = std::min(q.context.size(), static_cast<size_t>(C) - longest);
       const std::span<const int32_t> ctx = q.context.subspan(q.context.size() - keep);
@@ -505,14 +586,14 @@ class CudaTlm final : public LineRescorer {
       for (size_t i = 0; i < P; ++i) {
         S.prow.push_back(first + static_cast<int>(i));
         S.ptgt.push_back(q.readings[0][i]);
-        sto_.push_back({static_cast<int32_t>(l), -1});
+        job.sto.push_back({static_cast<int32_t>(l), -1});
       }
       const int lastrow = static_cast<int>(S.last.size()) - 1;
       for (size_t r = 0; r < q.readings.size(); ++r) {
         const auto& rd = q.readings[r];
         S.prow.push_back(lastrow);
         S.ptgt.push_back(rd.size() > P ? rd[P] : B);
-        sto_.push_back({static_cast<int32_t>(l), static_cast<int32_t>(r)});
+        job.sto.push_back({static_cast<int32_t>(l), static_cast<int32_t>(r)});
         const int r0 = static_cast<int>(R.tok.size());
         for (size_t j = P; j < rd.size(); ++j) {  // the reading's rest: each row predicts the next, the last the end
           const int row = static_cast<int>(R.tok.size());
@@ -521,61 +602,110 @@ class CudaTlm final : public LineRescorer {
           R.runs.push_back({seg, Ls, r0, static_cast<int>(j - P) + 1});
           R.prow.push_back(row);
           R.ptgt.push_back(j + 1 < rd.size() ? rd[j + 1] : B);
-          rto_.push_back({static_cast<int32_t>(l), static_cast<int32_t>(r)});
+          job.rto.push_back({static_cast<int32_t>(l), static_cast<int32_t>(r)});
         }
       }
     }
-    if (S.tok.empty()) return;
-    OnDevice on(gpu_);
-    reserve();  // everything both passes take, before either is enqueued: nothing is freed under a running kernel
-    const float* sp = run(S, ints_s_, stage_s_, picks_s_, back_s_, cache_.p, nullptr);
-    const float* rp = R.tok.empty() ? nullptr : run(R, ints_r_, stage_r_, picks_r_, back_r_, nullptr, cache_.p);
-    ck(cudaStreamSynchronize(s_), "the rescore");
-    for (size_t i = 0; i < sto_.size(); ++i) {
-      auto& o = out[static_cast<size_t>(sto_[i].line)];
-      if (sto_[i].reading < 0) {
-        for (double& v : o) v += sp[i];
+    reserve(job);  // everything both passes take, before either is enqueued: nothing is freed under a running kernel
+    const float* sp = enqueue(job, S, job.ints_s, job.stage_s, job.picks_s, job.back_s, job.cache.p, nullptr);
+    const float* rp = R.tok.empty()
+                          ? nullptr
+                          : enqueue(job, R, job.ints_r, job.stage_r, job.picks_r, job.back_r, nullptr, job.cache.p);
+    ck(cudaStreamSynchronize(job.s), "the rescore");
+    auto add = [&](const Part& p, double v) {
+      out[static_cast<size_t>(p.line)][static_cast<size_t>(p.reading)] += p.sign * v;
+    };
+    for (size_t i = 0; i < job.sto.size(); ++i) {
+      const auto& to = parts[static_cast<size_t>(job.sto[i].line)];
+      if (job.sto[i].reading < 0) {
+        for (const Part& p : to) add(p, sp[i]);
       } else {
-        o[static_cast<size_t>(sto_[i].reading)] += sp[i];
+        add(to[static_cast<size_t>(job.sto[i].reading)], sp[i]);
       }
     }
-    for (size_t i = 0; i < rto_.size(); ++i) {
-      out[static_cast<size_t>(rto_[i].line)][static_cast<size_t>(rto_[i].reading)] += rp[i];
+    for (size_t i = 0; i < job.rto.size(); ++i) {
+      add(parts[static_cast<size_t>(job.rto[i].line)][static_cast<size_t>(job.rto[i].reading)], rp[i]);
     }
   }
 
  private:
+  // A caller's hold on a run, given back (its stream drained) when it ends.
+  struct Lease {
+    const CudaTlm& t;
+    std::unique_ptr<Run> run;
+    explicit Lease(const CudaTlm& owner) : t(owner), run(owner.acquire()) {}
+    Lease(const Lease&) = delete;
+    Lease& operator=(const Lease&) = delete;
+    ~Lease() { t.release(std::move(run)); }
+  };
+
+  // An idle run, or a new one while fewer than kRuns are made; otherwise the wait for one. On the caller's device.
+  std::unique_ptr<Run> acquire() const {
+    std::unique_lock lk(pool_m_);
+    pool_cv_.wait(lk, [&] { return !idle_.empty() || made_ < kRuns; });
+    if (!idle_.empty()) {
+      std::unique_ptr<Run> r = std::move(idle_.back());
+      idle_.pop_back();
+      return r;
+    }
+    ++made_;
+    lk.unlock();
+    auto r = std::make_unique<Run>();
+    const cudaError_t e = cudaStreamCreateWithFlags(&r->s, cudaStreamNonBlocking);
+    if (e != cudaSuccess) {
+      {
+        std::lock_guard g(pool_m_);
+        --made_;
+      }
+      pool_cv_.notify_one();
+      ck(e, "cudaStreamCreate");
+    }
+    return r;
+  }
+
+  // A run back to the pool, nothing of it still in flight (a run an error cut short may have left copies queued on
+  // its pinned memory).
+  void release(std::unique_ptr<Run> r) const {
+    cudaStreamSynchronize(r->s);
+    {
+      std::lock_guard lk(pool_m_);
+      idle_.push_back(std::move(r));
+    }
+    pool_cv_.notify_one();
+  }
+
   static size_t ints_of(const Pass& P) {
     return 6 * P.tok.size() + P.last.size() + 2 * P.prow.size();  // tok, at, runs (4 each), last, prow, ptgt
   }
 
-  void reserve() const {
-    const size_t d = static_cast<size_t>(d_), rows = std::max(shared_.tok.size(), rest_.tok.size());
-    const size_t head = static_cast<size_t>(std::max(shared_.head_rows(), rest_.head_rows()));
-    cache_.reserve(shared_.tok.size() * 3 * d * layers_.size());
-    x_.reserve(rows * d);
-    xa_.reserve(rows * d);
-    xb_.reserve(rows * d);
-    xg_.reserve(rows * d);
-    h16_.reserve(rows * d);
-    att_.reserve(rows * d);
-    ff_.reserve(rows * h_.ffn);
-    qkv_.reserve(rows * 3 * d);
-    logits_.reserve(head * static_cast<size_t>(tp_));
-    ints_s_.reserve(ints_of(shared_));
-    ints_r_.reserve(ints_of(rest_));
-    stage_s_.reserve(ints_of(shared_));
-    stage_r_.reserve(ints_of(rest_));
-    picks_s_.reserve(shared_.prow.size());
-    picks_r_.reserve(rest_.prow.size());
-    back_s_.reserve(shared_.prow.size());
-    back_r_.reserve(rest_.prow.size());
+  void reserve(Run& j) const {
+    const size_t d = static_cast<size_t>(d_), rows = std::max(j.shared.tok.size(), j.rest.tok.size());
+    const size_t head = static_cast<size_t>(std::max(j.shared.head_rows(), j.rest.head_rows()));
+    j.cache.reserve(j.shared.tok.size() * 3 * d * layers_.size());
+    j.x.reserve(rows * d);
+    j.xa.reserve(rows * d);
+    j.xb.reserve(rows * d);
+    j.xg.reserve(rows * d);
+    j.h16.reserve(rows * d);
+    j.att.reserve(rows * d);
+    j.ff.reserve(rows * h_.ffn);
+    j.qkv.reserve(rows * 3 * d);
+    j.logits.reserve(head * static_cast<size_t>(tp_));
+    j.ints_s.reserve(ints_of(j.shared));
+    j.ints_r.reserve(ints_of(j.rest));
+    j.stage_s.reserve(ints_of(j.shared));
+    j.stage_r.reserve(ints_of(j.rest));
+    j.picks_s.reserve(j.shared.prow.size());
+    j.picks_r.reserve(j.rest.prow.size());
+    j.back_s.reserve(j.shared.prow.size());
+    j.back_r.reserve(j.rest.prow.size());
   }
 
-  // Enqueues one pass. keep: where its q, k, v go, a layer after another (the shared pass's, the cache); cache:
-  // the shared pass's, each row's first run of keys. Gives the pinned memory its picks will be in after the wait.
-  const float* run(const Pass& P, Buf<int32_t>& ints, Pinned<int32_t>& stage, Buf<float>& picks,
-                   Pinned<float>& back, float* keep, const float* cache) const {
+  // Enqueues one pass of run j on its stream. keep: where its q, k, v go, a layer after another (the shared pass's,
+  // the cache); cache: the shared pass's, each row's first run of keys. Gives the pinned memory its picks will be in
+  // after the wait.
+  const float* enqueue(Run& j, const Pass& P, Buf<int32_t>& ints, Pinned<int32_t>& stage, Buf<float>& picks,
+                       Pinned<float>& back, float* keep, const float* cache) const {
     const int rows = static_cast<int>(P.tok.size()), d = d_, heads = static_cast<int>(h_.heads);
     const int ffn = static_cast<int>(h_.ffn), T = static_cast<int>(h_.tokens);
     const int n = P.head_rows(), np = static_cast<int>(P.prow.size());
@@ -595,15 +725,15 @@ class CudaTlm final : public LineRescorer {
     const int32_t* last = put(P.last.data(), P.last.size());
     const int32_t* prow = put(P.prow.data(), P.prow.size());
     const int32_t* ptgt = put(P.ptgt.data(), P.ptgt.size());
-    ck(cudaMemcpyAsync(dv, h, o * sizeof(int32_t), cudaMemcpyHostToDevice, s_), "the rows' upload");
+    ck(cudaMemcpyAsync(dv, h, o * sizeof(int32_t), cudaMemcpyHostToDevice, j.s), "the rows' upload");
     const size_t layer = static_cast<size_t>(rows) * 3 * d;
-    const size_t cache_layer = shared_.tok.size() * 3 * static_cast<size_t>(d);
+    const size_t cache_layer = j.shared.tok.size() * 3 * static_cast<size_t>(d);
     // q: the quantization of what the kernel writes in FP16, the next product's input (INT8's; 0, 0 otherwise)
     // sc: INT8's sums' scales (null otherwise)
     auto gemm = [&](int M, const __half* A, const __half* Bw, const float* sc, int N, int K, const float* bias,
                     const float* residual, bool gelu, float* o32, __half* o16, const float* q = nullptr) {
       const dim3 grid((N + kTile - 1) / kTile, (M + kTile - 1) / kTile);
-      gemm_k<<<grid, kThreads, 0, s_>>>(A, Bw, M, N, K, sc, bias, residual, gelu, o32, q ? q[0] : 0.0f,
+      gemm_k<<<grid, kThreads, 0, j.s>>>(A, Bw, M, N, K, sc, bias, residual, gelu, o32, q ? q[0] : 0.0f,
                                          q ? q[1] : 0.0f, o16);
     };
     auto attend = [&](int M, const float* qkv, const int32_t* qrow, const float* buf1, const float* buf2,
@@ -611,70 +741,67 @@ class CudaTlm final : public LineRescorer {
       const int blocks = (M * heads + kWarps - 1) / kWarps;
       const float scale = 1.0f / sqrtf(static_cast<float>(dh_));
       if (dh_ == 32) {
-        attend_k<32><<<blocks, kThreads, 0, s_>>>(qkv, qrow, buf1, buf2, runs, M, d, heads, scale, q[0], q[1], att_.p);
+        attend_k<32><<<blocks, kThreads, 0, j.s>>>(qkv, qrow, buf1, buf2, runs, M, d, heads, scale, q[0], q[1],
+                                                   j.att.p);
       } else if (dh_ == 64) {
-        attend_k<64><<<blocks, kThreads, 0, s_>>>(qkv, qrow, buf1, buf2, runs, M, d, heads, scale, q[0], q[1], att_.p);
+        attend_k<64><<<blocks, kThreads, 0, j.s>>>(qkv, qrow, buf1, buf2, runs, M, d, heads, scale, q[0], q[1],
+                                                   j.att.p);
       } else {
-        attend_k<128><<<blocks, kThreads, 0, s_>>>(qkv, qrow, buf1, buf2, runs, M, d, heads, scale, q[0], q[1],
-                                                   att_.p);
+        attend_k<128><<<blocks, kThreads, 0, j.s>>>(qkv, qrow, buf1, buf2, runs, M, d, heads, scale, q[0], q[1],
+                                                   j.att.p);
       }
     };
     auto warps = [](int M) { return (M + kWarps - 1) / kWarps; };
-    embed_k<<<rows, 32, 0, s_>>>(emb_.p, pos_.p, tok, at, rows, d, x_.p);
-    float* cur = x_.p;
-    auto other = [&](const float* c) { return c == xb_.p ? xa_.p : xb_.p; };
+    embed_k<<<rows, 32, 0, j.s>>>(emb_.p, pos_.p, tok, at, rows, d, j.x.p);
+    float* cur = j.x.p;
+    auto other = [&](const float* c) { return c == j.xb.p ? j.xa.p : j.xb.p; };
     for (size_t l = 0; l < layers_.size(); ++l) {
       const LayerW& L = layers_[l];
-      float* qkv = keep ? keep + l * layer : qkv_.p;
-      layer_norm_k<<<warps(rows), kThreads, 0, s_>>>(cur, rows, d, L.ln1w.p, L.ln1b.p, L.qqkv[0], L.qqkv[1], h16_.p);
-      gemm(rows, h16_.p, L.wqkv.p, L.sqkv.p, 3 * d, d, L.bqkv.p, nullptr, false, qkv, nullptr);
+      float* qkv = keep ? keep + l * layer : j.qkv.p;
+      layer_norm_k<<<warps(rows), kThreads, 0, j.s>>>(cur, rows, d, L.ln1w.p, L.ln1b.p, L.qqkv[0], L.qqkv[1], j.h16.p);
+      gemm(rows, j.h16.p, L.wqkv.p, L.sqkv.p, 3 * d, d, L.bqkv.p, nullptr, false, qkv, nullptr);
       // a row's keys: the shared pass's, among its own rows; the rest pass's, the cache's and then its own
       const float* buf1 = cache ? cache + l * cache_layer : qkv;
       int M = rows;
       const int32_t* qrow = nullptr;
       if (l + 1 == layers_.size() && !P.all) {  // the last layer: the asked rows alone past q, k, v
-        gather_k<<<n, 32, 0, s_>>>(cur, last, n, d, xg_.p);
-        cur = xg_.p;
+        gather_k<<<n, 32, 0, j.s>>>(cur, last, n, d, j.xg.p);
+        cur = j.xg.p;
         M = n;
         qrow = last;
       }
       attend(M, qkv, qrow, buf1, qkv, L.qo);
       float* nxt = other(cur);
-      gemm(M, att_.p, L.wo.p, L.so.p, d, d, L.bo.p, cur, false, nxt, nullptr);
+      gemm(M, j.att.p, L.wo.p, L.so.p, d, d, L.bo.p, cur, false, nxt, nullptr);
       cur = nxt;
-      layer_norm_k<<<warps(M), kThreads, 0, s_>>>(cur, M, d, L.ln2w.p, L.ln2b.p, L.qw1[0], L.qw1[1], h16_.p);
-      gemm(M, h16_.p, L.w1.p, L.sw1.p, ffn, d, L.b1.p, nullptr, true, nullptr, ff_.p, L.qw2);
+      layer_norm_k<<<warps(M), kThreads, 0, j.s>>>(cur, M, d, L.ln2w.p, L.ln2b.p, L.qw1[0], L.qw1[1], j.h16.p);
+      gemm(M, j.h16.p, L.w1.p, L.sw1.p, ffn, d, L.b1.p, nullptr, true, nullptr, j.ff.p, L.qw2);
       nxt = other(cur);
-      gemm(M, ff_.p, L.w2.p, L.sw2.p, d, ffn, L.b2.p, cur, false, nxt, nullptr);
+      gemm(M, j.ff.p, L.w2.p, L.sw2.p, d, ffn, L.b2.p, cur, false, nxt, nullptr);
       cur = nxt;
     }
-    layer_norm_k<<<warps(n), kThreads, 0, s_>>>(cur, n, d, lnfw_.p, lnfb_.p, qhead_[0], qhead_[1], h16_.p);
-    gemm(n, h16_.p, head_.p, shead_.p, tp_, d, nullptr, nullptr, false, logits_.p, nullptr);
-    pick_k<<<warps(np), kThreads, 0, s_>>>(logits_.p, T, tp_, prow, ptgt, np, picks.p);
+    layer_norm_k<<<warps(n), kThreads, 0, j.s>>>(cur, n, d, lnfw_.p, lnfb_.p, qhead_[0], qhead_[1], j.h16.p);
+    gemm(n, j.h16.p, head_.p, shead_.p, tp_, d, nullptr, nullptr, false, j.logits.p, nullptr);
+    pick_k<<<warps(np), kThreads, 0, j.s>>>(j.logits.p, T, tp_, prow, ptgt, np, picks.p);
     ck(cudaGetLastError(), "the transformer's kernels");
-    ck(cudaMemcpyAsync(back.p, picks.p, static_cast<size_t>(np) * sizeof(float), cudaMemcpyDeviceToHost, s_),
+    ck(cudaMemcpyAsync(back.p, picks.p, static_cast<size_t>(np) * sizeof(float), cudaMemcpyDeviceToHost, j.s),
        "the picks");
     return back.p;
   }
 
   int gpu_ = 0, d_ = 0, dh_ = 0, tp_ = 0;
-  std::shared_ptr<TransformerLM> cpu_;  // the checks, the file's header, and readings longer than the window
+  std::shared_ptr<TransformerLM> cpu_;  // the file's header
   TlmHeader h_{};
-  cudaStream_t s_ = nullptr;
   Buf<float> emb_, pos_, lnfw_, lnfb_;
   Buf<__half> head_;
   Buf<float> shead_;     // INT8's: the head's sums' scales, padded to tp_
   float qhead_[2] = {};  // the head's input's quantization (INT8's)
   std::vector<LayerW> layers_;
-  // a run's, under m_
-  mutable std::mutex m_;
-  mutable Pass shared_, rest_;
-  mutable std::vector<To> sto_, rto_;
-  mutable Buf<float> cache_, x_, xa_, xb_, xg_, qkv_, logits_, picks_s_, picks_r_;
-  mutable Buf<__half> h16_, att_, ff_;
-  mutable Buf<int32_t> ints_s_, ints_r_;
-  mutable Pinned<int32_t> stage_s_, stage_r_;
-  mutable Pinned<float> back_s_, back_r_;
+  // the runs: idle ones, and how many are made
+  mutable std::mutex pool_m_;
+  mutable std::condition_variable pool_cv_;
+  mutable std::vector<std::unique_ptr<Run>> idle_;
+  mutable size_t made_ = 0;
 };
 
 }  // namespace
