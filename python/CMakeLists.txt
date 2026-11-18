@@ -13,16 +13,23 @@ carbon_warnings(carbon_ocr)
 install(TARGETS carbon_ocr LIBRARY DESTINATION .)
 
 # ONNX Runtime's shared library goes next to the module, which finds it there:
-# Windows looks in the module's folder first, and on Linux the module's RPATH
-# is its own folder.  The library is installed under its soname.
+# Windows looks in the module's folder first, and on Linux and macOS the
+# module's RPATH is its own folder.  The library is installed under the name
+# the module loads it by: its soname on Linux, and on macOS its install name
+# (@rpath/libonnxruntime.1.dylib).
 if(CARBON_WITH_ONNXRUNTIME)
   if(WIN32)
     install(FILES $<TARGET_FILE:onnxruntime::onnxruntime> DESTINATION .)
   else()
     get_target_property(_ort_lib onnxruntime::onnxruntime IMPORTED_LOCATION)
     file(REAL_PATH "${_ort_lib}" _ort_real)
-    install(FILES "${_ort_real}" DESTINATION . RENAME libonnxruntime.so.1)
-    set_target_properties(carbon_ocr PROPERTIES INSTALL_RPATH "$ORIGIN" BUILD_WITH_INSTALL_RPATH ON)
+    if(APPLE)
+      install(FILES "${_ort_real}" DESTINATION . RENAME libonnxruntime.1.dylib)
+      set_target_properties(carbon_ocr PROPERTIES INSTALL_RPATH "@loader_path" BUILD_WITH_INSTALL_RPATH ON)
+    else()
+      install(FILES "${_ort_real}" DESTINATION . RENAME libonnxruntime.so.1)
+      set_target_properties(carbon_ocr PROPERTIES INSTALL_RPATH "$ORIGIN" BUILD_WITH_INSTALL_RPATH ON)
+    endif()
   endif()
 endif()
 
