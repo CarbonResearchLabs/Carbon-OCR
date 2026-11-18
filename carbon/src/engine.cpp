@@ -18,10 +18,12 @@
 #include <map>
 #include <mutex>
 #include <numeric>
+#include <unordered_map>
 
 #include "carbon/deskew.h"
 #include "carbon/error.h"
 #include "carbon/image.h"
+#include "carbon/lm.h"
 #include "carbon/session.h"
 #include "carbon/strips.h"
 #include "det_head.h"
@@ -830,6 +832,26 @@ std::optional<Precision> parse_precision(std::string_view name) {
   return std::nullopt;
 }
 
+std::string_view lm_mode_name(LmMode mode) {
+  switch (mode) {
+    case LmMode::kAuto: return "auto";
+    case LmMode::kNone: return "none";
+    case LmMode::kNgram: return "ngram";
+    case LmMode::kTransformer: return "transformer";
+    case LmMode::kBoth: return "both";
+  }
+  return "?";
+}
+
+std::optional<LmMode> parse_lm_mode(std::string_view name) {
+  for (LmMode m : {LmMode::kAuto, LmMode::kNone, LmMode::kNgram, LmMode::kTransformer, LmMode::kBoth}) {
+    if (name == lm_mode_name(m)) return m;
+  }
+  if (name == "off" || name == "greedy") return LmMode::kNone;
+  if (name == "tlm") return LmMode::kTransformer;
+  return std::nullopt;
+}
+
 SetModel choose_set_model(const std::filesystem::path& set, const std::string& name, std::optional<Backend> backend,
                           Precision precision) {
   const std::filesystem::path int8 = set / (name + ".int8.onnx"), fp32 = set / (name + ".onnx");
@@ -895,6 +917,8 @@ struct Engine::Impl {
     bool complete = false;  // under Stream::m
     std::mutex error_m;
     std::exception_ptr error;  // the first a task of the page met
+    std::mutex unsure_m;
+    std::vector<detail::UnsureLine> unsure;  // gated lines that wait for the rescorer (detail::rescore_page)
 
     void fail(std::exception_ptr e) {
       std::lock_guard lk(error_m);
@@ -928,6 +952,7 @@ struct Engine::Impl {
   Impl(const std::filesystem::path& set, EngineOptions options)
       : o(std::move(options)), pool(engine_pool(o.pool)) {
     vocab = load_vocab(set / (o.rec + ".vocab.json"));
+    detail::attach_language_model(o, set, vocab, o.tlm_gpu.value_or(-1));
     o.crop = detail::model_crop(set, o.rec, o.crop);
     if (!o.turn_probability) {  // the orient file this engine runs
       o.turn_probability = detail::model_turn_probability_of(choose_set_model(set, "orient", o.backend, o.precision).file);
@@ -1284,6 +1309,7 @@ void Engine::Impl::read_lines(Job& j, std::span<const size_t> lines, int k) {
     // The logits decoded where the recognizer wrote them (about 20 MB a page, read once): no copy.
     std::vector<int32_t> lengths(m);
     std::vector<CtcLine> decoded;
+    std::vector<std::pair<size_t, std::vector<BeamLine>>> waiting;  // gated lines for the page's rescoring
     const std::vector<Tensor> in = one(std::move(x));
     w[k].rec->run(in, [&](std::span<const Session::OutputView> out) {
       const Session::OutputView& v = out[0];
@@ -1307,7 +1333,8 @@ void Engine::Impl::read_lines(Job& j, std::span<const size_t> lines, int k) {
                              cpu::rec_head_logits(fv + i * kk * frames, kk, frames, lengths[i], rec_head->head,
                                                   scratch.data());
                              return static_cast<const float*>(scratch.data());
-                           });
+                           },
+                           &waiting);
         return;
       }
       if (v.dtype != DType::kFloat32 || v.shape.size() != 3 || v.shape[0] != m) {
@@ -1318,13 +1345,38 @@ void Engine::Impl::read_lines(Job& j, std::span<const size_t> lines, int k) {
       }
       const int classes = static_cast<int>(v.shape[1]), frames = static_cast<int>(v.shape[2]);
       decoded = ctc_greedy(v.as<float>(), m, classes, frames, lengths);
-      detail::beam_lines(decoded, lengths, classes, frames, o, vocab, [&](size_t i, std::vector<float>&) {
-        return v.as<float>() + i * classes * frames;
-      });
+      detail::beam_lines(
+          decoded, lengths, classes, frames, o, vocab,
+          [&](size_t i, std::vector<float>&) { return v.as<float>() + i * classes * frames; }, &waiting);
     });
+    // the lines that wait for the page's rescoring (detail::rescore_page, in finish), read there with the line above
+    std::vector<char> waits(static_cast<size_t>(m), 0);
+    if (!waiting.empty()) {
+      std::vector<detail::UnsureLine> mine;
+      for (auto& [i, nb] : waiting) {
+        detail::UnsureLine u;
+        u.line = lines[a + i];
+        u.length = lengths[i];
+        u.nbest = std::move(nb);
+        if (o.spaces || o.word_boxes_at_ink) {
+          u.ink.resize(static_cast<size_t>(bw));
+          const uint8_t* c = crops.data() + i * h * bw;
+          if (detail::ink_columns(c, widths[i], h, bw, o.crop, u.ink.data())) {
+            u.ink_width = widths[i];
+          } else {
+            u.ink.clear();
+          }
+        }
+        waits[i] = 1;
+        mine.push_back(std::move(u));
+      }
+      std::lock_guard lk(j.unsure_m);
+      for (auto& u : mine) j.unsure.push_back(std::move(u));
+    }
     if (o.spaces || o.word_boxes_at_ink) {  // each crop's columns of ink, for its spaces and its words' boxes
       std::vector<uint8_t> ink(static_cast<size_t>(bw));
       for (int i = 0; i < m; ++i) {
+        if (waits[static_cast<size_t>(i)]) continue;
         const uint8_t* c = crops.data() + static_cast<size_t>(i) * h * bw;
         const bool has = detail::ink_columns(c, widths[i], h, bw, o.crop, ink.data());
         detail::read_line(j.out.lines[lines[a + i]], decoded[i], lengths[i], o.crop, vocab,
@@ -1333,6 +1385,7 @@ void Engine::Impl::read_lines(Job& j, std::span<const size_t> lines, int k) {
       }
     } else {
       for (int i = 0; i < m; ++i) {
+        if (waits[static_cast<size_t>(i)]) continue;
         detail::read_line(j.out.lines[lines[a + i]], decoded[i], lengths[i], o.crop, vocab, nullptr, 0, nullptr,
                           o.char_confidence);
       }
@@ -1343,6 +1396,8 @@ void Engine::Impl::read_lines(Job& j, std::span<const size_t> lines, int k) {
 
 void Engine::Impl::finish(Job& j, int k) {
   OcrPage& out = j.out;
+  detail::rescore_page(out, j.unsure, o, vocab);
+  j.unsure.clear();
   out.ms.recognize = ms_since(j.lines_start);
   detail::finish_page(out, w[k].order.get(), o);
   out.ms.total = ms_since(j.start);
@@ -1675,6 +1730,168 @@ bool ink_columns(const uint8_t* crop, int width, int h, int64_t stride, const Cr
   const int t = (darkest + p90) / 2;
   for (int x = 0; x < width; ++x) out[x] = low[static_cast<size_t>(x)] < t;
   return true;
+}
+
+void rescore_page(OcrPage& page, std::vector<UnsureLine>& lines, const EngineOptions& o,
+                  const std::vector<std::string>& vocab) {
+  if (lines.empty()) return;
+  const int32_t B = o.rescorer->boundary();
+  // every line's text as read, a waiting line's its best reading: one another's context
+  std::vector<std::string> text(page.lines.size());
+  for (size_t i = 0; i < page.lines.size(); ++i) text[i] = page.lines[i].text;
+  for (const UnsureLine& u : lines) {
+    std::string t;
+    for (const int32_t id : u.nbest.front().line.ids) {
+      if (id > 0 && static_cast<size_t>(id) < vocab.size()) t += vocab[static_cast<size_t>(id)];
+    }
+    text[u.line] = std::move(t);
+  }
+  std::unordered_map<std::string, int32_t> index;
+  size_t longest = 1;
+  for (size_t c = 1; c < vocab.size(); ++c) {
+    if (vocab[c].empty()) continue;
+    index.emplace(vocab[c], static_cast<int32_t>(c));
+    longest = std::max(longest, vocab[c].size());
+  }
+  // a text's classes, the longest class that matches at each place (a class may be more than one code point);
+  // a code point no class starts with is skipped
+  auto classes_of = [&](const std::string& s, std::vector<int32_t>& out) {
+    for (size_t i = 0; i < s.size();) {
+      size_t n = std::min(longest, s.size() - i);
+      for (; n > 0; --n) {
+        const auto it = index.find(s.substr(i, n));
+        if (it != index.end()) {
+          out.push_back(it->second);
+          break;
+        }
+      }
+      if (n > 0) {
+        i += n;
+        continue;
+      }
+      const unsigned char b = static_cast<unsigned char>(s[i]);
+      i += b < 0x80 ? 1 : (b >> 5) == 6 ? 2 : (b >> 4) == 14 ? 3 : (b >> 3) == 30 ? 4 : 1;
+    }
+  };
+  std::vector<std::vector<int32_t>> contexts(lines.size());
+  std::vector<std::vector<std::vector<int32_t>>> readings(lines.size());
+  std::vector<RescoreQuery> queries(lines.size());
+  for (size_t k = 0; k < lines.size(); ++k) {
+    const UnsureLine& u = lines[k];
+    const LineBox& b = page.lines[u.line].box;
+    const double h = b.y1 - b.y0, mid = 0.5 * (b.y0 + b.y1);
+    std::ptrdiff_t above = -1;
+    for (size_t j = 0; j < page.lines.size(); ++j) {
+      if (j == u.line) continue;
+      const LineBox& a = page.lines[j].box;
+      if (a.y1 > mid || b.y0 - a.y1 > 1.5 * h) continue;
+      const double overlap = std::min(a.x1, b.x1) - std::max(a.x0, b.x0);
+      if (overlap < 0.5 * std::min(a.x1 - a.x0, b.x1 - b.x0)) continue;
+      if (above < 0 || a.y1 > page.lines[static_cast<size_t>(above)].box.y1) above = static_cast<std::ptrdiff_t>(j);
+    }
+    std::vector<int32_t>& ctx = contexts[k];
+    ctx.push_back(B);
+    if (above >= 0) {
+      classes_of(text[static_cast<size_t>(above)], ctx);
+      // the line above's last 96 at most, cut as a training window starts: mid-line, no boundary before it
+      if (ctx.size() > 97) ctx.erase(ctx.begin(), ctx.end() - 96);
+      ctx.push_back(B);
+    }
+    for (const BeamLine& r : u.nbest) readings[k].push_back(r.line.ids);
+    queries[k] = {contexts[k], readings[k]};
+  }
+  std::vector<std::vector<double>> scores(lines.size());
+  o.rescorer->score_lines(queries, scores);
+  for (size_t k = 0; k < lines.size(); ++k) {
+    UnsureLine& u = lines[k];
+    size_t best = 0;
+    for (size_t i = 1; i < u.nbest.size(); ++i) {
+      if (u.nbest[i].score + o.beam.rescore * scores[k][i] > u.nbest[best].score + o.beam.rescore * scores[k][best]) {
+        best = i;
+      }
+    }
+    read_line(page.lines[u.line], u.nbest[best].line, u.length, o.crop, vocab, u.ink.empty() ? nullptr : u.ink.data(),
+              u.ink_width, u.ink.empty() || !o.spaces ? nullptr : &*o.spaces, o.char_confidence, o.word_boxes_at_ink);
+  }
+}
+
+namespace {
+
+std::string model_group(const EngineOptions& o) { return o.rec.rfind("rec-", 0) == 0 ? o.rec.substr(4) : o.rec; }
+
+// A mode's switches on o before the models are attached: the beam on, the model it does not name off; a model it
+// names that is neither given nor in the set refused
+void apply_lm_mode(EngineOptions& o, const std::filesystem::path& set) {
+  if (o.lm_mode == LmMode::kAuto) return;
+  if (o.lm_mode == LmMode::kNone) {
+    o.beam.width = 0;
+    return;
+  }
+  if (o.beam.width < 2) o.beam.width = kLmBeamWidth;
+  const bool ngram = o.lm_mode != LmMode::kTransformer, transformer = o.lm_mode != LmMode::kNgram;
+  const std::string mode(lm_mode_name(o.lm_mode)), group = model_group(o);
+  if (!ngram) {
+    o.language_model.reset();
+    o.lm = "off";
+  } else if (!o.language_model &&
+             (o.lm == "off" || (o.lm.empty() && !std::filesystem::exists(set / ("lm-" + group + ".bin"))))) {
+    throw Error("language models \"" + mode + "\": no n-gram model (the set has no lm-" + group +
+                ".bin; give one: lm)");
+  }
+  if (!transformer) {
+    o.rescorer.reset();
+    o.tlm = "off";
+  } else if (!o.rescorer &&
+             (o.tlm == "off" || (o.tlm.empty() && !std::filesystem::exists(set / ("tlm-" + group + ".bin"))))) {
+    throw Error("language models \"" + mode + "\": no transformer (the set has no tlm-" + group +
+                ".bin; give one: tlm)");
+  }
+}
+
+}  // namespace
+
+void attach_language_model(EngineOptions& o, const std::filesystem::path& set, const std::vector<std::string>& vocab,
+                           int rescorer_gpu) {
+  apply_lm_mode(o, set);
+  const float tlm_gate = attach_rescorer(o, set, vocab, rescorer_gpu);
+  float ngram_gate = 0;
+  if (o.beam.on() && !o.language_model && o.lm != "off") {
+    std::filesystem::path file = o.lm;
+    if (file.empty()) file = set / ("lm-" + model_group(o) + ".bin");
+    if (!o.lm.empty() || std::filesystem::exists(file)) {  // the set has none: the beam reads with the recognizer alone
+      std::shared_ptr<NgramModel> m = NgramModel::open(file);
+      m->check_vocab(vocab, file.string());
+      o.beam.alpha = o.lm_alpha.value_or(m->header().alpha);
+      o.beam.beta = o.lm_beta.value_or(m->header().beta);
+      ngram_gate = m->header().gate;
+      o.language_model = std::move(m);
+    }
+  }
+  if (o.lm_mode == LmMode::kAuto || o.lm_mode == LmMode::kNone) return;
+  // the gate the models were tuned at: the n-gram's where it reads, else the transformer's
+  const float tuned = o.lm_mode == LmMode::kTransformer ? tlm_gate : ngram_gate;
+  if (tuned > 0) o.beam.gate = tuned;
+  if (o.lm_gate) o.beam.gate = *o.lm_gate;
+}
+
+float attach_rescorer(EngineOptions& o, const std::filesystem::path& set, const std::vector<std::string>& vocab,
+                      int gpu) {
+  if (!o.beam.on() || o.rescorer || o.tlm == "off") return 0;
+  std::filesystem::path file = o.tlm;
+  if (file.empty()) {
+    file = set / ("tlm-" + model_group(o) + ".bin");
+    if (!std::filesystem::exists(file)) return 0;
+  }
+  std::shared_ptr<TransformerLM> t = TransformerLM::open(file);
+  t->check_vocab(vocab, file.string());
+  o.beam.rescore = o.tlm_alpha.value_or(t->header().alpha);
+  const float gate = t->header().gate;
+  if (gpu >= 0) {
+    o.rescorer = cuda_transformer_lm(file, gpu);
+  } else {
+    o.rescorer = std::move(t);
+  }
+  return gate;
 }
 
 float decoded_confidence(const CtcLine& d, const std::vector<std::string>& vocab, bool char_confidence) {

@@ -51,9 +51,16 @@ By default the pages run in parallel on the CPU, one worker per physical core. `
 | `--table-spans on\|off` | `on` | with `--grid off`, the order model's tables with their spanning cells (`colspan`, `rowspan`) |
 | `--blocks-first on\|off` | `off` | the order model's blocks as its same-block scores' clusters, not the runs of its order |
 | `--spaces model\|ink` | `model` | `ink`: drop a space the recognizer is unsure of where the line's ink shows no gap (the CPU only) |
-| `--beam N` | 0 | read the lines the recognizer is unsure of again by a CTC prefix beam of N prefixes (8 is the width to ask for); under 2: off, every line greedy |
+| `--beam N` | 0 | read the lines the recognizer is unsure of again by a CTC prefix beam of N prefixes (8 is the width to ask for), with the set's language models where it ships them; under 2: off, every line greedy |
 | `--beam-gate F` | 0.9 | the confidence under which a line goes to the beam; 0: none, 2: every line |
 | `--beam-topk N` | 5 | the classes each frame offers the beam besides the blank |
+| `--lm-mode auto\|none\|ngram\|transformer\|both` | `auto` | the language models as one switch. `ngram`: the lines under the gate read again by a beam of 8 with the set's n-gram (`lm-<group>.bin`); `transformer`: the beam's best readings rescored by the set's transformer (`tlm-<group>.bin`), each after the line above it; `both`: the two. Each model at the weights and gate tuned into its file; a mode whose model the set lacks is an error. `none`: greedy; `auto`: as `--beam`, `--lm` and `--tlm` set it |
+| `--lm-gate F` | the file's | under a mode, the confidence under which a line goes to the beam, 0 to 2 |
+| `--lm FILE\|off` | the set's | the n-gram the beam reads with; `off`: none |
+| `--lm-alpha F`, `--lm-beta F` | the file's | the n-gram's weight, and a bonus a character |
+| `--tlm FILE\|off` | the set's | the transformer that rescores the beam's readings (an FP32, FP16 or INT8 file); `off`: none |
+| `--tlm-alpha F` | the file's | the transformer's weight |
+| `--tlm-gpu N\|cpu` | the pipeline's GPU, else the CPU | the GPU the transformer runs on; `cpu`: the CPU's kernels |
 | `--as-given` | off | no quarter turns and no deskew: the page as given |
 | `--max-skew D` | 45 | deskew's range in degrees; 5: the narrow search alone |
 | `--wide-skew-gain F` | 1.25 | how much better than level a skew past 5 degrees must score to be levelled |
@@ -83,7 +90,7 @@ curl --data-binary @scan.jpg "http://127.0.0.1:8080/ocr?format=pdf" -o searchabl
 curl http://127.0.0.1:8080/info
 ```
 
-`serve` loads a set's models once and reads the pages clients send over HTTP/1.1, until Ctrl+C. Every client's pages share the engine. On the CPU each page goes to the next free worker, is decoded there and is answered as soon as it is read, so a slow page holds back no other. On the GPU (`--device cuda`) the batched pipeline puts every client's pages in its batches. `serve` takes `ocr`'s model, worker, device and page options (`--rec`, `--backend`, `--precision`, `--second-pass`, `--as-given`, `--gate`, `--block-order`, `--table-spans`, `--workers`, `--no-pin`, `--device`, `--batch`, `--in-flight`, `--engine-cache`), so it runs every model file the engine does. On the GPU, `--prefetch off` uploads each group's pages only when their turn comes. Connections are kept alive, and a client may send `Expect: 100-continue`.
+`serve` loads a set's models once and reads the pages clients send over HTTP/1.1, until Ctrl+C. Every client's pages share the engine. On the CPU each page goes to the next free worker, is decoded there and is answered as soon as it is read, so a slow page holds back no other. On the GPU (`--device cuda`) the batched pipeline puts every client's pages in its batches. `serve` takes `ocr`'s model, worker, device and page options (`--rec`, `--backend`, `--precision`, `--second-pass`, `--as-given`, `--gate`, `--block-order`, `--table-spans`, `--workers`, `--no-pin`, `--device`, `--batch`, `--in-flight`, `--engine-cache`, and the beam's and the language models': `--beam`, `--lm-mode` and the rest), so it runs every model file the engine does. On the GPU, `--prefetch off` uploads each group's pages only when their turn comes. Connections are kept alive, and a client may send `Expect: 100-continue`.
 
 | request | answer |
 |---|---|
@@ -176,6 +183,8 @@ for name in ["a.png", "b.png", "c.png"]:                           # a stream: e
 while (page := engine.next()) is not None:                          # in the order given
     print(page["ms"]["load"], page["text"][:60])
 
+engine = carbon_ocr.Engine("models/fullerene-1.1-3M", lm_mode="both")  # as --lm-mode both
+
 pipeline = carbon_ocr.Pipeline("models/fullerene-3M", page_batch=8)  # batched; same results
 pages = pipeline.ocr([carbon_ocr.load_image("a.png")])
 print(pipeline.stats)
@@ -184,7 +193,7 @@ session = carbon_ocr.Session("models/fullerene-3M/rec-latin.onnx", backend="ort"
 logits, = session.run([np.zeros((1, 1, 32, 512), np.float32)])     # [1, 800, 128]
 ```
 
-The module also exposes the engine's building blocks: the crop rule (`crop`, `crop_lines`, `crop_region`), the CTC decoders (`ctc_greedy`, `ctc_collapse`), the detector's decoder and the merge of its two passes (`decode_det`, `takes_second_pass`, `merge_passes`), the order model's features and decoder (`order_features`, `decode_order`, `reading_order`), and text scoring (`text_errors`, `char_confusions`). [python/README.md](../python/README.md) lists all of them.
+The module also exposes the engine's building blocks: the crop rule (`crop`, `crop_lines`, `crop_region`), the CTC decoders (`ctc_greedy`, `ctc_collapse`, `ctc_beam`, `ctc_beam_nbest`), the language models (`NgramModel`, `TransformerLM`, `cuda_transformer_lm`), the detector's decoder and the merge of its two passes (`decode_det`, `takes_second_pass`, `merge_passes`), the order model's features and decoder (`order_features`, `decode_order`, `reading_order`), and text scoring (`text_errors`, `char_confusions`). [python/README.md](../python/README.md) lists all of them.
 
 ## <img src="assets/chip-06.svg" height="22" alt=""> OCRmyPDF
 

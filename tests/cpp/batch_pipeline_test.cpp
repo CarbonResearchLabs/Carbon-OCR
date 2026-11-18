@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -159,6 +160,78 @@ TEST(BatchPipeline, ReadsUnsureLinesByTheBeamAsTheEngineDoes) {
   const std::vector<OcrPage> same = Engine(kSet, none).ocr(pages);
   EXPECT_EQ(lm->calls.load(), 0);
   for (size_t i = 0; i < same.size(); ++i) expect_same(same[i], greedy[i], static_cast<int>(i));
+}
+
+// A rescorer that records what it is asked: the contexts, and the batches (a page's at once); a shorter reading
+// scores higher, so it moves the choice.
+class Recording : public LineRescorer {
+ public:
+  void score(std::span<const int32_t> context, std::span<const std::vector<int32_t>> readings,
+             std::span<double> out) const override {
+    std::lock_guard lk(m);
+    contexts.emplace_back(context.begin(), context.end());
+    for (size_t i = 0; i < readings.size(); ++i) out[i] = -static_cast<double>(readings[i].size());
+  }
+  void score_lines(std::span<const RescoreQuery> q, std::span<std::vector<double>> out) const override {
+    {
+      std::lock_guard lk(m);
+      ++batches;
+    }
+    LineRescorer::score_lines(q, out);
+  }
+  int boundary() const override { return 999; }
+  mutable std::mutex m;
+  mutable std::vector<std::vector<int32_t>> contexts;
+  mutable int batches = 0;
+};
+
+// The rescorer (EngineOptions::rescorer) at the page's finish: every gated line of a page in one batch, each with
+// the line above as its context where it has one; the pipeline's pages the engine's; a weight of 0 asks it nothing.
+TEST(BatchPipeline, RescoresAPagesUnsureLinesWithTheLineAbove) {
+  const GrayImage page = load_image(kSet / "page.png");
+  const GrayImage tiny = tiny_page();
+  GrayImage close = paper(800, 1024);  // three lines of dashes 20 px high, 14 px apart: each the one above's next
+  const int dashes[] = {3, 4, 2};
+  for (int i = 0; i < 3; ++i) {
+    const int y = 300 + 34 * i;
+    for (int d = 0; d < dashes[i]; ++d) {
+      for (int r = y; r < y + 20; ++r) std::fill_n(close.pixels.begin() + r * 800 + 100 + 40 * d, 30, uint8_t{20});
+    }
+  }
+  const std::vector<GrayView> pages = {page.view(), tiny.view(), close.view()};
+  EngineOptions eo;
+  eo.pool.workers = 2;
+  eo.beam.width = 8;
+  eo.beam.gate = 2.0f;  // every line
+  eo.beam.rescore = 1.0f;
+  auto rec = std::make_shared<Recording>();
+  eo.rescorer = rec;
+  const std::vector<OcrPage> want = Engine(kSet, eo).ocr(pages);
+  EXPECT_EQ(rec->batches, 3);
+  bool above = false;
+  for (const auto& c : rec->contexts) {
+    ASSERT_FALSE(c.empty());
+    EXPECT_EQ(c.front(), 999);
+    if (c.size() > 2) {
+      EXPECT_EQ(c.back(), 999);
+      above = true;
+    }
+  }
+  EXPECT_TRUE(above);  // the fake page's lines lie one above the other
+  auto rec2 = std::make_shared<Recording>();
+  PipelineOptions po = cpu_options();
+  po.engine = eo;
+  po.engine.rescorer = rec2;
+  const std::vector<OcrPage> got = Pipeline(kSet, po).ocr(pages);
+  for (size_t i = 0; i < got.size(); ++i) expect_same(got[i], want[i], static_cast<int>(i));
+  EXPECT_EQ(rec2->batches, 3);
+  EXPECT_EQ(rec2->contexts.size(), rec->contexts.size());
+  auto rec3 = std::make_shared<Recording>();
+  EngineOptions off = eo;
+  off.rescorer = rec3;
+  off.beam.rescore = 0.0f;
+  Engine(kSet, off).ocr(pages);
+  EXPECT_EQ(rec3->batches, 0);
 }
 
 // Many pages in flight: a detection run holds several pages of a size, a

@@ -22,5 +22,6 @@ models/fullerene-7M/
   ...
   order.onnx           reading order and layout
   order.native.bin     its weights for the engine's own CPU kernels
-  lm-latin.bin         n-gram language models
+  lm-latin.bin         n-gram language models, one per script group, where a set ships them
+  tlm-latin.bin        transformer language models (FP32; tlm-latin.fp16.bin, FP16)
 ```

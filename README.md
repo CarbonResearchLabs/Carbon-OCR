@@ -21,7 +21,7 @@ The goal is to be far more accurate than Tesseract and faster than every open en
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/glance-dark.svg">
-  <img src="docs/assets/glance-light.svg" alt="Designed: 2.83 M parameters in fullerene-3M; 10.8 GMAC per Latin page; OmniParseBench headline 52.3 against Tesseract's 5.9. Measured: rec-latin at 62 GMAC/s on one CPU core and 12.8 TMAC/s in FP16 on a laptop RTX 4060; 278 tests, 262 of them in CI" width="100%">
+  <img src="docs/assets/glance-light.svg" alt="Designed: 2.83 M parameters in fullerene-3M; 10.8 GMAC per Latin page; OmniParseBench headline 52.3 against Tesseract's 5.9. Measured: rec-latin at 62 GMAC/s on one CPU core and 12.8 TMAC/s in FP16 on a laptop RTX 4060; 291 tests, 270 of them in CI" width="100%">
 </picture>
 
 The top row is the Latin set: its parameters and its compute for a page, counted from the models' layer shapes, and its score on OmniParseBench. The bottom row is the kernels' speed, measured on random weights since speed does not depend on them, and the tests (Measured so far, below).
@@ -35,7 +35,7 @@ The top row is the Latin set: its parameters and its compute for a page, counted
 
 - **Input.** Pages come in as images (PNG, JPEG, BMP, PNM) or PDFs. PDFium renders a PDF in helper processes, so a PDF that crashes it takes down a helper, not your program. When a born-digital page's text layer passes the checks, the page is read from that layer, its words set in the lines the detector finds, and only its pictures go through OCR.
 - **Orient and deskew.** A small model turns a page by quarter turns when it is sure. A projection search levels what remains, up to 45 degrees, so a page photographed askew reads too.
-- **Detect and recognize.** A small line detector, then CTC recognizers per script, read every line of every page in flight in a few batched calls. A page of tiny text is detected again at twice the scale and the two passes merged line by line. On the GPU, the recognizer's last layer runs fused with greedy CTC decoding, so the logits never leave the chip: only ids, confidences and frame positions come back. The lines it is unsure of can be read again by a CTC prefix beam (`--beam 8`, off by default), which a language model plugs into.
+- **Detect and recognize.** A small line detector, then CTC recognizers per script, read every line of every page in flight in a few batched calls. A page of tiny text is detected again at twice the scale and the two passes merged line by line. On the GPU, the recognizer's last layer runs fused with greedy CTC decoding, so the logits never leave the chip: only ids, confidences and frame positions come back. The lines it is unsure of can be read again by a CTC prefix beam with the set's language models, a character n-gram and a small transformer (`--lm-mode`, off by default).
 - **Order and output.** A reading-order and layout model orders the lines and groups them into labeled blocks. Where it is unsure, an XY-cut does the ordering. In the blocks it marks as tables, the engine builds the grid from the lines' rows and columns: a table cut in two joined again, a cell set on two lines kept as one, row labels spanning their rows. The result goes out as text, markdown, HTML, JSON, hOCR, ALTO, PAGE XML or a searchable PDF.
 
 On the CPU, a pinned worker per physical core reads pages in parallel, from a list or a stream (`submit` and `next`) that keeps every core busy. Work is cut smaller than a page, so a single page also uses every core. The int8 kernels are picked at run time for the CPU: AVX2, AVX-VNNI, AVX-512, NEON or the Arm dot product. On the GPU, `carbon::Pipeline` batches each model across all the pages in flight. `carbon-ocr serve` keeps a set loaded and reads pages sent over HTTP/1.1, with every client's pages sharing the CPU's workers or the GPU's batches. [docs/ENGINE.md](docs/ENGINE.md) covers the engine in full.
@@ -61,6 +61,8 @@ Fullerene is eight small networks, shipped in two sets named by their parameter 
 
 All the models use ReLU and channels in multiples of 16. Their RepVGG blocks are folded into plain 3×3 convolutions in the shipped files. Each model ships as ONNX in FP32, FP16 and INT8 (Q/DQ), and the engine runs each precision on the CPU and, through TensorRT, on the GPU (`--precision`); the GPU's INT8 is a symmetric file of its own. The recognizers read a 32-px band of the line and give a CTC frame per 4 px of width.
 
+Beside the networks, a set can ship two language models per script group, which read again only the lines a recognizer is unsure of: a character 7-gram (`lm-latin.bin`, memory-mapped) and a small character transformer of 0.9 M parameters (`tlm-latin.bin`, in FP32 and FP16) that rescores a line's best readings after the line above it. They are off by default and switched on with `--lm-mode ngram`, `transformer` or `both`. The Latin set `fullerene-1.1-3M` ships both.
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/fig-page-compute-dark.svg">
   <img src="docs/assets/fig-page-compute-light.svg" alt="Compute per page by stage, in GMAC: recognition is four fifths of a Latin page." width="100%">
@@ -84,6 +86,15 @@ The trained `fullerene-3M` ([on Hugging Face](https://huggingface.co/CarbonResea
 | OmniDocBench: reading order (edit distance, lower is better) | 0.293 | **0.253** |
 
 Read as PDFs means through `carbon-ocr ocr`, as you would run it: each page from its text layer where the layer passes its checks, its words set in the lines the detector finds, and by OCR otherwise. Setting the words in the detector's lines costs the text pages about 10% of their speed (`--layer-lines layer` skips it). Tesseract writes text alone, so it scores 0 on tables and layout. Where `fullerene-3M` loses: Tesseract reads OmniDocBench's text better and orders it a little better, most of all on newspapers (an edit distance of 0.097 against 0.305). Tesseract also reads more of olmOCR-Bench's old scans (20.7 to 16.0), and neither writes LaTeX (0 on the math tests). [docs/ENGINE.md](docs/ENGINE.md) has each benchmark's breakdown.
+
+**With the language models** (17 November): `fullerene-1.1-3M`, a newer Latin set that ships them, read greedily and with each mode on every page, each benchmark graded by its own grader. The models' weights and gates were tuned on held-out lines, never on the benchmarks.
+
+| benchmark | greedy | `--lm-mode ngram` | `--lm-mode both` | Tesseract 5.5 |
+|---|---|---|---|---|
+| OmniParseBench, 2,937 page images: headline | 54.26 | **55.28** | 55.27 | 5.95 |
+| olmOCR-Bench, 1,403 PDFs read as images | 51.5 | 52.4 | **52.8** | 34.2 |
+
+The beam alone, without a model, keeps greedy's readings (54.21 and 51.5): the gains are the models'. OmniDocBench's text is the one measure the models do not improve: an edit distance of 0.152 greedy, 0.156 with the n-gram and 0.159 with both, against Tesseract's 0.129.
 
 **Speed**, on a desktop (a virtual machine with 8 CPUs of an Intel Core i5-13600KF, and an RTX 4060 Ti), 17 November:
 - **5.14 pages a second on one core** against Tesseract's 0.92, so 5.6 times as fast (a median page of 165 ms against 789), and 31.3 against 6.0 in eight processes.
@@ -163,6 +174,10 @@ carbon-ocr ocr scan.pdf --set models/fullerene-3M --format pdf --output searchab
 carbon-ocr ocr scans/*.png --set models/fullerene-3M --device cuda --engine-cache .engines
 carbon-ocr ocr scans/*.png --set models/fullerene-3M --device cuda --precision fp32
 
+# unsure lines read again with the language models, on a set that ships them
+carbon-ocr ocr page.png --set models/fullerene-1.1-3M --lm-mode ngram
+carbon-ocr ocr page.png --set models/fullerene-1.1-3M --lm-mode both --tlm-gpu 0
+
 # an HTTP server on 127.0.0.1:8080, and a page sent to it
 carbon-ocr serve --set models/fullerene-3M
 curl --data-binary @page.png "http://127.0.0.1:8080/ocr?format=text"
@@ -173,6 +188,8 @@ carbon-ocr cpus --gemm
 
 `serve` keeps the models loaded and answers each page sent to `POST /ocr` in any of `ocr`'s formats (JSON by default), with every client's pages sharing the CPU's workers or, with `--device cuda`, the GPU's batches.
 
+`--lm-mode` switches the language models as one option. `none` reads every line greedily, as the engine does by default; `ngram` reads the lines under the gate again with a CTC prefix beam of 8 and the set's 7-gram (`lm-latin.bin`); `transformer` rescores the beam's best readings with the set's transformer (`tlm-latin.bin`), each after the line above it; `both` does both. Each model runs at the weights and gate tuned into its file for the set's recognizer. `--lm-gate`, `--lm-alpha`, `--lm-beta` and `--tlm-alpha` override them, and `--tlm-gpu N` runs the transformer on that GPU (on the CPU otherwise; with `--device cuda`, on the pipeline's GPU). A mode whose model the set lacks is an error. On `fullerene-1.1-3M` the n-gram takes OmniParseBench from 54.26 to 55.28 and olmOCR-Bench from 51.5 to 52.4, at 85% of greedy's pages a second (4.15 on one core to 4.88); both models take olmOCR-Bench to 52.8, at a quarter of them on one core and 30% on 8 workers with the transformer on the GPU. `serve` takes the same options.
+
 ```python
 import carbon_ocr
 
@@ -181,6 +198,8 @@ page = engine.ocr([carbon_ocr.load_image("page.png")])[0]
 print(page["text"])
 for line in page["lines"]:
     print(line["box"], line["confidence"], line["text"])
+
+engine = carbon_ocr.Engine("models/fullerene-1.1-3M", lm_mode="ngram")  # as --lm-mode ngram
 ```
 
 Carbon-OCR also runs as OCRmyPDF's OCR engine:
@@ -190,7 +209,7 @@ ocrmypdf --plugin tools/ocrmypdf/carbon_ocrmypdf.py \
     --carbon-set models/fullerene-3M in.pdf out.pdf
 ```
 
-[docs/USAGE.md](docs/USAGE.md) covers every command and option, the output formats, the Python module and the plugin. [Examples/](Examples) has Jupyter notebooks that work through the engine from Python and the command line: a quickstart, every option tried on a page where it matters, streams and batches, each step by hand, measuring accuracy, and the HTTP server.
+[docs/USAGE.md](docs/USAGE.md) covers every command and option, the output formats, the Python module and the plugin. [Examples/](Examples) has Jupyter notebooks that work through the engine from Python and the command line: a quickstart, every option tried on a page where it matters, streams and batches, each step by hand, measuring accuracy, the HTTP server, and the language models.
 
 ## <img src="docs/assets/chip-07.svg" height="22" alt=""> Repository
 

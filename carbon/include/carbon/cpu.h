@@ -337,6 +337,29 @@ void rec_head_logits(const float* features, int k, int frames, int t_n, const Pa
 void ctc_topk(const float* logits, int classes, int frames, int t_n, int k, int32_t* ids, float* logp, float* blank,
               Isa isa = best_isa());
 
+// ---------------------------------------------------------------- the transformer language model's (carbon/tlm.h)
+//
+// layer_norm_rows: each of n_rows rows of n floats (rows ld apart) to (v - mean) / sqrt(var + eps) * w + b, into out
+// (rows out_ld apart; out may be x). The mean and the variance in two passes over the row.
+void layer_norm_rows(const float* x, int64_t ld, int n_rows, int n, const float* w, const float* b, float eps,
+                     float* out, int64_t out_ld, Isa isa = best_isa());
+// log_softmax_pick: for each of n_rows rows of n logits (rows ld apart; 0: one row for every target), the log-softmax
+// of its target column: the row's max, the sum of exp_neg(v - max) over the row, and v[target] less the max and ln of
+// the sum.
+void log_softmax_pick(const float* x, int64_t ld, int n_rows, int n, const int32_t* targets, float* out,
+                      Isa isa = best_isa());
+// attend: one query of dh values (a multiple of 8) against the keys of up to two runs, each n rows ld apart with
+// their values beside them: the scores q.k times scale, their softmax, and the values summed by it into out[dh].
+// scratch holds a score a key.
+struct KeyRun {
+  const float* k = nullptr;
+  const float* v = nullptr;
+  int64_t ld = 0;
+  int n = 0;
+};
+void attend(const float* q, int dh, const KeyRun* runs, int n_runs, float scale, float* out, float* scratch,
+            Isa isa = best_isa());
+
 // det_head: the line detector's head (fullerene det) in one pass.  From x[in][h4][w4] (the FPN's stride-4 features):
 // a 1x1 convolution to `mid` channels and ReLU, a nearest 2x upsample, a depthwise 3x3 (padding 1) and ReLU, and a
 // 1x1 convolution to the `out` maps; rows row0 to row1 - 1 of maps[out][2 h4][2 w4].  The stride-2 tensors between

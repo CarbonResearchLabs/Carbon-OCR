@@ -57,6 +57,7 @@ struct BeamRule {
   float blank_skip = 0.999f;  // a frame whose blank has at least this probability starts no character; >= 1: none
   float alpha = 0.0f;         // the language model's weight
   float beta = 0.0f;          // a bonus a character (it offsets the language model's cost of each)
+  float rescore = 0.0f;       // the rescorer's weight (EngineOptions::rescorer) on its ln P of each of the n best
   bool on() const { return width >= 2; }
 };
 
@@ -76,6 +77,12 @@ class LanguageModel {
     (void)state;
     return 0.0f;
   }
+  // Many queries at once: out[i] = score(states[i], classes[i], next[i]). The beam asks a frame's new prefixes
+  // together, so a model may overlap their memory reads (NgramModel prefetches).
+  virtual void score_batch(std::span<const uint64_t> states, std::span<const int32_t> classes, std::span<float> out,
+                           std::span<uint64_t> next) const {
+    for (size_t i = 0; i < states.size(); ++i) out[i] = score(states[i], classes[i], next[i]);
+  }
 };
 
 // A line the beam read.
@@ -89,6 +96,9 @@ struct BeamLine {
 
 // Throws Error for a malformed FrameCandidates.
 BeamLine ctc_beam(const FrameCandidates& f, const BeamRule& rule, const LanguageModel* lm = nullptr);
+// The beam's n best survivors by their exact scores, best first (at most the width and greedy's): what a second
+// model rescores (carbon/tlm.h). Width 1 gives one.
+std::vector<BeamLine> ctc_beam_nbest(const FrameCandidates& f, const BeamRule& rule, const LanguageModel* lm, int n);
 
 // ln P(ids | frames) over the candidates: the CTC forward algorithm over the
 // extended sequence (blank, c1, blank, c2, ..., blank); -inf where no path through

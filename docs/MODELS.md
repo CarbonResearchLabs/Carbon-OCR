@@ -268,7 +268,12 @@ The start token is the embedding of a feature vector of −1s, which no line has
 
 ## <img src="assets/chip-08.svg" height="22" alt=""> Language models and formula models
 
-**Language models, `lm-<group>`.** The design pairs each script group with a character 7-gram language model, at most 15 MB, in a packed, memory-mapped format (`lm-latin.bin` and so on). It reads again only the lines a recognizer is unsure of, those whose mean CTC peak probability is under 0.9: the recognizer hands over its top classes per frame, and a beam of 8 in C++ rescores them on CPU threads, so a smudged "rn" that could be "m" comes out as the word the language makes likelier. The language models are not counted in the sets' parameters. The beam is in the engine (`carbon/beam.h`, `--beam 8`, off by default; the engine guide's section 5), on the CPU and the GPU, with a seam for the model (`carbon::LanguageModel`); the language models themselves are not built yet.
+**Language models, `lm-<group>` and `tlm-<group>`.** A recognizer reads each frame from its pixels alone, so on an unsure line it can pick a look-alike. Each script group can have two language models, files beside its recognizer, that read again only the lines it is unsure of, so a smudged "rn" that could be "m" comes out as the word the language makes likelier. They are not counted in the sets' parameters, and they are off by default (`--lm-mode`; the engine guide's section 5).
+- **The n-gram, `lm-<group>.bin`:** a character n-gram over the recognizer's own classes (interpolated modified Kneser-Ney, pruned), in a packed format the engine memory-maps (`carbon/lm.h`). It is a file, not a network: no parameters. `lm-latin.bin` is a 7-gram counted on 500 M characters of text, the benchmarks' texts left out: 1.02 GB, 9.1 M 7-grams.
+- **The transformer, `tlm-<group>.bin`:** a small causal character transformer (`carbon/tlm.h`), 912,256 parameters for Latin (3.6 MB in FP32), that rescores the beam's best readings of a line with the line above it as context, on the CPU's kernels or a GPU's tensor cores. It ships in FP32 and FP16 (`tlm-latin.fp16.bin`), each file gated against FP32; the engine also reads an INT8 file, where one passes its gate (Latin's did not).
+- **How they read:** a line whose confidence is under the gate is read again by a CTC prefix beam of 8 over each frame's five likeliest classes and the blank. The n-gram scores each prefix as the beam makes it; the transformer rescores the beam's best readings once the page's lines are read. Each file carries its weights and gate, tuned for the set's recognizer on held-out lines, never on the benchmarks, and `--lm-mode ngram`, `transformer` or `both` runs it at them.
+- **Measured** (17 November, on `fullerene-1.1-3M`, which ships `lm-latin` and `tlm-latin`): on held-out lines the 7-gram cuts the recognizer's character errors from 11.64% to 10.10% (handwriting 33.6% to 28.9%). OmniParseBench goes from 54.26 greedy to 55.28 with the 7-gram and 55.27 with both, against Tesseract 5.5's 5.95; olmOCR-Bench from 51.5 to 52.4 and 52.8, against 34.2. OmniDocBench's plain text gets a little worse (an edit distance of 0.152 to 0.156 with the 7-gram).
+- **Speed** (the same day): on one CPU core of a desktop (a virtual machine with 8 CPUs of an Intel Core i5-13600KF): 4.88 pages a second greedy, 4.15 with the 7-gram, 1.17 with the transformer on the CPU (it rescores every line), against Tesseract's 0.92; one process of 8 workers reads 29.3, 25.1 and 8.8 pages a second, the transformer on the desktop's RTX 4060 Ti.
 
 **Formula models, `mathcls` and `math`.** Planned, opt-in and off by default, in neither set: `mathcls`, a line classifier that flags the lines holding math, so the other lines never pay for it; and `math`, a small encoder-decoder that writes inline LaTeX for the flagged lines, with cached keys and values and an early stop on low confidence.
 
@@ -296,7 +301,10 @@ models/fullerene-3M/
   order.native.bin              its weights, for the native CPU backend
   order.fp16.onnx  order.int8.onnx  order.int8-sym.onnx
   meta.json                     the models' contracts
-  lm-latin.bin                  the language model (planned)
+  lm-latin.bin                  the n-gram language model (in sets that ship it:
+                                fullerene-1.1-3M)
+  tlm-latin.bin                 the transformer language model, FP32
+  tlm-latin.fp16.bin            FP16
 ```
 
 `fullerene-10M` adds the same files for `rec-rtl`, `rec-indic` and `rec-cjk`.
@@ -304,6 +312,8 @@ models/fullerene-3M/
 - **`<rec>.vocab.json`:** `{"model": "rec-latin", "blank": 0, "chars": [...]}`. The engine reads `chars`: class i is `chars[i]`, one string each, and class 0 is the blank.
 - **`<rec>.head.bin`:** the recognizer's last 1×1 convolution, little-endian: the magic `CTCHEAD1`, int32 classes, int32 k (the trunk's channels: 256 for `rec-latin`, 192 for `rec-cjk`), the weight `[classes][k]` in float16, the bias `[classes]` in float32.
 - **`order.native.bin`:** `order`'s weights for the engine's own kernels, little-endian: the magic `ORDERNT1`; int32 d, layers, heads, feed-forward width, features (16) and labels (13); then float32 weights, `[out][in]`: the embedding's weight and bias, each layer's attention input and output and its two feed-forward layers (weights and biases), the five pairwise forms (weights only), and the labels' weight and bias.
+- **`lm-<group>.bin`:** the n-gram, little-endian, every section on 64 bytes: a 512-byte header (the magic `CRBNGRM1`, version 1, the order N, the recognizer's classes, the bits a token takes in a packed context, the vocabulary's hash, each order's table, the tuned alpha, beta and gate, each order's discounts, the corpus's tokens and lines, a note), the unigrams, then each order's open-addressing hash table of 16-byte entries (a 64-bit fingerprint of the n-gram, ln P and ln of its back-off weight). Its tokens are the recognizer's classes 1 to classes − 1 and the line's boundary, `classes`. `carbon/lm.h` has the layout.
+- **`tlm-<group>.bin`:** the transformer, little-endian: a 256-byte header (the magic `CRBNTLM1`, the version, d, layers, heads, the feed-forward width, the window, tokens and classes, the vocabulary's hash, the tuned weight and a character's bonus, the parameters, the held-out nats a token, a note, the precision and the tuned gate), then the tensors: the embedding and the positions; each layer's two layer norms, its attention's input and output, and its feed-forward; the final layer norm. The output is the embedding's transpose. Version 1 is FP32; version 2 adds FP16 (every tensor binary16) and INT8 (each weight int8 per output channel with its scales, each layer's input's scale and zero point). `carbon/tlm.h` has the layout.
 - **`meta.json`:** each model's contract, for tools and people: its input and output names, dtypes and shapes, its parameter count, and for a recognizer its crop rule and frame. The engine does not read it; what the engine needs is in the ONNX files and the vocabulary.
 
 Which files each path opens:
@@ -312,6 +322,7 @@ Which files each path opens:
 |---|---|
 | the CPU engine (`carbon::Engine`, `Pipeline` on the CPU) | `orient`, `det` and the recognizer as `.int8.onnx` where the set has it, else `.onnx`; `det.onnx` too, for detection on several threads; `<rec>.vocab.json`; `order.native.bin`, else `order.onnx` (without either, the XY-cut) |
 | the GPU pipeline (`Pipeline` on CUDA) | at `--precision auto`, the default: `orient.fp16.onnx` and `det.fp16.onnx` (else their `.onnx`), `<rec>.features.fp16.onnx` and `<rec>.head.bin` (else `<rec>.onnx`); at `fp32` the `.onnx` files, at `int8` the `.int8-sym.onnx` files; `<rec>.vocab.json`; the order model as on the CPU |
+| the language models, either path, with the beam on (`--lm-mode`, or `--beam`) | `lm-<group>.bin` and `tlm-<group>.bin`, the group the recognizer's name after `rec-` (`latin` for `rec-latin`), each where the set has it; `--lm` and `--tlm` name other files (`tlm-latin.fp16.bin`, say) |
 
 ## <img src="assets/chip-10.svg" height="22" alt=""> The metadata and checks the engine reads
 

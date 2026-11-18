@@ -19,11 +19,13 @@
 #include <utility>
 #include <vector>
 
+#include "carbon/beam.h"
 #include "carbon/deskew.h"
 #include "carbon/error.h"
 #include "carbon/image.h"
 #include "carbon/output.h"
 #include "carbon/textlayer.h"
+#include "carbon/tlm.h"
 #include "../../carbon/src/engine_steps.h"
 #include "../../carbon/src/escape_scan.h"
 
@@ -1008,6 +1010,77 @@ TEST(Gate, TheGradedOptions) {
   const double x0 = crop_region(boxed.box, crop).x0;
   EXPECT_NEAR(boxed.words[0].box.x0, std::max(0.0, x0 + 4 * per_px), 1e-9) << "out of the glyph to its blank";
   EXPECT_NEAR(boxed.words[0].box.x1, x0 + 14 * per_px, 1e-9) << "back from the gap to the ink";
+}
+
+// A rescorer that keeps each context it is given, in the order asked, and the calls; a shorter reading scores higher.
+class ContextLog : public LineRescorer {
+ public:
+  void score(std::span<const int32_t> context, std::span<const std::vector<int32_t>> readings,
+             std::span<double> out) const override {
+    contexts.emplace_back(context.begin(), context.end());
+    for (size_t i = 0; i < readings.size(); ++i) out[i] = -static_cast<double>(readings[i].size());
+  }
+  void score_lines(std::span<const RescoreQuery> q, std::span<std::vector<double>> out) const override {
+    ++calls;
+    LineRescorer::score_lines(q, out);
+  }
+  int boundary() const override { return 999; }
+  mutable std::vector<std::vector<int32_t>> contexts;
+  mutable int calls = 0;
+};
+
+// detail::rescore_page: each waiting line after the line above it, that line's text in the recognizer's classes by
+// the longest class at each place (a code point no class starts with skipped), its last 96 alone where it is longer
+// (mid-line, as a training window starts: no boundary before them); a waiting line above another its best reading;
+// a line with none above the boundary alone; every line in one call, each read as its best reading after the rescore.
+TEST(Engine, RescoresAPagesWaitingLinesAfterTheLineAbove) {
+  const std::vector<std::string> vocab = {"", "a", "b", " ", "ch", "c", "h"};
+  auto reading = [](std::vector<int32_t> ids, double score) {
+    BeamLine r;
+    for (size_t i = 0; i < ids.size(); ++i) {
+      r.line.frames.push_back(static_cast<int32_t>(2 + 2 * i));
+      r.line.probs.push_back(0.9f);
+    }
+    r.line.ids = std::move(ids);
+    r.score = score;
+    return r;
+  };
+  const std::string first = std::string(100, 'a') + "chx\xc3\xa9" "b";  // 100 a, ch, x and é (no class), b
+  OcrPage page;
+  page.width = 1400;
+  page.height = 300;
+  page.lines.resize(4);
+  page.lines[0].box = {0, 0, 300, 20};
+  page.lines[0].text = first;                  // read already
+  page.lines[1].box = {0, 30, 300, 50};        // under line 0, 10 px down
+  page.lines[2].box = {0, 60, 300, 80};        // under line 1 (line 0 is 40 px up: more than 1.5 of its heights)
+  page.lines[3].box = {1000, 200, 1300, 220};  // under none: no line overlaps it across
+  std::vector<detail::UnsureLine> waiting(3);
+  waiting[0].line = 1;
+  waiting[0].nbest = {reading({4, 5, 6, 1}, -1.0), reading({2}, -1.5)};  // "chcha" the beam's; "b" after the rescore
+  waiting[1].line = 2;
+  waiting[1].nbest = {reading({2, 3, 1}, 0.0)};
+  waiting[2].line = 3;
+  waiting[2].nbest = {reading({1, 1, 1}, 0.0), reading({1}, -0.5)};
+  for (detail::UnsureLine& u : waiting) u.length = 16;
+  EngineOptions o;
+  o.beam.rescore = 1.0f;
+  auto log = std::make_shared<ContextLog>();
+  o.rescorer = log;
+  detail::rescore_page(page, waiting, o, vocab);
+
+  EXPECT_EQ(log->calls, 1);
+  ASSERT_EQ(log->contexts.size(), 3u);
+  std::vector<int32_t> cut(94, 1);  // line 0's 102 classes, its last 96: 94 a, ch, b; then the boundary
+  cut.insert(cut.end(), {4, 2, 999});
+  EXPECT_EQ(log->contexts[0], cut);
+  EXPECT_EQ(log->contexts[1], (std::vector<int32_t>{999, 4, 4, 1, 999}))  // "chcha" by the longest: ch, ch, a
+      << "line 1's best reading as the beam read it, not as it was rescored";
+  EXPECT_EQ(log->contexts[2], (std::vector<int32_t>{999}));
+  EXPECT_EQ(page.lines[1].text, "b");  // -1.5 - 1 over -1.0 - 4
+  EXPECT_EQ(page.lines[2].text, "b a");
+  EXPECT_EQ(page.lines[3].text, "a");  // -0.5 - 1 over 0 - 3
+  EXPECT_EQ(page.lines[0].text, first) << "a line read already is left as it was";
 }
 
 // The JSON writer's numbers (std::to_chars) as printf writes them on this platform, ties included, and its

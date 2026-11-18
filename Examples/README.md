@@ -10,6 +10,7 @@ Jupyter notebooks on using the Carbon-OCR engine and tuning it. Each one runs on
 | [4. Inside the engine](04-inside-the-engine.ipynb) | each step by hand with the models' sessions: orientation, detection and the line decoder's thresholds, the second pass and its merge, the crop rule, recognition and CTC decoding, the order model and the XY-cut |
 | [5. Measuring accuracy](05-measuring-accuracy.ipynb) | CER and WER, pages made harder by blur, noise, JPEG, low resolution and faded ink, the characters confused, a line's confidence against its errors, a folder of your own pages measured |
 | [6. The command line and the server](06-command-line-and-server.ipynb) | `carbon-ocr ocr` and its eight formats, the command line's options, searchable PDFs and PDFs with text of their own, the timing tools, `carbon-ocr serve` over HTTP, the GPU and OCRmyPDF |
+| [7. The language models](07-language-models.ipynb) | `lm_mode` and `--lm-mode`: none, the 7-gram, the transformer, both, on clean and harder pages; what each changes and costs; the files' tuned weights and setting them by hand (a set that ships them: `CARBON_OCR_SET`, `fullerene-1.1-3M`) |
 
 ## Setup
 
@@ -21,8 +22,8 @@ pip install -r Examples/requirements.txt # Jupyter, matplotlib, Pillow, huggingf
 jupyter lab Examples
 ```
 
-- **The model set.** The notebooks read pages with `fullerene-3M` from `models/fullerene-3M`, and download it there from [Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M) the first time (about 20 MB). To use a set kept elsewhere, set `CARBON_OCR_SET` to its folder.
-- **The command line.** Notebook 6 runs `carbon-ocr`, built with CMake as the [build guide](https://github.com/CarbonResearchLabs/Carbon-OCR/blob/main/docs/BUILD.md) describes. It finds the program in `build/<preset>/cli/`, on the `PATH`, or where `CARBON_OCR` points. Notebooks 1 to 5 need only the Python module.
+- **The model set.** The notebooks read pages with `fullerene-3M` from `models/fullerene-3M`, and download it there from [Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M) the first time (about 20 MB). To use a set kept elsewhere, set `CARBON_OCR_SET` to its folder. Notebook 7 needs a set that ships the language models, `fullerene-1.1-3M`.
+- **The command line.** Notebook 6 runs `carbon-ocr`, built with CMake as the [build guide](https://github.com/CarbonResearchLabs/Carbon-OCR/blob/main/docs/BUILD.md) describes. It finds the program in `build/<preset>/cli/`, on the `PATH`, or where `CARBON_OCR` points. Notebooks 1 to 5 and 7 need only the Python module (7's last cell runs `carbon-ocr` where it finds it).
 
 ## The files
 

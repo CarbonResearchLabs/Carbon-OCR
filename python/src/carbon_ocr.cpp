@@ -10,6 +10,7 @@
 #include <nanobind/stl/map.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/pair.h>
+#include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/unique_ptr.h>
@@ -31,6 +32,8 @@
 #include "carbon/output.h"
 #include "carbon/error.h"
 #include "carbon/image.h"
+#include "carbon/lm.h"
+#include "carbon/tlm.h"
 #include "carbon/lines.h"
 #include "carbon/order.h"
 #include "carbon/pipeline.h"
@@ -348,10 +351,16 @@ NB_MODULE(carbon_ocr, m) {
              bool share_sessions, double bucket_ratio, bool spaces_from_ink, int64_t det_area,
              double second_pass_target, bool justified, bool flip_needs_dark, bool char_confidence,
              bool word_boxes_at_ink, bool fused_rec_head, bool det_stem, double det_pitch, int beam_width,
-             int beam_topk, float beam_gate, float beam_blank_skip, bool grid, bool blocks_first,
+             int beam_topk, float beam_gate, float beam_blank_skip, std::optional<std::filesystem::path> lm,
+             std::optional<float> lm_alpha, std::optional<float> lm_beta, std::optional<std::filesystem::path> tlm,
+             std::optional<float> tlm_alpha, std::optional<int> tlm_gpu, bool grid, bool blocks_first,
              bool turn_by_quarters, double max_skew, double wide_skew_gain, double bullet_join, double dash_cell,
-             double sliver_thin) {
+             double sliver_thin, const std::string& lm_mode, std::optional<float> lm_gate) {
             carbon::EngineOptions o;
+            const auto mode = carbon::parse_lm_mode(lm_mode);
+            if (!mode) throw carbon::Error("lm_mode \"" + lm_mode + "\": auto, none, ngram, transformer or both");
+            o.lm_mode = *mode;
+            o.lm_gate = lm_gate;
             if (!grid) o.grid.reset();
             o.order.blocks_first = blocks_first;
             o.turn_by_quarters = turn_by_quarters;
@@ -393,6 +402,12 @@ NB_MODULE(carbon_ocr, m) {
             o.beam.topk = beam_topk;
             o.beam.gate = beam_gate;
             o.beam.blank_skip = beam_blank_skip;
+            if (lm) o.lm = *lm;
+            o.lm_alpha = lm_alpha;
+            o.lm_beta = lm_beta;
+            if (tlm) o.tlm = *tlm;
+            o.tlm_alpha = tlm_alpha;
+            o.tlm_gpu = tlm_gpu;
             new (e) carbon::Engine(set, o);
           },
           "set"_a, "workers"_a = 0, "pin"_a = true, "rec"_a = "rec-latin", "order_model"_a = nb::none(),
@@ -403,11 +418,13 @@ NB_MODULE(carbon_ocr, m) {
           "word_boxes_at_ink"_a = false, "fused_rec_head"_a = false, "det_stem"_a = false, "det_pitch"_a = 0.0,
           "beam_width"_a = carbon::BeamRule{}.width, "beam_topk"_a = carbon::BeamRule{}.topk,
           "beam_gate"_a = carbon::BeamRule{}.gate, "beam_blank_skip"_a = carbon::BeamRule{}.blank_skip,
-          "grid"_a = true,
+          "lm"_a = nb::none(), "lm_alpha"_a = nb::none(), "lm_beta"_a = nb::none(), "tlm"_a = nb::none(),
+          "tlm_alpha"_a = nb::none(), "tlm_gpu"_a = nb::none(), "grid"_a = true,
           "blocks_first"_a = carbon::OrderRule{}.blocks_first,
           "turn_by_quarters"_a = carbon::EngineOptions{}.turn_by_quarters, "max_skew"_a = carbon::EngineOptions{}.max_skew,
           "wide_skew_gain"_a = carbon::EngineOptions{}.wide_skew_gain, "bullet_join"_a = carbon::GateRule{}.bullet_join,
           "dash_cell"_a = carbon::GateRule{}.dash_cell, "sliver_thin"_a = carbon::GateRule{}.sliver_thin,
+          "lm_mode"_a = "auto", "lm_gate"_a = nb::none(),
           "A Fullerene set's directory (orient.onnx, det.onnx, <rec>.onnx, <rec>.vocab.json, and order.native.bin "
           "or order.onnx where it has one; order_model another); workers 0 is one per physical core. precision: "
           "the models' files, \"auto\" (the fastest the set has), \"fp32\", \"fp16\" or \"int8\" "
@@ -417,11 +434,15 @@ NB_MODULE(carbon_ocr, m) {
           "carbon::DetRule's (0 for neither). table_spans: the order model's tables laid out again with their "
           "spans (carbon::EngineOptions::table_spans). beam_width, beam_topk, beam_gate, beam_blank_skip: the CTC "
           "prefix beam for the lines under the gate (carbon::EngineOptions::beam, carbon/beam.h); a width under 2 is "
-          "off. grid: the order model's tables by geometry (carbon::GridRule; False: the model's cells). "
-          "blocks_first: blocks as the same-block head's clusters (carbon::OrderRule). turn_by_quarters, "
-          "max_skew (0 to 45), wide_skew_gain: orientation by quarter turns and deskew past 5 degrees "
-          "(carbon::EngineOptions). bullet_join, dash_cell, sliver_thin: the gate's marks and slivers "
-          "(carbon::GateRule; 0 turns each off).")
+          "off. lm: the beam's n-gram model file (\"off\": none; none: the set's lm-<group>.bin where it has one), "
+          "lm_alpha and lm_beta its weights (none: the file's). lm_mode: the language models as one switch "
+          "(carbon::EngineOptions::lm_mode): \"none\" (greedy), \"ngram\", \"transformer\" or \"both\", the beam on "
+          "and each of the set's models at the weights and gate tuned into its file (lm_gate the gate over it); "
+          "\"auto\" (the default) leaves the beam and the models as the options above set them. grid: the order model's tables by geometry "
+          "(carbon::GridRule; False: the model's cells). blocks_first: blocks as the same-block head's clusters "
+          "(carbon::OrderRule). turn_by_quarters, max_skew (0 to 45), wide_skew_gain: orientation by quarter turns "
+          "and deskew past 5 degrees (carbon::EngineOptions). bullet_join, dash_cell, sliver_thin: the gate's marks "
+          "and slivers (carbon::GateRule; 0 turns each off).")
       .def_prop_ro("workers", &carbon::Engine::workers)
       .def(
           "ocr",
@@ -897,7 +918,7 @@ NB_MODULE(carbon_ocr, m) {
       "ctc_beam",
       [](nb::ndarray<const float, nb::ndim<3>, nb::c_contig, nb::device::cpu> logits,
          nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> lengths, int width, int topk,
-         float blank_skip, float alpha, float beta) {
+         float blank_skip, float alpha, float beta, std::shared_ptr<carbon::NgramModel> lm) {
         const int n = static_cast<int>(logits.shape(0)), c = static_cast<int>(logits.shape(1)),
                   t = static_cast<int>(logits.shape(2));
         if (static_cast<int>(lengths.shape(0)) < n) throw carbon::Error("ctc_beam: lengths is shorter than the batch");
@@ -914,19 +935,193 @@ NB_MODULE(carbon_ocr, m) {
           for (int i = 0; i < n; ++i) {
             const carbon::FrameCandidates f = carbon::frame_candidates(
                 logits.data() + static_cast<size_t>(i) * c * t, c, t, lengths.data()[i], std::min(topk, c - 1));
-            carbon::BeamLine b = carbon::ctc_beam(f, r);
+            carbon::BeamLine b = carbon::ctc_beam(f, r, lm.get());
             lines[static_cast<size_t>(i)] = std::move(b.line);
-            scores[static_cast<size_t>(i)] = b.ctc;
+            scores[static_cast<size_t>(i)] = lm ? b.score : b.ctc;
           }
         }
         return std::make_pair(to_python(std::move(lines)), std::move(scores));
       },
       "logits"_a, "lengths"_a, "width"_a = 8, "topk"_a = 5, "blank_skip"_a = 0.999f, "alpha"_a = 0.0f, "beta"_a = 0.0f,
+      nb::arg("lm").none() = nb::none(),
       "The engine's CTC prefix beam (carbon/beam.h) over logits [n, classes, frames] (or their log-softmax), line i "
       "its first lengths[i] frames, each frame's topk likeliest classes but the blank (at most classes - 1) and the "
-      "blank; no language model, so alpha and beta weigh none but beta's bonus a character. Width 1 is greedy. "
-      "Returns (lines, scores): per line (ids, start frames, probabilities) as ctc_greedy's, and its ln P over the "
-      "frames' candidates.");
+      "blank, with an NgramModel `lm` weighed by alpha (beta a character's bonus). Width 1 is greedy. Returns "
+      "(lines, scores): per line (ids, start frames, probabilities) as ctc_greedy's, and its ln P over the frames' "
+      "candidates, or with a model its score, that plus alpha times the model's plus beta a character.");
+
+  nb::class_<carbon::NgramModel>(m, "NgramModel",
+                                 "An n-gram language model over a recognizer's classes (carbon/lm.h), its file mapped.")
+      .def(nb::new_([](const std::filesystem::path& file) { return carbon::NgramModel::open(file); }), "file"_a)
+      .def_prop_ro("order", &carbon::NgramModel::order)
+      .def_prop_ro("classes", &carbon::NgramModel::classes)
+      .def_prop_ro("boundary", &carbon::NgramModel::boundary)
+      .def_prop_ro("bytes", &carbon::NgramModel::bytes)
+      .def_prop_ro(
+          "header",
+          [](const carbon::NgramModel& lm) {
+            const carbon::NgramHeader& h = lm.header();
+            nb::dict d;
+            d["order"] = h.order;
+            d["classes"] = h.classes;
+            d["vocab_hash"] = h.vocab_hash;
+            d["alpha"] = h.alpha;
+            d["beta"] = h.beta;
+            d["gate"] = h.gate;
+            d["tokens"] = h.tokens;
+            d["lines"] = h.lines;
+            d["note"] = std::string(h.note);
+            nb::list counts;
+            for (uint32_t n = 2; n <= h.order; ++n) counts.append(h.tables[n].count);
+            d["ngrams"] = counts;
+            return d;
+          })
+      .def("start", &carbon::NgramModel::start)
+      .def(
+          "score",
+          [](const carbon::NgramModel& lm, uint64_t state, int32_t c) {
+            uint64_t next = 0;
+            const float v = lm.score(state, c, next);
+            return std::make_pair(v, next);
+          },
+          "state"_a, "token"_a, "ln P(token | state) and the state after it.")
+      .def("end", &carbon::NgramModel::end, "state"_a)
+      .def(
+          "logprob",
+          [](const carbon::NgramModel& lm, std::vector<int32_t> tokens, bool end) { return lm.logprob(tokens, end); },
+          "tokens"_a, "end"_a = true, "ln P of a line's tokens from its start, and of its end where `end`.")
+      .def(
+          "token_logprobs",
+          [](const carbon::NgramModel& lm, nb::ndarray<const uint16_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> t) {
+            const size_t n = t.shape(0);
+            auto* out = new float[n + 1];
+            nb::capsule owner(out, [](void* q) noexcept { delete[] static_cast<float*>(q); });
+            {
+              nb::gil_scoped_release unlocked;
+              uint64_t s = lm.start(), next = 0;
+              for (size_t i = 0; i < n; ++i) {
+                const uint16_t tok = t.data()[i];
+                out[i] = lm.score(s, tok == 0 ? lm.boundary() : tok, next);
+                s = tok == 0 ? lm.start() : next;
+              }
+            }
+            const size_t shape[1] = {n};
+            return nb::ndarray<nb::numpy, float, nb::ndim<1>>(out, 1, shape, owner);
+          },
+          "tokens"_a,
+          "ln P of each token of a token stream (a .tok file's: lines ended by 0, each 0 the line's end), each "
+          "from the line's start.");
+
+  nb::class_<carbon::LineRescorer>(m, "LineRescorer",
+                                   "What rescores the beam's readings of a line (carbon/tlm.h): a TransformerLM, or "
+                                   "cuda_transformer_lm's model on a GPU.")
+      .def_prop_ro("boundary", &carbon::LineRescorer::boundary)
+      .def(
+          "score",
+          [](const carbon::LineRescorer& t, std::vector<int32_t> context, std::vector<std::vector<int32_t>> readings) {
+            std::vector<double> out(readings.size());
+            {
+              nb::gil_scoped_release unlocked;
+              t.score(context, readings, out);
+            }
+            return out;
+          },
+          "context"_a, "readings"_a,
+          "ln P of each reading (its tokens, then the line's end) after the context (at least the boundary).")
+      .def(
+          "score_lines",
+          [](const carbon::LineRescorer& t,
+             std::vector<std::pair<std::vector<int32_t>, std::vector<std::vector<int32_t>>>> lines) {
+            std::vector<carbon::RescoreQuery> q;
+            q.reserve(lines.size());
+            for (const auto& [context, readings] : lines) q.push_back({context, readings});
+            std::vector<std::vector<double>> out(lines.size());
+            {
+              nb::gil_scoped_release unlocked;
+              t.score_lines(q, out);
+            }
+            return out;
+          },
+          "lines"_a,
+          "score for many lines at once, each (context, readings): a GPU's in one run. A list of each line's scores.");
+
+  m.def(
+      "cuda_transformer_lm",
+      [](const std::filesystem::path& file, int gpu) { return carbon::cuda_transformer_lm(file, gpu); }, "file"_a,
+      "gpu"_a = 0,
+      "The transformer language model on a GPU (a LineRescorer): a page's lines rescored in one run on the tensor "
+      "cores, within a few hundredths of a nat of the CPU's. Error where the module was built without CUDA.");
+
+  nb::class_<carbon::TransformerLM, carbon::LineRescorer>(m, "TransformerLM",
+                                    "The small transformer language model (carbon/tlm.h), on the CPU's kernels.")
+      .def(nb::new_([](const std::filesystem::path& file) { return carbon::TransformerLM::open(file); }), "file"_a)
+      .def_prop_ro("boundary", &carbon::TransformerLM::boundary)
+      .def_prop_ro("ctx", &carbon::TransformerLM::ctx)
+      .def_prop_ro("header",
+                   [](const carbon::TransformerLM& t) {
+                     const carbon::TlmHeader& h = t.header();
+                     nb::dict d;
+                     d["d"] = h.d;
+                     d["layers"] = h.layers;
+                     d["heads"] = h.heads;
+                     d["ffn"] = h.ffn;
+                     d["ctx"] = h.ctx;
+                     d["tokens"] = h.tokens;
+                     d["classes"] = h.classes;
+                     d["vocab_hash"] = h.vocab_hash;
+                     d["alpha"] = h.alpha;
+                     d["params"] = h.params;
+                     d["heldout"] = h.heldout;
+                     d["note"] = std::string(h.note);
+                     d["precision"] = std::string(carbon::precision_name(h.precision));
+                     d["gate"] = h.gate;
+                     return d;
+                   })
+      .def(
+          "logprob",
+          [](const carbon::TransformerLM& t, std::vector<int32_t> context, std::vector<int32_t> tokens, bool end) {
+            return t.logprob(context, tokens, end);
+          },
+          "context"_a, "tokens"_a, "end"_a = true);
+
+  m.def(
+      "ctc_beam_nbest",
+      [](nb::ndarray<const float, nb::ndim<3>, nb::c_contig, nb::device::cpu> logits,
+         nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> lengths, int width, int topk,
+         float blank_skip, float alpha, float beta, std::shared_ptr<carbon::NgramModel> lm, int n) {
+        const int lines = static_cast<int>(logits.shape(0)), c = static_cast<int>(logits.shape(1)),
+                  t = static_cast<int>(logits.shape(2));
+        if (static_cast<int>(lengths.shape(0)) < lines) throw carbon::Error("ctc_beam_nbest: lengths too short");
+        carbon::BeamRule r;
+        r.width = width;
+        r.topk = topk;
+        r.blank_skip = blank_skip;
+        r.alpha = alpha;
+        r.beta = beta;
+        std::vector<std::vector<carbon::BeamLine>> all(static_cast<size_t>(lines));
+        {
+          nb::gil_scoped_release unlocked;
+          for (int i = 0; i < lines; ++i) {
+            const carbon::FrameCandidates f = carbon::frame_candidates(
+                logits.data() + static_cast<size_t>(i) * c * t, c, t, lengths.data()[i], std::min(topk, c - 1));
+            all[static_cast<size_t>(i)] = carbon::ctc_beam_nbest(f, r, lm.get(), n);
+          }
+        }
+        nb::list out;
+        for (auto& nb_line : all) {
+          nb::list one;
+          for (auto& b : nb_line) one.append(nb::make_tuple(b.line.ids, b.ctc, b.lm, b.score));
+          out.append(one);
+        }
+        return out;
+      },
+      "logits"_a, "lengths"_a, "width"_a = 8, "topk"_a = 5, "blank_skip"_a = 0.999f, "alpha"_a = 0.0f, "beta"_a = 0.0f,
+      nb::arg("lm").none() = nb::none(), "n"_a = 8,
+      "The beam's n best readings of each line, best first: per line a list of (ids, ctc, lm, score), ctc its ln P "
+      "over the frames' candidates, lm the n-gram's ln P (0 without one), score ctc + alpha lm + beta characters.");
+
+  m.def("vocab_hash", &carbon::vocab_hash, "vocab"_a,
+        "The hash a language model and a token file carry of the vocabulary they were made on (carbon/lm.h).");
 
   m.def(
       "ctc_collapse",

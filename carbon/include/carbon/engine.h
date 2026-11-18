@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "carbon/beam.h"
+#include "carbon/tlm.h"
 #include "carbon/detect.h"
 #include "carbon/image.h"
 #include "carbon/lines.h"
@@ -152,6 +153,18 @@ enum class Precision : uint8_t { kAuto, kFp32, kFp16, kInt8 };
 std::string_view precision_name(Precision precision);  // "auto", "fp32", "fp16", "int8"
 std::optional<Precision> parse_precision(std::string_view name);
 
+// Which language models read a page's lines (EngineOptions::lm_mode):
+//   kAuto         as set by hand (EngineOptions::beam, lm, tlm): the beam, and the set's models with it, only where
+//                 beam.width is set
+//   kNone         greedy: no beam, no language model
+//   kNgram        the beam with the n-gram (lm-<group>.bin)
+//   kTransformer  the beam, its best readings rescored by the transformer (tlm-<group>.bin) after the line above
+//   kBoth         the beam with the n-gram, its best readings rescored by the transformer
+enum class LmMode : uint8_t { kAuto, kNone, kNgram, kTransformer, kBoth };
+constexpr int kLmBeamWidth = 8;  // the beam's width under a mode where none is set: the width the models were tuned at
+std::string_view lm_mode_name(LmMode mode);  // "auto", "none", "ngram", "transformer", "both"
+std::optional<LmMode> parse_lm_mode(std::string_view name);  // those, or "off"/"greedy" for none, "tlm" for transformer
+
 struct EngineOptions {
   PoolOptions pool;               // the workers: one per physical core by default
   std::optional<Backend> backend; // the models' backend (open_set_model); none: the fastest the set has
@@ -249,6 +262,32 @@ struct EngineOptions {
   // line is decoded greedily first; the rest keep it. beam.width under 2: off (the default), every line greedy.
   BeamRule beam;
   std::shared_ptr<const LanguageModel> language_model;
+  // The n-gram model the beam reads with where language_model is not given (carbon/lm.h): this file, else the
+  // set's own beside the recognizer (lm-latin.bin for rec-latin) where it has one; "off": none. Opened only while
+  // the beam is on, and refused if it was counted on another vocabulary. lm_alpha and lm_beta set beam.alpha and
+  // beam.beta then; none: the weights tuned into the model's file.
+  std::filesystem::path lm;
+  std::optional<float> lm_alpha, lm_beta;
+  // A second model that rescores the beam's beam.width best readings of a line (carbon/tlm.h): rescorer where given,
+  // else this file, else the set's tlm-<group>.bin where it has one; "off": none. Each reading's score gains
+  // beam.rescore times its ln P after the line above it on the page, as read (or after the line's start where it
+  // has none); a page's gated lines are rescored together once all its lines are read. tlm_alpha sets
+  // beam.rescore (none: the file's tuned weight).
+  std::shared_ptr<const LineRescorer> rescorer;
+  std::filesystem::path tlm;
+  std::optional<float> tlm_alpha;
+  // The GPU the file's rescorer runs on (cuda_transformer_lm: a page's lines in one run); none: the batched
+  // pipeline's own where it runs on one, else the CPU; -1: the CPU.
+  std::optional<int> tlm_gpu;
+  // The language models as one switch (LmMode), each model at the weights tuned into its file for the set's
+  // recognizer (an n-gram's alpha, beta and gate; a transformer's weight and gate).
+  // kAuto, the default, leaves the beam and the models above as set by hand. Under kNgram, kTransformer and kBoth the
+  // beam is on (beam.width kLmBeamWidth where it is under 2), the model the mode does not name is off, and the beam's
+  // gate is the n-gram's tuned one where the n-gram reads, else the transformer's (beam.gate where the file has
+  // none), lm_gate over it; lm_alpha, lm_beta and tlm_alpha still set the weights. A model the mode needs that is
+  // neither given nor in the set is refused (Error). kNone: greedy, the beam off.
+  LmMode lm_mode = LmMode::kAuto;
+  std::optional<float> lm_gate;
   // The crop rule the recognizer reads lines by. A recognizer that carries its own (its ONNX
   // file's carbon.crop.height, pad_v and pad_h, written at export) sets those three.
   CropRule crop;

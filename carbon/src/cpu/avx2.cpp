@@ -1237,6 +1237,113 @@ void ctc_topk_avx2(const float* logits, int classes, int frames, int t_n, int k,
   }
 }
 
+// ---------------------------------------------------------------- the transformer language model's kernels
+
+namespace {
+
+inline float hsum8(__m256 v) {
+  __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+  s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+  s = _mm_add_ss(s, _mm_movehdup_ps(s));
+  return _mm_cvtss_f32(s);
+}
+
+inline float hmax8(__m256 v) {
+  __m128 s = _mm_max_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+  s = _mm_max_ps(s, _mm_movehl_ps(s, s));
+  s = _mm_max_ss(s, _mm_movehdup_ps(s));
+  return _mm_cvtss_f32(s);
+}
+
+}  // namespace
+
+void layer_norm_rows_avx2(const float* x, int64_t ld, int n_rows, int n, const float* w, const float* b, float eps,
+                          float* out, int64_t out_ld) {
+  // n a multiple of 8: the mean, then the variance about it, then the scale and shift by FMA, 8 columns a vector
+  const __m256 inv_n = _mm256_set1_ps(1.0f / static_cast<float>(n));
+  for (int r = 0; r < n_rows; ++r) {
+    const float* v = x + static_cast<int64_t>(r) * ld;
+    float* o = out + static_cast<int64_t>(r) * out_ld;
+    __m256 s = _mm256_setzero_ps();
+    for (int j = 0; j < n; j += 8) s = _mm256_add_ps(s, _mm256_loadu_ps(v + j));
+    const __m256 mean = _mm256_set1_ps(hsum8(_mm256_mul_ps(s, inv_n)));
+    __m256 q = _mm256_setzero_ps();
+    for (int j = 0; j < n; j += 8) {
+      const __m256 d = _mm256_sub_ps(_mm256_loadu_ps(v + j), mean);
+      q = _mm256_fmadd_ps(d, d, q);
+    }
+    const float var = hsum8(q) / static_cast<float>(n);
+    const __m256 rs = _mm256_set1_ps(1.0f / sqrtf(var + eps));  // the C library's: no inline std:: overload
+    for (int j = 0; j < n; j += 8) {
+      const __m256 d = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(v + j), mean), rs);
+      _mm256_storeu_ps(o + j, _mm256_fmadd_ps(d, _mm256_loadu_ps(w + j), _mm256_loadu_ps(b + j)));
+    }
+  }
+}
+
+void log_softmax_pick_avx2(const float* x, int64_t ld, int n_rows, int n, const int32_t* targets, float* out) {
+  // the row's max and its sum of exp_neg(v - max) 8 columns a vector, the tail the reference's
+  const int full = n / 8 * 8;
+  for (int r = 0; r < n_rows; ++r) {
+    const float* v = x + static_cast<int64_t>(r) * ld;
+    __m256 mv = _mm256_set1_ps(-INFINITY);
+    for (int j = 0; j < full; j += 8) mv = _mm256_max_ps(mv, _mm256_loadu_ps(v + j));
+    float m = hmax8(mv);
+    for (int j = full; j < n; ++j) m = v[j] > m ? v[j] : m;
+    const __m256 mb = _mm256_set1_ps(m);
+    __m256 sv = _mm256_setzero_ps();
+    for (int j = 0; j < full; j += 8) sv = _mm256_add_ps(sv, exp_neg8(_mm256_sub_ps(_mm256_loadu_ps(v + j), mb)));
+    float sum = hsum8(sv);
+    for (int j = full; j < n; ++j) sum += exp_neg(v[j] - m);
+    out[r] = v[targets[r]] - m - logf(sum);
+  }
+}
+
+void attend_avx2(const float* q, int dh, const KeyRun* runs, int n_runs, float scale, float* out, float* scratch) {
+  // dh a multiple of 8 and at most 128: the query in up to 16 registers, each key's dot product by FMA, the
+  // scores' softmax 8 at a time, then the values summed into up to 16 accumulators
+  const int nv = dh / 8;
+  __m256 qv[16];
+  for (int j = 0; j < nv; ++j) qv[j] = _mm256_loadu_ps(q + 8 * j);
+  int total = 0;
+  float mx = -INFINITY;
+  for (int r = 0; r < n_runs; ++r) {
+    for (int i = 0; i < runs[r].n; ++i) {
+      const float* k = runs[r].k + static_cast<int64_t>(i) * runs[r].ld;
+      __m256 a = _mm256_mul_ps(qv[0], _mm256_loadu_ps(k));
+      for (int j = 1; j < nv; ++j) a = _mm256_fmadd_ps(qv[j], _mm256_loadu_ps(k + 8 * j), a);
+      const float s = hsum8(a) * scale;
+      scratch[total++] = s;
+      mx = s > mx ? s : mx;
+    }
+  }
+  const __m256 mb = _mm256_set1_ps(mx);
+  __m256 sv = _mm256_setzero_ps();
+  int i = 0;
+  for (; i + 8 <= total; i += 8) {
+    const __m256 e = exp_neg8(_mm256_sub_ps(_mm256_loadu_ps(scratch + i), mb));
+    _mm256_storeu_ps(scratch + i, e);
+    sv = _mm256_add_ps(sv, e);
+  }
+  float sum = hsum8(sv);
+  for (; i < total; ++i) {
+    scratch[i] = exp_neg(scratch[i] - mx);
+    sum += scratch[i];
+  }
+  __m256 acc[16];
+  for (int j = 0; j < nv; ++j) acc[j] = _mm256_setzero_ps();
+  int at = 0;
+  for (int r = 0; r < n_runs; ++r) {
+    for (int k = 0; k < runs[r].n; ++k) {
+      const float* v = runs[r].v + static_cast<int64_t>(k) * runs[r].ld;
+      const __m256 p = _mm256_set1_ps(scratch[at++]);
+      for (int j = 0; j < nv; ++j) acc[j] = _mm256_fmadd_ps(p, _mm256_loadu_ps(v + 8 * j), acc[j]);
+    }
+  }
+  const __m256 inv = _mm256_set1_ps(1.0f / sum);
+  for (int j = 0; j < nv; ++j) _mm256_storeu_ps(out + 8 * j, _mm256_mul_ps(acc[j], inv));
+}
+
 // ---------------------------------------------------------------- resampling
 //
 // The weights are 22-bit fixed point (up to 2^22), too wide for vpmaddwd, so each is

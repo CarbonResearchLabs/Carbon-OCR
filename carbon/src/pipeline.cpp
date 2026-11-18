@@ -249,13 +249,16 @@ struct Pipeline::Impl {
       throw Error("Pipeline: page_batch, line_batch and in_flight are at least 1");
     }
     vocab = load_vocab(set / (e.rec + ".vocab.json"));
+    const Device device =
+        given ? given->device() : o.device.value_or(cuda_pipeline_available() ? Device::kCuda : Device::kCpu);
+    // the rescorer on the pipeline's GPU where it runs on one (EngineOptions::tlm_gpu)
+    detail::attach_language_model(e, set, vocab, e.tlm_gpu.value_or(device == Device::kCuda ? o.gpu : -1));
     e.crop = detail::model_crop(set, e.rec, e.crop);
     if (!e.turn_probability) e.turn_probability = detail::model_turn_probability(set);
     const int cores = cpu_topology().default_workers();
     if (given) {  // the caller's own (Pipeline's third constructor)
       models = std::move(given);
     } else {
-      const Device device = o.device.value_or(cuda_pipeline_available() ? Device::kCuda : Device::kCpu);
       models = device == Device::kCuda ? cuda_pipeline_models(set, e, o)
                                        : cpu_pipeline_models(set, e, o.model_threads > 0 ? o.model_threads : cores);
       if (device == Device::kCpu) check_recognizer(static_cast<const CpuModels&>(*models).rec());
@@ -662,9 +665,21 @@ struct Pipeline::Impl {
 
   void finish(Page& p, int k) {
     OcrPage& out = p.out;
-    for (Page::Unsure& u : p.unsure) {  // the beam's lines (EngineOptions::beam), as the CPU engine reads them
-      const CtcLine d = ctc_beam(u.frames, e.beam, e.language_model.get()).line;
-      detail::read_line(out.lines[u.line], d, u.length, e.crop, vocab, nullptr, 0, nullptr, e.char_confidence);
+    if (detail::rescoring(e)) {  // the beam's n best, rescored with the line above, as the CPU engine reads them
+      std::vector<detail::UnsureLine> waiting;
+      for (Page::Unsure& u : p.unsure) {
+        detail::UnsureLine w;
+        w.line = u.line;
+        w.length = u.length;
+        w.nbest = ctc_beam_nbest(u.frames, e.beam, e.language_model.get(), e.beam.width);
+        waiting.push_back(std::move(w));
+      }
+      detail::rescore_page(out, waiting, e, vocab);
+    } else {
+      for (Page::Unsure& u : p.unsure) {  // the beam's lines (EngineOptions::beam), as the CPU engine reads them
+        const CtcLine d = detail::beam_read(u.frames, e);
+        detail::read_line(out.lines[u.line], d, u.length, e.crop, vocab, nullptr, 0, nullptr, e.char_confidence);
+      }
     }
     p.unsure.clear();
     out.ms.recognize = ms_since(p.lines_start);

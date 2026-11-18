@@ -670,6 +670,90 @@ void ctc_topk(const float* logits, int classes, int frames, int t_n, int k, int3
   }
 }
 
+void layer_norm_rows(const float* x, int64_t ld, int n_rows, int n, const float* w, const float* b, float eps,
+                     float* out, int64_t out_ld, Isa isa) {
+  if (n_rows <= 0 || n <= 0) return;
+  check(isa, "layer_norm_rows");
+#if defined(CARBON_KERNEL_AVX2)
+  if (dw_kernel(isa) == Isa::kAvx2 && n % 8 == 0) {
+    detail::layer_norm_rows_avx2(x, ld, n_rows, n, w, b, eps, out, out_ld);
+    return;
+  }
+#endif
+  for (int r = 0; r < n_rows; ++r) {  // the reference
+    const float* v = x + static_cast<int64_t>(r) * ld;
+    float* o = out + static_cast<int64_t>(r) * out_ld;
+    float mean = 0;
+    for (int j = 0; j < n; ++j) mean += v[j];
+    mean /= static_cast<float>(n);
+    float var = 0;
+    for (int j = 0; j < n; ++j) {
+      const float d = v[j] - mean;
+      var += d * d;
+    }
+    const float rs = 1.0f / std::sqrt(var / static_cast<float>(n) + eps);
+    for (int j = 0; j < n; ++j) o[j] = (v[j] - mean) * rs * w[j] + b[j];
+  }
+}
+
+void log_softmax_pick(const float* x, int64_t ld, int n_rows, int n, const int32_t* targets, float* out, Isa isa) {
+  if (n_rows <= 0 || n <= 0) return;
+  check(isa, "log_softmax_pick");
+#if defined(CARBON_KERNEL_AVX2)
+  if (dw_kernel(isa) == Isa::kAvx2) {
+    detail::log_softmax_pick_avx2(x, ld, n_rows, n, targets, out);
+    return;
+  }
+#endif
+  for (int r = 0; r < n_rows; ++r) {  // the reference
+    const float* v = x + static_cast<int64_t>(r) * ld;
+    float m = -std::numeric_limits<float>::infinity();
+    for (int j = 0; j < n; ++j) m = v[j] > m ? v[j] : m;
+    float sum = 0;
+    for (int j = 0; j < n; ++j) sum += detail::exp_neg(v[j] - m);
+    out[r] = v[targets[r]] - m - std::log(sum);
+  }
+}
+
+void attend(const float* q, int dh, const KeyRun* runs, int n_runs, float scale, float* out, float* scratch, Isa isa) {
+  if (dh <= 0 || dh % 8) throw Error("attend: dh " + std::to_string(dh) + " (a multiple of 8)");
+  check(isa, "attend");
+#if defined(CARBON_KERNEL_AVX2)
+  if (dw_kernel(isa) == Isa::kAvx2 && dh <= 128) {
+    detail::attend_avx2(q, dh, runs, n_runs, scale, out, scratch);
+    return;
+  }
+#endif
+  int total = 0;  // the reference
+  float mx = -std::numeric_limits<float>::infinity();
+  for (int r = 0; r < n_runs; ++r) {
+    for (int i = 0; i < runs[r].n; ++i) {
+      const float* k = runs[r].k + static_cast<int64_t>(i) * runs[r].ld;
+      float s = 0;
+      for (int j = 0; j < dh; ++j) s += q[j] * k[j];
+      s *= scale;
+      scratch[total++] = s;
+      mx = s > mx ? s : mx;
+    }
+  }
+  float sum = 0;
+  for (int i = 0; i < total; ++i) {
+    scratch[i] = detail::exp_neg(scratch[i] - mx);
+    sum += scratch[i];
+  }
+  std::fill(out, out + dh, 0.0f);
+  int at = 0;
+  for (int r = 0; r < n_runs; ++r) {
+    for (int i = 0; i < runs[r].n; ++i) {
+      const float* v = runs[r].v + static_cast<int64_t>(i) * runs[r].ld;
+      const float p = scratch[at++];
+      for (int j = 0; j < dh; ++j) out[j] += p * v[j];
+    }
+  }
+  const float inv = 1.0f / sum;
+  for (int j = 0; j < dh; ++j) out[j] *= inv;
+}
+
 void bgrx_to_gray(const uint8_t* src, int64_t src_stride, int w, int h, uint8_t* dst, int64_t dst_stride, Isa isa) {
   if (w <= 0 || h <= 0) return;
   check(isa, "bgrx_to_gray");

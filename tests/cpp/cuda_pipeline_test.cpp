@@ -15,13 +15,18 @@
 #include <atomic>
 #include <filesystem>
 #include <memory>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include "carbon/deskew.h"
+#include "carbon/engine.h"
 #include "carbon/error.h"
 #include "carbon/image.h"
 #include "carbon/lines.h"
+#include "carbon/lm.h"
 #include "carbon/pipeline.h"
+#include "random_tlm.h"
 
 namespace carbon {
 namespace {
@@ -152,6 +157,35 @@ TEST(CudaPipeline, ReadsUnsureLinesByTheBeamAsTheCpuDeviceDoes) {
   }
   EXPECT_GT(lm_cpu->calls.load(), 0);
   EXPECT_GT(lm_gpu->calls.load(), 0);
+}
+
+// The transformer's rescoring (EngineOptions::tlm) on the pipeline's GPU, as it is by default where the pipeline
+// runs on one (cuda_transformer_lm), and on the CPU (tlm_gpu -1): the same lines, every one of them gated.
+TEST(CudaPipeline, RescoresWithTheTransformerOnItsGpuAsOnTheCpu) {
+  if (!cuda_pipeline_available()) GTEST_SKIP() << "no GPU, or no TensorRT in this build";
+  const std::vector<std::string> vocab = load_vocab(kSet / "rec-latin.vocab.json");
+  const auto tlm = random_model("pipeline", 64, 2, 2, 128, 64, static_cast<int>(vocab.size()), 9u, vocab_hash(vocab));
+  const GrayImage page = load_image(kSet / "page.png");
+  const GrayImage tiny = tiny_page();
+  const std::vector<GrayView> pages = {page.view(), tiny.view(), page.view(), tiny.view()};
+  auto rescored = [&](PipelineOptions o, std::optional<int> gpu) {
+    o.engine.beam.width = 8;
+    o.engine.beam.gate = 2.0f;  // every line
+    o.engine.tlm = tlm;
+    o.engine.tlm_alpha = 1.0f;
+    o.engine.tlm_gpu = gpu;
+    return o;
+  };
+  const std::vector<OcrPage> on_cpu = Pipeline(kSet, rescored(gpu_options(Precision::kFp32, true), -1)).ocr(pages);
+  const std::vector<OcrPage> on_gpu =
+      Pipeline(kSet, rescored(gpu_options(Precision::kFp32, true), std::nullopt)).ocr(pages);
+  ASSERT_EQ(on_gpu.size(), on_cpu.size());
+  for (size_t p = 0; p < on_gpu.size(); ++p) {
+    ASSERT_EQ(on_gpu[p].lines.size(), on_cpu[p].lines.size()) << "page " << p;
+    for (size_t i = 0; i < on_gpu[p].lines.size(); ++i) {
+      EXPECT_EQ(on_gpu[p].lines[i].text, on_cpu[p].lines[i].text) << "page " << p << " line " << i;
+    }
+  }
 }
 
 TEST(CudaPipeline, Fp16NeedsTheTrunkAndFusedHead) {

@@ -107,12 +107,33 @@ void read_line(OcrLine& line, const CtcLine& d, int32_t length, const CropRule& 
 // characters, its spaces left out (char_confidence), or of every id the decoder kept; 0 with none. The beam's gate.
 float decoded_confidence(const CtcLine& d, const std::vector<std::string>& vocab, bool char_confidence);
 
+// A gated line that waits for the page's rescoring (rescore_page): its index among the page's lines, its frame
+// count, the beam's n best, and its crop's ink columns where read_line takes them (EngineOptions::spaces,
+// word_boxes_at_ink).
+struct UnsureLine {
+  size_t line = 0;
+  int32_t length = 0;
+  std::vector<BeamLine> nbest;
+  std::vector<uint8_t> ink;  // empty: none
+  int ink_width = 0;
+};
+
+// Whether gated lines wait for a rescorer (EngineOptions::rescorer, with a weight) before they are read.
+inline bool rescoring(const EngineOptions& o) { return o.beam.on() && o.rescorer && o.beam.rescore != 0.0f; }
+
+// A gated line read by the beam alone (EngineOptions::beam, language_model).
+inline CtcLine beam_read(const FrameCandidates& f, const EngineOptions& o) {
+  return ctc_beam(f, o.beam, o.language_model.get()).line;
+}
+
 // The lines of a recognition run under the beam's gate (EngineOptions::beam) read again: for each line i of the
-// run whose decoded[i] is under it, logits_of(i, scratch) its logits [classes][frames] (null: not read again),
-// and decoded[i] the beam's. Nothing where the beam is off.
+// run whose decoded[i] is under it, logits_of(i, scratch) its logits [classes][frames] (null: not read again), and
+// decoded[i] the beam's; where the page's lines wait for a rescorer (rescoring) and `waiting` is given, the beam's
+// n best go there with i instead, decoded[i] left as it was. Nothing where the beam is off.
 template <class LogitsOf>
 void beam_lines(std::vector<CtcLine>& decoded, std::span<const int32_t> lengths, int classes, int frames,
-                const EngineOptions& o, const std::vector<std::string>& vocab, LogitsOf&& logits_of) {
+                const EngineOptions& o, const std::vector<std::string>& vocab, LogitsOf&& logits_of,
+                std::vector<std::pair<size_t, std::vector<BeamLine>>>* waiting = nullptr) {
   if (!o.beam.on() || classes < 2) return;
   std::vector<float> scratch;
   for (size_t i = 0; i < decoded.size(); ++i) {
@@ -120,9 +141,33 @@ void beam_lines(std::vector<CtcLine>& decoded, std::span<const int32_t> lengths,
     const float* logits = logits_of(i, scratch);
     if (!logits) continue;
     const FrameCandidates f = frame_candidates(logits, classes, frames, lengths[i], std::min(o.beam.topk, classes - 1));
-    decoded[i] = ctc_beam(f, o.beam, o.language_model.get()).line;
+    if (waiting && rescoring(o)) {
+      waiting->emplace_back(i, ctc_beam_nbest(f, o.beam, o.language_model.get(), o.beam.width));
+      continue;
+    }
+    decoded[i] = beam_read(f, o);
   }
 }
+
+// The page's waiting lines read (before the split and the order): each reading's score plus beam.rescore times the
+// rescorer's ln P of it after its context, the line above it on the page (the nearest whose box ends above its
+// middle, within 1.5 of its heights, overlapping it across by half the narrower's width), that line's text as
+// read (a waiting line's its best reading) between boundaries, its last 96 characters where it is longer (then
+// with no boundary before them, as a training window starts), or the boundary alone; every waiting line of the
+// page in one call (LineRescorer::score_lines); the best into its line by read_line.
+void rescore_page(OcrPage& page, std::vector<UnsureLine>& lines, const EngineOptions& o,
+                  const std::vector<std::string>& vocab);
+
+// The beam's language model, where it is on and none is given: EngineOptions::lm's file, or the set's
+// lm-<group>.bin beside the recognizer, checked against its vocabulary, its tuned weights into o.beam unless
+// lm_alpha and lm_beta are given. EngineOptions::lm_mode first (the beam on, the models it does not name off, a model
+// it names that is missing refused), and under a mode the beam's gate the models' tuned one (lm_gate over it).
+void attach_language_model(EngineOptions& o, const std::filesystem::path& set, const std::vector<std::string>& vocab,
+                           int rescorer_gpu);
+// The same for the rescorer (EngineOptions::tlm, the set's tlm-<group>.bin), which attach_language_model calls: on
+// that GPU (cuda_transformer_lm), or the CPU where it is -1. Returns its file's tuned gate (0: none, or no file).
+float attach_rescorer(EngineOptions& o, const std::filesystem::path& set, const std::vector<std::string>& vocab,
+                      int gpu);
 
 // A crop's columns that hold ink (SpaceRule): out[x] 1 or 0 for x < width, of an h-row crop `stride` bytes a row;
 // false (out untouched) where the crop's contrast is under 32 levels.

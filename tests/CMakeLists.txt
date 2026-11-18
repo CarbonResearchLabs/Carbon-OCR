@@ -1,6 +1,6 @@
 include(GoogleTest)
 
-add_executable(carbon_tests cpp/tensor_test.cpp cpp/lines_test.cpp cpp/beam_test.cpp cpp/parallel_test.cpp cpp/strips_test.cpp cpp/detect_test.cpp
+add_executable(carbon_tests cpp/tensor_test.cpp cpp/lines_test.cpp cpp/beam_test.cpp cpp/tlm_test.cpp cpp/lm_mode_test.cpp cpp/parallel_test.cpp cpp/strips_test.cpp cpp/detect_test.cpp
   cpp/pipeline_test.cpp cpp/cpu_test.cpp cpp/net_test.cpp cpp/textlayer_test.cpp cpp/output_test.cpp cpp/deskew_test.cpp cpp/order_test.cpp
   cpp/score_test.cpp cpp/order_net_test.cpp cpp/image_test.cpp
   cpp/png_test.cpp cpp/http_test.cpp)
@@ -31,7 +31,8 @@ if(CARBON_WITH_PDFIUM)
   gtest_discover_tests(carbon_pdf_tests DISCOVERY_MODE PRE_TEST)
 endif()
 if(CARBON_WITH_CUDA)
-  target_sources(carbon_tests PRIVATE cpp/cuda_lines_test.cpp cpp/cuda_ctc_head_test.cpp cpp/cuda_beam_test.cpp)
+  target_sources(carbon_tests PRIVATE cpp/cuda_lines_test.cpp cpp/cuda_ctc_head_test.cpp cpp/cuda_beam_test.cpp
+                 cpp/cuda_tlm_test.cpp)
   target_link_libraries(carbon_tests PRIVATE CUDA::cudart_static)
 endif()
 if(CARBON_WITH_TENSORRT)

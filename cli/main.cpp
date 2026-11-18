@@ -180,6 +180,13 @@ struct Args {
   int beam = 0;  // ocr, serve: the CTC prefix beam's width for unsure lines (carbon::BeamRule); under 2: off
   int beam_topk = carbon::BeamRule{}.topk;
   float beam_gate = carbon::BeamRule{}.gate;
+  std::string lm;  // ocr, serve: the beam's n-gram model (empty: the set's own where it has one; off: none)
+  std::optional<float> lm_alpha, lm_beta;  // and its weights (none: the model file's)
+  std::string tlm;  // ocr, serve: the transformer that rescores the beam's readings (empty: the set's; off: none)
+  std::optional<float> tlm_alpha;
+  std::optional<int> tlm_gpu;  // the transformer on this GPU (-1: the CPU); none: the pipeline's where it has one
+  std::string lm_mode = "auto";  // ocr, serve: the language models as one switch (carbon::LmMode): none, ngram, ...
+  std::optional<float> lm_gate;  // and the beam's gate under it (none: the models' tuned one)
   std::string out_dir;              // ocr --format page: a file a page here
   std::string output;                // ocr: the file to write (pdf needs one); empty: standard output
   std::string text_out;              // ocr: also the pages' text, to this file
@@ -210,7 +217,10 @@ struct Args {
                "                        [--table-spans on|off] [--spaces model|ink]\n"
                "                        [--grid on|off] [--blocks-first on|off] [--turn bin|quarters]\n"
                "                        [--max-skew D] [--wide-skew-gain F]\n"
+               "                        [--lm-mode none|ngram|transformer|both] [--lm-gate F]\n"
                "                        [--beam N] [--beam-gate F] [--beam-topk N]\n"
+               "                        [--lm FILE|off] [--lm-alpha F] [--lm-beta F] [--tlm FILE|off] [--tlm-alpha F]\n"
+               "                        [--tlm-gpu N|cpu]\n"
                "                        [--format text|json|hocr|alto|page|markdown|html|pdf] [--out-dir DIR]\n"
                "                        [--output FILE] [--text-out FILE] [--text-only] [--image-dpi N]\n"
                "                        [--as-given] [--device cpu|cuda] [--batch N] [--in-flight N]\n"
@@ -402,6 +412,34 @@ Args parse(int argc, char** argv) {
       a.wide_skew_gain = to_double(arg, value(), 1, 100);
     } else if (arg == "--beam") {
       a.beam = to_int(arg, value(), 0);
+    } else if (arg == "--lm-mode") {
+      a.lm_mode = value();
+      if (!carbon::parse_lm_mode(a.lm_mode)) usage(arg + " takes auto, none, ngram, transformer or both");
+    } else if (arg == "--lm-gate") {
+      const std::string v = value();
+      char* end = nullptr;
+      const double x = std::strtod(v.c_str(), &end);
+      if (end == v.c_str() || *end || !(x >= 0 && x <= 2)) usage(arg + " takes a number from 0 to 2");
+      a.lm_gate = static_cast<float>(x);
+    } else if (arg == "--tlm") {
+      a.tlm = value();
+    } else if (arg == "--tlm-gpu") {
+      const std::string v = value();
+      a.tlm_gpu = v == "cpu" ? -1 : to_int(arg, v, 0);
+    } else if (arg == "--tlm-alpha") {
+      const std::string v = value();
+      char* end = nullptr;
+      const double x = std::strtod(v.c_str(), &end);
+      if (end == v.c_str() || *end) usage(arg + " takes a number");
+      a.tlm_alpha = static_cast<float>(x);
+    } else if (arg == "--lm") {
+      a.lm = value();
+    } else if (arg == "--lm-alpha" || arg == "--lm-beta") {
+      const std::string v = value();
+      char* end = nullptr;
+      const double x = std::strtod(v.c_str(), &end);
+      if (end == v.c_str() || *end) usage(arg + " takes a number");
+      (arg == "--lm-alpha" ? a.lm_alpha : a.lm_beta) = static_cast<float>(x);
     } else if (arg == "--beam-topk") {
       a.beam_topk = to_int(arg, value(), 1);
     } else if (arg == "--beam-gate") {
@@ -1222,6 +1260,14 @@ carbon::EngineOptions engine_options(const Args& a) {
   o.beam.width = a.beam;  // under 2: off
   o.beam.topk = a.beam_topk;
   o.beam.gate = a.beam_gate;
+  o.lm = a.lm;
+  o.lm_alpha = a.lm_alpha;
+  o.lm_beta = a.lm_beta;
+  o.tlm = a.tlm;
+  o.tlm_alpha = a.tlm_alpha;
+  o.tlm_gpu = a.tlm_gpu;
+  o.lm_mode = *carbon::parse_lm_mode(a.lm_mode);
+  o.lm_gate = a.lm_gate;
   if (a.second_pass_share) o.det.second_pass_share = *a.second_pass_share;
   if (a.single_pixel) o.det.single_pixel = static_cast<float>(*a.single_pixel);
   if (a.as_given) {  // the page as given (OCRmyPDF turns and deskews pages itself, and grafts the text back)

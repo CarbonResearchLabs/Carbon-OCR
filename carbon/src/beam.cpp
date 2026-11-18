@@ -226,15 +226,33 @@ class Prefixes {
     const auto [it, made] = kids_.try_emplace(key, static_cast<int32_t>(nodes_.size()));
     if (made) {
       const Node parent = nodes_[static_cast<size_t>(p)];
-      Node n{p, c, parent.depth + 1, 0, parent.lm};
-      if (lm_) {
-        uint64_t next = 0;
-        n.lm += lm_->score(parent.state, c, next);
-        n.state = next;
-      }
-      nodes_.push_back(n);
+      nodes_.push_back(Node{p, c, parent.depth + 1, parent.state, parent.lm});
+      if (lm_) pending_.push_back(it->second);  // its score in the next resolve
     }
     return it->second;
+  }
+  // The language model's scores of the prefixes made since the last call, asked in one batch
+  // (LanguageModel::score_batch), each from its parent's state: a frame's new prefixes together. Their parents
+  // must be resolved already.
+  void resolve() {
+    if (pending_.empty()) return;
+    const size_t m = pending_.size();
+    states_.resize(m);
+    cls_.resize(m);
+    out_.resize(m);
+    next_.resize(m);
+    for (size_t i = 0; i < m; ++i) {
+      const Node& n = nodes_[static_cast<size_t>(pending_[i])];
+      states_[i] = nodes_[static_cast<size_t>(n.parent)].state;
+      cls_[i] = n.cls;
+    }
+    lm_->score_batch(states_, cls_, out_, next_);
+    for (size_t i = 0; i < m; ++i) {
+      Node& n = nodes_[static_cast<size_t>(pending_[i])];
+      n.lm = nodes_[static_cast<size_t>(n.parent)].lm + out_[i];
+      n.state = next_[i];
+    }
+    pending_.clear();
   }
   const Node& operator[](int32_t i) const { return nodes_[static_cast<size_t>(i)]; }
   size_t size() const { return nodes_.size(); }
@@ -250,6 +268,9 @@ class Prefixes {
   const LanguageModel* lm_;
   std::vector<Node> nodes_;
   std::unordered_map<uint64_t, int32_t> kids_;
+  std::vector<int32_t> pending_, cls_;
+  std::vector<uint64_t> states_, next_;
+  std::vector<float> out_;
 };
 
 struct Entry {
@@ -298,7 +319,10 @@ CtcLine ctc_align(const FrameCandidates& f, std::span<const int32_t> ids) {
   return align(Emissions(f), ids);
 }
 
-BeamLine ctc_beam(const FrameCandidates& f, const BeamRule& rule, const LanguageModel* lm) {
+namespace {
+
+// The search; its `nbest` best survivors, best first.
+std::vector<BeamLine> search(const FrameCandidates& f, const BeamRule& rule, const LanguageModel* lm, int nbest) {
   check(f, "ctc_beam");
   if (rule.width < 1) throw Error("ctc_beam: a width of at least 1, not " + std::to_string(rule.width));
   if (!(rule.blank_skip > 0.0f)) throw Error("ctc_beam: blank_skip above 0 (1 or more: no frame skipped)");
@@ -308,10 +332,13 @@ BeamLine ctc_beam(const FrameCandidates& f, const BeamRule& rule, const Language
     int32_t node = 0, prev = 0;
     for (int t = 0; t < f.frames; ++t) {
       const int32_t a = argmax_at(f, t);
-      if (a != 0 && a != prev) node = trie.child(node, a);
+      if (a != 0 && a != prev) {
+        node = trie.child(node, a);
+        trie.resolve();  // the next prefix's parent is this one
+      }
       prev = a;
     }
-    return finish(em, trie, node, rule, lm);
+    return {finish(em, trie, node, rule, lm)};
   }
   const double quiet_at = rule.blank_skip >= 1.0f ? std::numeric_limits<double>::infinity()
                                                    : std::log(static_cast<double>(rule.blank_skip));
@@ -372,6 +399,7 @@ BeamLine ctc_beam(const FrameCandidates& f, const BeamRule& rule, const Language
     const int32_t a = argmax_at(f, t);
     if (a != 0 && a != prev) greedy = trie.child(greedy, a);
     prev = a;
+    trie.resolve();  // the frame's new prefixes scored together, before they are ranked
     const size_t g = static_cast<size_t>(greedy);
     if (g >= stamp.size() || stamp[g] != t) {
       // Defensive: the greedy class and the blank are always among a frame's candidates, so the moves above
@@ -420,23 +448,39 @@ BeamLine ctc_beam(const FrameCandidates& f, const BeamRule& rule, const Language
     if (!has_greedy) kept.push_back(next[static_cast<size_t>(slot[g])]);
     beam.swap(kept);
   }
-  // The survivor with the best exact score: the beam's running score only bounds a prefix's probability from
-  // below (pruning drops paths), and greedy's prefix is among the survivors.
-  int32_t best = -1;
-  double best_score = kNeg, best_beam = kNeg;
+  // The survivors by their exact scores: the beam's running score only bounds a prefix's probability from below
+  // (pruning drops paths), and greedy's prefix is among the survivors.
+  struct Ranked {
+    double s, b;
+    int32_t node;
+  };
+  std::vector<Ranked> ranked;
   for (const Entry& e : beam) {
     const Node& n = trie[e.node];
     const double ctc = logprob(em, trie.ids(e.node));
     const double lmv = lm ? n.lm + lm->end(n.state) : 0.0;
-    const double s = ctc + alpha * lmv + beta * n.depth;
-    const double b = lae(e.pb, e.pnb) + alpha * n.lm + beta * n.depth;
-    if (best < 0 || s > best_score || (s == best_score && (b > best_beam || (b == best_beam && e.node < best)))) {
-      best = e.node;
-      best_score = s;
-      best_beam = b;
-    }
+    ranked.push_back({ctc + alpha * lmv + beta * n.depth, lae(e.pb, e.pnb) + alpha * n.lm + beta * n.depth, e.node});
   }
-  return finish(em, trie, best, rule, lm);
+  std::sort(ranked.begin(), ranked.end(), [](const Ranked& x, const Ranked& y) {
+    return x.s > y.s || (x.s == y.s && (x.b > y.b || (x.b == y.b && x.node < y.node)));
+  });
+  std::vector<BeamLine> out;
+  for (size_t i = 0; i < ranked.size() && static_cast<int>(i) < nbest; ++i) {
+    out.push_back(finish(em, trie, ranked[i].node, rule, lm));
+  }
+  return out;
+}
+
+}  // namespace
+
+BeamLine ctc_beam(const FrameCandidates& f, const BeamRule& rule, const LanguageModel* lm) {
+  return search(f, rule, lm, 1).front();
+}
+
+std::vector<BeamLine> ctc_beam_nbest(const FrameCandidates& f, const BeamRule& rule, const LanguageModel* lm,
+                                     int n) {
+  if (n < 1) throw Error("ctc_beam_nbest: n of at least 1");
+  return search(f, rule, lm, n);
 }
 
 }  // namespace carbon
