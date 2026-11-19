@@ -28,7 +28,8 @@
 //
 // Each caller runs on a state of its own (a stream, the passes it lays out, their device and pinned memory), taken
 // from a pool of up to kRuns and given back when its run ends; only the weights are shared. Workers' pages run on
-// their own streams at once, not one after another.
+// their own streams at once, not one after another. A page's lines go in batches of at most kBatchRows rows a pass,
+// one after another on its run, so a run's memory is a batch's, not its largest page's.
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
@@ -381,7 +382,7 @@ struct Part {
 };
 
 // One caller's run: its stream, the passes it lays out, and the device and pinned memory they take, grown when asked
-// and never shrunk.
+// (to a batch's, kBatchRows) and never shrunk.
 struct Run {
   cudaStream_t s = nullptr;
   Pass shared, rest;
@@ -399,9 +400,15 @@ struct Run {
   }
 };
 
-// The runs callers can hold at once; a caller past them waits for one. Each keeps device memory for the largest page
-// it has run.
+// The runs callers can hold at once; a caller past them waits for one.
 constexpr size_t kRuns = 8;
+
+// The rows a pass of one batch takes at most: a page with more lines runs as several batches, one after another on
+// its run. A run keeps device memory for the largest batch it has run, so its memory is bounded whatever the pages:
+// for Latin's model (d 128, 4 layers, a feed-forward of 512, 800 tokens) about 120 MB, and about 1 GB for all kRuns.
+// Kept for the largest page instead, 8 workers' runs grew to 15.9 GB of a 16 GB card, and pages failed with CUDA's
+// "out of memory" (10 of 17,898 in 12 minutes).
+constexpr size_t kBatchRows = 8192;
 
 class CudaTlm final : public LineRescorer {
  public:
@@ -555,11 +562,38 @@ class CudaTlm final : public LineRescorer {
     Run& job = *lease.run;
     Pass& S = job.shared;
     Pass& R = job.rest;
-    S.clear();
-    R.clear();
-    S.all = false;
-    job.sto.clear();
-    job.rto.clear();
+    auto fresh = [&] {
+      S.clear();
+      R.clear();
+      S.all = false;
+      job.sto.clear();
+      job.rto.clear();
+    };
+    auto add = [&](const Part& p, double v) {
+      out[static_cast<size_t>(p.line)][static_cast<size_t>(p.reading)] += p.sign * v;
+    };
+    // the batch laid out so far: its two passes run, their picks added where they go, and a new batch begun
+    auto run = [&] {
+      reserve(job);  // everything both passes take, before either is enqueued: nothing is freed under a running kernel
+      const float* sp = enqueue(job, S, job.ints_s, job.stage_s, job.picks_s, job.back_s, job.cache.p, nullptr);
+      const float* rp = R.tok.empty()
+                            ? nullptr
+                            : enqueue(job, R, job.ints_r, job.stage_r, job.picks_r, job.back_r, nullptr, job.cache.p);
+      ck(cudaStreamSynchronize(job.s), "the rescore");
+      for (size_t i = 0; i < job.sto.size(); ++i) {
+        const auto& to = parts[static_cast<size_t>(job.sto[i].line)];
+        if (job.sto[i].reading < 0) {
+          for (const Part& p : to) add(p, sp[i]);
+        } else {
+          add(to[static_cast<size_t>(job.sto[i].reading)], sp[i]);
+        }
+      }
+      for (size_t i = 0; i < job.rto.size(); ++i) {
+        add(parts[static_cast<size_t>(job.rto[i].line)][static_cast<size_t>(job.rto[i].reading)], rp[i]);
+      }
+      fresh();
+    };
+    fresh();
     for (size_t l = 0; l < qs.size(); ++l) {
       const RescoreQuery& q = qs[l];
       size_t longest = 0;
@@ -573,6 +607,11 @@ class CudaTlm final : public LineRescorer {
         while (k < P && k < r.size() && r[k] == q.readings[0][k]) ++k;
         P = k;
       }
+      // a batch takes at most kBatchRows rows a pass (a query larger than that runs alone): the page's lines past that
+      // go in the next, on the same run, so a run's memory is a batch's however large the page
+      size_t rest = 0;
+      for (const auto& r : q.readings) rest += r.size() - P;
+      if (!S.tok.empty() && (S.tok.size() + ctx.size() + P > kBatchRows || R.tok.size() + rest > kBatchRows)) run();
       const int seg = static_cast<int>(S.tok.size()), Ls = static_cast<int>(ctx.size() + P);
       for (int i = 0; i < Ls; ++i) {
         S.tok.push_back(i < static_cast<int>(ctx.size()) ? ctx[static_cast<size_t>(i)]
@@ -606,26 +645,7 @@ class CudaTlm final : public LineRescorer {
         }
       }
     }
-    reserve(job);  // everything both passes take, before either is enqueued: nothing is freed under a running kernel
-    const float* sp = enqueue(job, S, job.ints_s, job.stage_s, job.picks_s, job.back_s, job.cache.p, nullptr);
-    const float* rp = R.tok.empty()
-                          ? nullptr
-                          : enqueue(job, R, job.ints_r, job.stage_r, job.picks_r, job.back_r, nullptr, job.cache.p);
-    ck(cudaStreamSynchronize(job.s), "the rescore");
-    auto add = [&](const Part& p, double v) {
-      out[static_cast<size_t>(p.line)][static_cast<size_t>(p.reading)] += p.sign * v;
-    };
-    for (size_t i = 0; i < job.sto.size(); ++i) {
-      const auto& to = parts[static_cast<size_t>(job.sto[i].line)];
-      if (job.sto[i].reading < 0) {
-        for (const Part& p : to) add(p, sp[i]);
-      } else {
-        add(to[static_cast<size_t>(job.sto[i].reading)], sp[i]);
-      }
-    }
-    for (size_t i = 0; i < job.rto.size(); ++i) {
-      add(parts[static_cast<size_t>(job.rto[i].line)][static_cast<size_t>(job.rto[i].reading)], rp[i]);
-    }
+    run();
   }
 
  private:

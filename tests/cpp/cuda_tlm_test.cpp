@@ -1,7 +1,7 @@
 // The transformer language model on a GPU (cuda_transformer_lm, src/cuda/tlm.cu) against the CPU's
 // (TransformerLM): the same model file, random weights, the same scores to FP16's rounding; a page's lines in one
-// run the lines one by one; the readings longer than the window in windows, as the CPU's; callers at once each as
-// alone.
+// run the lines one by one; the readings longer than the window in windows, as the CPU's; a page larger than a batch
+// in batches, its lines as alone; callers at once each as alone.
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
 
@@ -139,7 +139,9 @@ TEST(CudaTlm, ScoresAsTheCpuDoesInEachPrecision) {
         to_f32 += std::abs(got[r] - full[r]);
       }
     }
-    if (p == TlmPrecision::kInt8) EXPECT_LT(to_cpu, 0.2 * to_f32) << "int8: the GPU's file is not the CPU's INT8";
+    if (p == TlmPrecision::kInt8) {
+      EXPECT_LT(to_cpu, 0.2 * to_f32) << "int8: the GPU's file is not the CPU's INT8";
+    }
   }
 }
 
@@ -182,6 +184,52 @@ TEST(CudaTlm, APagesLinesInOneRunAreEachLinesAlone) {
     }
   }
   ASSERT_GT(readings[40][0].size() + 1, 128u);  // the long line is longer than the window
+}
+
+// A page larger than a batch (8192 rows a pass, src/cuda/tlm.cu's kBatchRows) runs as several, one after another on
+// its run, which keeps a batch's memory, not the page's: its lines score as each alone, and as the CPU's model scores
+// them, whichever batch they fall in, a long line's windows too.
+TEST(CudaTlm, APageLargerThanABatchScoresAsItsLinesAlone) {
+  if (!have_gpu()) GTEST_SKIP() << "no GPU";
+  const int classes = 97;
+  const auto file = random_model("gpu-batches", 128, 2, 4, 256, 128, classes, 13u);
+  const auto cpu = TransformerLM::open(file);
+  const auto gpu = cuda_transformer_lm(file, 0);
+  std::mt19937 g(31u);
+  std::vector<std::vector<int32_t>> contexts;
+  std::vector<std::vector<std::vector<int32_t>>> readings;
+  size_t tokens = 0;
+  for (int l = 0; l < 220; ++l) {
+    std::vector<int32_t> ctx{classes};
+    const auto above = random_tokens(g, classes, 20 + static_cast<size_t>(l) % 40);
+    ctx.insert(ctx.end(), above.begin(), above.end());
+    ctx.push_back(classes);
+    contexts.push_back(ctx);
+    const size_t len = l % 50 == 7 ? 260 : 30 + static_cast<size_t>(l * 13) % 50;  // a long line now and then
+    readings.push_back(readings_of(g, classes, len, 8));
+    for (const auto& r : readings.back()) tokens += r.size();
+  }
+  ASSERT_GT(tokens, 3u * 8192u);  // more than three batches' rows
+  std::vector<RescoreQuery> q;
+  for (size_t l = 0; l < contexts.size(); ++l) q.push_back({contexts[l], readings[l]});
+  std::vector<std::vector<double>> page(q.size());
+  gpu->score_lines(q, page);
+  for (size_t l = 0; l < q.size(); ++l) {
+    ASSERT_EQ(page[l].size(), readings[l].size());
+    std::vector<double> alone(readings[l].size());
+    gpu->score(contexts[l], readings[l], alone);
+    for (size_t r = 0; r < alone.size(); ++r) {
+      EXPECT_NEAR(page[l][r], alone[r], 1e-3) << "line " << l << ", reading " << r;
+    }
+    if (l % 9 == 0 || l % 50 == 7) {  // the CPU's on a sample, the long lines among them
+      std::vector<double> want(readings[l].size());
+      cpu->score(contexts[l], readings[l], want);
+      for (size_t r = 0; r < want.size(); ++r) {
+        EXPECT_NEAR(page[l][r], want[r], tolerance_of(readings[l][r].size(), contexts[l].size(), 128))
+            << "line " << l << ", reading " << r;
+      }
+    }
+  }
 }
 
 // Callers at once, more than the runs a rescorer holds (8): each page's scores exactly as when it runs alone (the same

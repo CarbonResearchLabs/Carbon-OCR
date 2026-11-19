@@ -96,8 +96,9 @@ class LineRescorer {
 // cores (FP16 in, FP32 sums, the bias, GELU and residual fused), the layer norms, attention and log-softmax a warp a
 // row; within a few hundredths of a nat of the CPU's. A line longer than its window is scored in windows, as the
 // CPU's model scores it, in the same run. Callers at once run at once, each on a stream and buffers of its own (up to
-// 8; more wait for one). Throws Error where CUDA is not built in, or where the model's heads are not 32, 64 or 128
-// wide.
+// 8; more wait for one). A page's lines run in batches of a bounded size, one after another, so each caller's buffers
+// are a batch's (about 120 MB for Latin's model) however large its pages. Throws Error where CUDA is not built in, or
+// where the model's heads are not 32, 64 or 128 wide.
 std::shared_ptr<LineRescorer> cuda_transformer_lm(const std::filesystem::path& file, int gpu = 0);
 
 class TransformerLM final : public LineRescorer {
