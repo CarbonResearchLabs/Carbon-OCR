@@ -21,7 +21,7 @@ The goal is to be far more accurate than Tesseract and faster than every open en
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/glance-dark.svg">
-  <img src="docs/assets/glance-light.svg" alt="Designed: 2.83 M parameters in fullerene-3M; 10.8 GMAC per Latin page; OmniParseBench headline 52.3 against Tesseract's 5.9. Measured: rec-latin at 62 GMAC/s on one CPU core and 12.8 TMAC/s in FP16 on a laptop RTX 4060; 295 tests, 273 of them in CI" width="100%">
+  <img src="docs/assets/glance-light.svg" alt="Designed: 2.83 M parameters in fullerene-3M; 10.8 GMAC per Latin page; OmniParseBench headline 53.0 against Tesseract's 5.9. Measured: rec-latin at 62 GMAC/s on one CPU core and 12.8 TMAC/s in FP16 on a laptop RTX 4060; 295 tests, 273 of them in CI" width="100%">
 </picture>
 
 The top row is the Latin set: its parameters and its compute for a page, counted from the models' layer shapes, and its score on OmniParseBench. The bottom row is the kernels' speed, measured on random weights since speed does not depend on them, and the tests (Measured so far, below).
@@ -72,45 +72,59 @@ A Latin page is 10.8 GMAC, and 77% of that is recognition. That is why the recog
 
 ## <img src="docs/assets/chip-04.svg" height="22" alt=""> Measured so far
 
-The trained `fullerene-3M` ([on Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M)) against Tesseract 5.5 with its defaults, on every page of three benchmarks, each graded by its own grader (17 November 2026). The engine's rules were tuned on OmniParseBench. olmOCR-Bench and OmniDocBench were held out, only graded, to check that what helps one benchmark holds on pages it was not tuned on.
+The trained `fullerene-3M` ([on Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M)) against Tesseract 5.5 with its defaults, on every page of three benchmarks, each graded by its own grader (18 November 2026), in its default precision: on the CPU, its INT8 recognizer and orientation model, with detection and order in FP32. The engine's rules were tuned on OmniParseBench. olmOCR-Bench and OmniDocBench were held out, only graded, to check that what helps one benchmark holds on pages it was not tuned on.
 
 | benchmark | `fullerene-3M` | Tesseract 5.5 |
 |---|---|---|
-| OmniParseBench, 2,937 page images: headline | **52.3** | 5.9 |
-| OmniParseBench: text, tables, layout | 27.3, 47.9, 81.7 | 17.8, 0, 0 |
-| OmniParseBench, read as PDFs | **58.6** | not run |
-| olmOCR-Bench, 1,403 PDFs read as images | **45.8** ± 0.9 | 34.2 |
-| olmOCR-Bench, read as PDFs | **47.5** ± 0.9 | not run |
-| OmniDocBench v1.6, 755 English pages: tables (TEDS) | **49.2** | none |
-| OmniDocBench: text (edit distance, lower is better) | 0.171 | **0.129** |
-| OmniDocBench: reading order (edit distance, lower is better) | 0.293 | **0.253** |
+| OmniParseBench, 2,937 page images: headline | **53.0** | 5.9 |
+| OmniParseBench: text, tables, layout | 27.2, 49.7, 81.9 | 17.8, 0, 0 |
+| OmniParseBench, read as PDFs | **58.8** | not run |
+| olmOCR-Bench, 1,403 PDFs read as images | **47.0** ± 1.0 | 34.2 |
+| olmOCR-Bench, read as PDFs | **48.1** ± 0.9 | not run |
+| OmniDocBench v1.6, 755 English pages: tables (TEDS) | **51.1** | none |
+| OmniDocBench: text (edit distance, lower is better) | 0.164 | **0.129** |
+| OmniDocBench: reading order (edit distance, lower is better) | 0.287 | **0.253** |
 
-Read as PDFs means through `carbon-ocr ocr`, as you would run it: each page from its text layer where the layer passes its checks, its words set in the lines the detector finds, and by OCR otherwise. Setting the words in the detector's lines costs the text pages about 10% of their speed (`--layer-lines layer` skips it). Tesseract writes text alone, so it scores 0 on tables and layout. Where `fullerene-3M` loses: Tesseract reads OmniDocBench's text better and orders it a little better, most of all on newspapers (an edit distance of 0.097 against 0.305). Tesseract also reads more of olmOCR-Bench's old scans (20.7 to 16.0), and neither writes LaTeX (0 on the math tests). [docs/ENGINE.md](docs/ENGINE.md) has each benchmark's breakdown.
+Read as PDFs means through `carbon-ocr ocr`, as you would run it: each page from its text layer where the layer passes its checks, its words set in the lines the detector finds, and by OCR otherwise. Setting the words in the detector's lines costs the text pages about 10% of their speed (`--layer-lines layer` skips it). Tesseract writes text alone, so it scores 0 on tables and layout. Where `fullerene-3M` loses: Tesseract reads OmniDocBench's text better and orders it a little better, most of all on newspapers (an edit distance of 0.097 against 0.282). Tesseract also reads more of olmOCR-Bench's old scans (20.7 to 15.6), and neither writes LaTeX (0 on the math tests). [docs/ENGINE.md](docs/ENGINE.md) has each benchmark's breakdown.
 
-**With the language models** (17 November): `fullerene-1.1-3M`, a newer Latin set that ships them, read greedily and with each mode on every page, each benchmark graded by its own grader. The models' weights and gates were tuned on held-out lines, never on the benchmarks.
+**With the language models** (18 November): `fullerene-1.1-3M`, a newer Latin set that ships them, read greedily and with each mode on every page, each benchmark graded by its own grader. The models' weights and gates were tuned on held-out lines, never on the benchmarks.
 
 | benchmark | greedy | `--lm-mode ngram` | `--lm-mode both` | Tesseract 5.5 |
 |---|---|---|---|---|
-| OmniParseBench, 2,937 page images: headline | 54.26 | **55.28** | 55.27 | 5.95 |
-| olmOCR-Bench, 1,403 PDFs read as images | 51.5 | 52.4 | **52.8** | 34.2 |
+| OmniParseBench, 2,937 page images: headline | 54.37 | **55.09** | 54.94 | 5.95 |
+| olmOCR-Bench, 1,403 PDFs read as images | 51.5 | 52.5 | **52.8** | 34.2 |
+| OmniDocBench: text (edit distance, lower is better) | 0.154 | 0.156 | 0.154 | **0.129** |
 
-The beam alone, without a model, keeps greedy's readings (54.21 and 51.5): the gains are the models'. OmniDocBench's text is the one measure the models do not improve: an edit distance of 0.152 greedy, 0.156 with the n-gram and 0.159 with both, against Tesseract's 0.129.
+The beam alone, without a model, removes few of greedy's errors on held-out lines (a mean of 11.47% to greedy's 11.64%, against the 7-gram's 10.31%): the gains are the models'. Of these three, OmniDocBench's text is the one the n-gram does not improve: an edit distance of 0.154 greedy, 0.156 with the n-gram and 0.154 with both, against Tesseract's 0.129.
 
-**Speed**, on a desktop (a virtual machine with 8 CPUs of an Intel Core i5-13600KF, and an RTX 4060 Ti), 17 November:
-- **5.14 pages a second on one core** against Tesseract's 0.92, so 5.6 times as fast (a median page of 165 ms against 789), and 31.3 against 6.0 in eight processes.
-- **30.8 pages a second** in one process of 8 workers with 16 pages in flight, 31.0 sustained over five minutes; one page at a time on 8 workers, a median page of 53 ms. Every page comes out the same bytes either way.
-- 31.9 pages a second served over HTTP (`carbon-ocr serve` on the CPU, 32 connections), the images' decoding included; 24.6 through `carbon-ocr ocr` on 8 workers, in runs of 64 pages that each load the models.
-- **209.7 pages a second on the GPU**, sustained over five minutes (`--device cuda`, the FP16 files on TensorRT, 32 pages in flight); all 2,937 pages at 237.2, every page read, scoring 52.3 as the CPU does.
-- All of OmniParseBench at 30.9 pages a second in 8 processes, and its PDFs at 24.9 through `carbon-ocr ocr`.
+**Speed**, on a desktop (a virtual machine with 8 CPUs of an Intel Core i5-13600KF, and an RTX 4060 Ti), 18 November, `fullerene-3M` in its default precision unless a line says otherwise:
+- **9.34 pages a second on one core** against Tesseract's 0.92, so 10.2 times as fast (a median page of 91 ms against 793); with every network in INT8, 11.12; in FP32, 5.15.
+- **51.1 pages a second in eight processes** against Tesseract's 6.00, 8.5 times as fast; with every network in INT8, 65.7; in FP32, 30.6.
+- **48.2 pages a second** in one process of 8 workers with 16 pages in flight, 53.2 sustained over five minutes; one page at a time on 8 workers, 22.6, a median page of 36 ms. With every network in INT8, 58.3 and 63.5 sustained.
+- 56.6 pages a second served over HTTP (`carbon-ocr serve` on the CPU, 32 connections), the images' decoding included; 36.3 through `carbon-ocr ocr` on 8 workers, in runs of 64 pages that each load the models.
+- **209.9 pages a second on the GPU**, sustained over five minutes (`--device cuda`, the FP16 files on TensorRT, 32 pages in flight), scoring 53.4 on OmniParseBench. In INT8 (`--precision int8`) it reads about as fast: 202.1 sustained against 209.9, though a single pass over all of OmniParseBench went 223.8 against 194.3. In INT8 the recognizer runs whole, without the fused CTC head.
+
+**By precision** (18 November): `fullerene-3M` read every way the engine can read it, each benchmark graded by its own grader. det's and order's INT8 files, and the GPU's symmetric INT8 files, fail their gates and the set does not ship them: they change more than 0.3% of their decisions against FP32, the symmetric recognizer its character error rate on codes, amounts and IDs (1.11% against 0.97%, the limit 0.05 points more), though it reads rendered lines better (4.70% against 4.87%). They are measured here all the same.
+
+| `fullerene-3M` | OmniParseBench | olmOCR-Bench | OmniDocBench text (lower is better) | pages a second |
+|---|---|---|---|---|
+| the default on the CPU: INT8 recognizer and orientation model | 53.0 | 47.0 ± 1.0 | 0.164 | 9.34 on one core, 51.1 in 8 processes, 53.2 sustained on 8 workers |
+| every network in INT8 | 51.4 | 46.8 ± 1.0 | 0.162 | 11.12 on one core, 65.7 in 8 processes, 63.5 sustained on 8 workers |
+| FP32 | 53.2 | 46.8 ± 0.9 | 0.167 | 5.15 on one core, 30.6 in 8 processes, 30.8 sustained on 8 workers |
+| FP16 on the CPU | 53.4 | 46.8 ± 0.9 | 0.163 | 3.55 on one core |
+| FP16 on the GPU (TensorRT) | 53.4 | 46.7 ± 1.0 | 0.165 | 209.9 sustained |
+| INT8 on the GPU (TensorRT, symmetric files) | 50.1 | 45.6 ± 0.9 | 0.170 | 202.1 sustained |
+| the default with the 7-gram (`--lm-mode ngram`) | 54.0 | 48.4 ± 0.9 | 0.164 | 7.00 on one core, 41.0 sustained on 8 workers |
+| Tesseract 5.5 | 5.9 | 34.2 ± 1.0 | 0.129 | 0.92 on one core, 6.00 in 8 processes |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/fig-bench-dark.svg">
-  <img src="docs/assets/fig-bench-light.svg" alt="OmniParseBench, all 2,937 pages: fullerene-3M scores a headline of 52.3 against Tesseract 5.5's 5.9; text 27.3 against 17.8, tables 47.9 and layout 81.7 against 0." width="100%">
+  <img src="docs/assets/fig-bench-light.svg" alt="OmniParseBench, all 2,937 pages: fullerene-3M scores a headline of 53.0 against Tesseract 5.5's 5.9; text 27.2 against 17.8, tables 49.7 and layout 81.9 against 0." width="100%">
 </picture>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/fig-bench-speed-dark.svg">
-  <img src="docs/assets/fig-bench-speed-light.svg" alt="Pages a second on a desktop's 8 CPUs: 5.14 against Tesseract's 0.92 on one core, 31.34 against 6.04 in eight processes." width="100%">
+  <img src="docs/assets/fig-bench-speed-light.svg" alt="Pages a second on a desktop's 8 CPUs: 9.34 against Tesseract's 0.92 on one core, 51.06 against 6.00 in eight processes." width="100%">
 </picture>
 
 **Pages, read** (17 November): `fullerene-3M` on three invented pages, a report page, a page of two tables and a rough photo of the first, every picture drawn from the engine's own output. On the report page it found every line, read 252 of 255 words right, put 21 blocks in the page's own reading order and wrote HTML, in 104 ms on one core; it turned the photo 180° and levelled it; it put all 73 table cells in their row and column, 62 of them character for character. Every fault found is listed with where it comes from ([docs/DEMO.md](docs/DEMO.md), [PDF](docs/Carbon-OCR-Demo.pdf), [dark](docs/Carbon-OCR-Demo-Dark.pdf); the scripts in [docs/demo/](docs/demo/)).
@@ -188,7 +202,7 @@ carbon-ocr cpus --gemm
 
 `serve` keeps the models loaded and answers each page sent to `POST /ocr` in any of `ocr`'s formats (JSON by default), with every client's pages sharing the CPU's workers or, with `--device cuda`, the GPU's batches.
 
-`--lm-mode` switches the language models as one option. `none` reads every line greedily, as the engine does by default; `ngram` reads the lines under the gate again with a CTC prefix beam of 8 and the set's 7-gram (`lm-latin.bin`); `transformer` rescores the beam's best readings with the set's transformer (`tlm-latin.bin`), each after the line above it; `both` does both. Each model runs at the weights and gate tuned into its file for the set's recognizer. `--lm-gate`, `--lm-alpha`, `--lm-beta` and `--tlm-alpha` override them, and `--tlm-gpu N` runs the transformer on that GPU (on the CPU otherwise; with `--device cuda`, on the pipeline's GPU). A mode whose model the set lacks is an error. On `fullerene-1.1-3M` the n-gram takes OmniParseBench from 54.26 to 55.28 and olmOCR-Bench from 51.5 to 52.4, at 85% of greedy's pages a second (4.15 on one core to 4.88); both models take olmOCR-Bench to 52.8, at a quarter of them on one core and 80% on 8 workers with the transformer on the GPU. `serve` takes the same options.
+`--lm-mode` switches the language models as one option. `none` reads every line greedily, as the engine does by default; `ngram` reads the lines under the gate again with a CTC prefix beam of 8 and the set's 7-gram (`lm-latin.bin`); `transformer` rescores the beam's best readings with the set's transformer (`tlm-latin.bin`), each after the line above it; `both` does both. Each model runs at the weights and gate tuned into its file for the set's recognizer. `--lm-gate`, `--lm-alpha`, `--lm-beta` and `--tlm-alpha` override them, and `--tlm-gpu N` runs the transformer on that GPU (on the CPU otherwise; with `--device cuda`, on the pipeline's GPU). A mode whose model the set lacks is an error. On `fullerene-1.1-3M` the n-gram takes OmniParseBench from 54.37 to 55.09 and olmOCR-Bench from 51.5 to 52.5, at 85% of greedy's pages a second (4.13 on one core to 4.87); both models take olmOCR-Bench to 52.8, at 79% of greedy's pages a second on 8 workers with the transformer on the GPU, while the transformer on the CPU leaves a quarter of them on one core (1.16). `serve` takes the same options.
 
 ```python
 import carbon_ocr

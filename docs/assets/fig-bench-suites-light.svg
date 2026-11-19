@@ -5,32 +5,32 @@
 <text x="212.6" y="14.0" font-size="8" fill="#3d3d3d">Tesseract 5.5</text>
 <text x="110.0" y="38.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">tables</text>
 <text x="110.0" y="48.0" font-family="PlexMono" font-size="6.8" text-anchor="end" fill="#6b6b6b">5,427 tests</text>
-<path d="M118.0 30.0 H388.8 Q390.8 30.0 390.8 32.0 V36.5 Q390.8 38.5 388.8 38.5 H118.0 Z" fill="#2a78d6"/>
-<text x="394.8" y="37.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.53</text>
+<path d="M118.0 30.0 H397.4 Q399.4 30.0 399.4 32.0 V36.5 Q399.4 38.5 397.4 38.5 H118.0 Z" fill="#2a78d6"/>
+<text x="403.4" y="37.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.54</text>
 <path d="M118.0 40.0 H124.4 Q126.4 40.0 126.4 42.0 V46.5 Q126.4 48.5 124.4 48.5 H118.0 Z" fill="#eb6834"/>
 <text x="130.4" y="47.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.02</text>
 <text x="110.0" y="64.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">arXiv math</text>
 <text x="110.0" y="74.0" font-family="PlexMono" font-size="6.8" text-anchor="end" fill="#6b6b6b">3,272 tests</text>
-<path d="M118.0 56.0 H188.0 Q190.0 56.0 190.0 58.0 V62.5 Q190.0 64.5 188.0 64.5 H118.0 Z" fill="#2a78d6"/>
-<text x="194.0" y="63.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.14</text>
+<path d="M118.0 56.0 H187.2 Q189.2 56.0 189.2 58.0 V62.5 Q189.2 64.5 187.2 64.5 H118.0 Z" fill="#2a78d6"/>
+<text x="193.2" y="63.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.14</text>
 <path d="M118.0 66.0 H119.9 Q121.8 66.0 121.8 67.9 V72.6 Q121.8 74.5 119.9 74.5 H118.0 Z" fill="#eb6834"/>
 <text x="125.8" y="73.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.01</text>
 <text x="110.0" y="90.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">synthetic copies</text>
 <text x="110.0" y="100.0" font-family="PlexMono" font-size="6.8" text-anchor="end" fill="#6b6b6b">1,881 tests</text>
-<path d="M118.0 82.0 H320.9 Q322.9 82.0 322.9 84.0 V88.5 Q322.9 90.5 320.9 90.5 H118.0 Z" fill="#2a78d6"/>
-<text x="326.9" y="89.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.40</text>
+<path d="M118.0 82.0 H323.6 Q325.6 82.0 325.6 84.0 V88.5 Q325.6 90.5 323.6 90.5 H118.0 Z" fill="#2a78d6"/>
+<text x="329.6" y="89.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.40</text>
 <path d="M118.0 92.0 H198.3 Q200.3 92.0 200.3 94.0 V98.5 Q200.3 100.5 198.3 100.5 H118.0 Z" fill="#eb6834"/>
 <text x="204.3" y="99.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.16</text>
 <text x="110.0" y="116.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">table tests</text>
 <text x="110.0" y="126.0" font-family="PlexMono" font-size="6.8" text-anchor="end" fill="#6b6b6b">718 tests</text>
-<path d="M118.0 108.0 H406.7 Q408.7 108.0 408.7 110.0 V114.5 Q408.7 116.5 406.7 116.5 H118.0 Z" fill="#2a78d6"/>
-<text x="412.7" y="115.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.56</text>
+<path d="M118.0 108.0 H420.5 Q422.5 108.0 422.5 110.0 V114.5 Q422.5 116.5 420.5 116.5 H118.0 Z" fill="#2a78d6"/>
+<text x="426.5" y="115.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.59</text>
 <path d="M118.0 118.0 H118.8 Q119.5 118.0 119.5 118.8 V125.8 Q119.5 126.5 118.8 126.5 H118.0 Z" fill="#eb6834"/>
 <text x="123.5" y="125.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.00</text>
 <text x="110.0" y="142.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">multilingual PDFs</text>
 <text x="110.0" y="152.0" font-family="PlexMono" font-size="6.8" text-anchor="end" fill="#6b6b6b">676 tests</text>
-<path d="M118.0 134.0 H309.1 Q311.1 134.0 311.1 136.0 V140.5 Q311.1 142.5 309.1 142.5 H118.0 Z" fill="#2a78d6"/>
-<text x="315.1" y="141.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.37</text>
+<path d="M118.0 134.0 H294.5 Q296.5 134.0 296.5 136.0 V140.5 Q296.5 142.5 294.5 142.5 H118.0 Z" fill="#2a78d6"/>
+<text x="300.5" y="141.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.34</text>
 <path d="M118.0 144.0 H124.4 Q126.4 144.0 126.4 146.0 V150.5 Q126.4 152.5 124.4 152.5 H118.0 Z" fill="#eb6834"/>
 <text x="130.4" y="151.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.02</text>
 <text x="110.0" y="168.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">old scans, math</text>
@@ -41,32 +41,32 @@
 <text x="146.2" y="177.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.05</text>
 <text x="110.0" y="194.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">real pages</text>
 <text x="110.0" y="204.0" font-family="PlexMono" font-size="6.8" text-anchor="end" fill="#6b6b6b">445 tests</text>
-<path d="M118.0 186.0 H441.9 Q443.9 186.0 443.9 188.0 V192.5 Q443.9 194.5 441.9 194.5 H118.0 Z" fill="#2a78d6"/>
-<text x="447.9" y="193.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.63</text>
+<path d="M118.0 186.0 H440.8 Q442.8 186.0 442.8 188.0 V192.5 Q442.8 194.5 440.8 194.5 H118.0 Z" fill="#2a78d6"/>
+<text x="446.8" y="193.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.63</text>
 <path d="M118.0 196.0 H231.2 Q233.2 196.0 233.2 198.0 V202.5 Q233.2 204.5 231.2 204.5 H118.0 Z" fill="#eb6834"/>
 <text x="237.2" y="203.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.22</text>
 <text x="110.0" y="220.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">old scans</text>
 <text x="110.0" y="230.0" font-family="PlexMono" font-size="6.8" text-anchor="end" fill="#6b6b6b">395 tests</text>
-<path d="M118.0 212.0 H192.1 Q194.1 212.0 194.1 214.0 V218.5 Q194.1 220.5 192.1 220.5 H118.0 Z" fill="#2a78d6"/>
-<text x="198.1" y="219.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.15</text>
+<path d="M118.0 212.0 H194.7 Q196.7 212.0 196.7 214.0 V218.5 Q196.7 220.5 194.7 220.5 H118.0 Z" fill="#2a78d6"/>
+<text x="200.7" y="219.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.15</text>
 <path d="M118.0 222.0 H142.2 Q144.2 222.0 144.2 224.0 V228.5 Q144.2 230.5 142.2 230.5 H118.0 Z" fill="#eb6834"/>
 <text x="148.2" y="229.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.05</text>
 <text x="110.0" y="246.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">rotated, skewed</text>
 <text x="110.0" y="256.0" font-family="PlexMono" font-size="6.8" text-anchor="end" fill="#6b6b6b">377 tests</text>
-<path d="M118.0 238.0 H445.8 Q447.8 238.0 447.8 240.0 V244.5 Q447.8 246.5 445.8 246.5 H118.0 Z" fill="#2a78d6"/>
-<text x="451.8" y="245.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.64</text>
+<path d="M118.0 238.0 H438.9 Q440.9 238.0 440.9 240.0 V244.5 Q440.9 246.5 438.9 246.5 H118.0 Z" fill="#2a78d6"/>
+<text x="444.9" y="245.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.62</text>
 <path d="M118.0 248.0 H190.2 Q192.2 248.0 192.2 250.0 V254.5 Q192.2 256.5 190.2 256.5 H118.0 Z" fill="#eb6834"/>
 <text x="196.2" y="255.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.14</text>
 <text x="110.0" y="272.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">tiny plans</text>
 <text x="110.0" y="282.0" font-family="PlexMono" font-size="6.8" text-anchor="end" fill="#6b6b6b">372 tests</text>
-<path d="M118.0 264.0 H546.3 Q548.3 264.0 548.3 266.0 V270.5 Q548.3 272.5 546.3 272.5 H118.0 Z" fill="#2a78d6"/>
-<text x="552.3" y="271.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.83</text>
+<path d="M118.0 264.0 H549.1 Q551.1 264.0 551.1 266.0 V270.5 Q551.1 272.5 549.1 272.5 H118.0 Z" fill="#2a78d6"/>
+<text x="555.1" y="271.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.84</text>
 <path d="M118.0 274.0 H522.6 Q524.6 274.0 524.6 276.0 V280.5 Q524.6 282.5 522.6 282.5 H118.0 Z" fill="#eb6834"/>
 <text x="528.6" y="281.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.78</text>
 <text x="110.0" y="298.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">multi-column</text>
 <text x="110.0" y="308.0" font-family="PlexMono" font-size="6.8" text-anchor="end" fill="#6b6b6b">352 tests</text>
-<path d="M118.0 290.0 H503.0 Q505.0 290.0 505.0 292.0 V296.5 Q505.0 298.5 503.0 298.5 H118.0 Z" fill="#2a78d6"/>
-<text x="509.0" y="297.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.75</text>
+<path d="M118.0 290.0 H506.0 Q508.0 290.0 508.0 292.0 V296.5 Q508.0 298.5 506.0 298.5 H118.0 Z" fill="#2a78d6"/>
+<text x="512.0" y="297.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.75</text>
 <path d="M118.0 300.0 H304.4 Q306.4 300.0 306.4 302.0 V306.5 Q306.4 308.5 304.4 308.5 H118.0 Z" fill="#eb6834"/>
 <text x="310.4" y="307.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.36</text>
 <text x="110.0" y="324.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">handwriting</text>
@@ -77,8 +77,8 @@
 <text x="126.8" y="333.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.01</text>
 <text x="110.0" y="350.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">document photos</text>
 <text x="110.0" y="360.0" font-family="PlexMono" font-size="6.8" text-anchor="end" fill="#6b6b6b">299 tests</text>
-<path d="M118.0 342.0 H464.2 Q466.2 342.0 466.2 344.0 V348.5 Q466.2 350.5 464.2 350.5 H118.0 Z" fill="#2a78d6"/>
-<text x="470.2" y="349.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.67</text>
+<path d="M118.0 342.0 H460.8 Q462.8 342.0 462.8 344.0 V348.5 Q462.8 350.5 460.8 350.5 H118.0 Z" fill="#2a78d6"/>
+<text x="466.8" y="349.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.67</text>
 <path d="M118.0 352.0 H187.0 Q189.0 352.0 189.0 354.0 V358.5 Q189.0 360.5 187.0 360.5 H118.0 Z" fill="#eb6834"/>
 <text x="193.0" y="359.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.14</text>
 <text x="110.0" y="376.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">ParseBench docs</text>
@@ -89,14 +89,14 @@
 <text x="304.1" y="385.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.35</text>
 <text x="110.0" y="402.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">real PDFs</text>
 <text x="110.0" y="412.0" font-family="PlexMono" font-size="6.8" text-anchor="end" fill="#6b6b6b">256 tests</text>
-<path d="M118.0 394.0 H405.4 Q407.4 394.0 407.4 396.0 V400.5 Q407.4 402.5 405.4 402.5 H118.0 Z" fill="#2a78d6"/>
-<text x="411.4" y="401.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.56</text>
+<path d="M118.0 394.0 H407.4 Q409.4 394.0 409.4 396.0 V400.5 Q409.4 402.5 407.4 402.5 H118.0 Z" fill="#2a78d6"/>
+<text x="413.4" y="401.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.56</text>
 <path d="M118.0 404.0 H336.6 Q338.6 404.0 338.6 406.0 V410.5 Q338.6 412.5 336.6 412.5 H118.0 Z" fill="#eb6834"/>
 <text x="342.6" y="411.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.43</text>
 <text x="110.0" y="428.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">long tiny text</text>
 <text x="110.0" y="438.0" font-family="PlexMono" font-size="6.8" text-anchor="end" fill="#6b6b6b">237 tests</text>
-<path d="M118.0 420.0 H432.9 Q434.9 420.0 434.9 422.0 V426.5 Q434.9 428.5 432.9 428.5 H118.0 Z" fill="#2a78d6"/>
-<text x="438.9" y="427.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.61</text>
+<path d="M118.0 420.0 H446.0 Q448.0 420.0 448.0 422.0 V426.5 Q448.0 428.5 446.0 428.5 H118.0 Z" fill="#2a78d6"/>
+<text x="452.0" y="427.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.64</text>
 <path d="M118.0 430.0 H273.4 Q275.4 430.0 275.4 432.0 V436.5 Q275.4 438.5 273.4 438.5 H118.0 Z" fill="#eb6834"/>
 <text x="279.4" y="437.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.30</text>
 <text x="110.0" y="454.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">federal forms</text>
@@ -107,14 +107,14 @@
 <text x="289.2" y="463.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.32</text>
 <text x="110.0" y="480.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">filled forms</text>
 <text x="110.0" y="490.0" font-family="PlexMono" font-size="6.8" text-anchor="end" fill="#6b6b6b">107 tests</text>
-<path d="M118.0 472.0 H454.9 Q456.9 472.0 456.9 474.0 V478.5 Q456.9 480.5 454.9 480.5 H118.0 Z" fill="#2a78d6"/>
-<text x="460.9" y="479.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.65</text>
+<path d="M118.0 472.0 H435.5 Q437.5 472.0 437.5 474.0 V478.5 Q437.5 480.5 435.5 480.5 H118.0 Z" fill="#2a78d6"/>
+<text x="441.5" y="479.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.62</text>
 <path d="M118.0 482.0 H348.4 Q350.4 482.0 350.4 484.0 V488.5 Q350.4 490.5 348.4 490.5 H118.0 Z" fill="#eb6834"/>
 <text x="354.4" y="489.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.45</text>
 <text x="110.0" y="506.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">multilingual</text>
 <text x="110.0" y="516.0" font-family="PlexMono" font-size="6.8" text-anchor="end" fill="#6b6b6b">92 tests</text>
-<path d="M118.0 498.0 H358.1 Q360.1 498.0 360.1 500.0 V504.5 Q360.1 506.5 358.1 506.5 H118.0 Z" fill="#2a78d6"/>
-<text x="364.1" y="505.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.47</text>
+<path d="M118.0 498.0 H363.7 Q365.7 498.0 365.7 500.0 V504.5 Q365.7 506.5 363.7 506.5 H118.0 Z" fill="#2a78d6"/>
+<text x="369.7" y="505.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.48</text>
 <path d="M118.0 508.0 H200.5 Q202.5 508.0 202.5 510.0 V514.5 Q202.5 516.5 200.5 516.5 H118.0 Z" fill="#eb6834"/>
 <text x="206.5" y="515.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.16</text>
 <text x="110.0" y="532.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">handwriting (FR)</text>
@@ -125,8 +125,8 @@
 <text x="128.2" y="541.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.01</text>
 <text x="110.0" y="558.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">large format</text>
 <text x="110.0" y="568.0" font-family="PlexMono" font-size="6.8" text-anchor="end" fill="#6b6b6b">57 tests</text>
-<path d="M118.0 550.0 H370.5 Q372.5 550.0 372.5 552.0 V556.5 Q372.5 558.5 370.5 558.5 H118.0 Z" fill="#2a78d6"/>
-<text x="376.5" y="557.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.49</text>
+<path d="M118.0 550.0 H379.5 Q381.5 550.0 381.5 552.0 V556.5 Q381.5 558.5 379.5 558.5 H118.0 Z" fill="#2a78d6"/>
+<text x="385.5" y="557.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.51</text>
 <path d="M118.0 560.0 H352.3 Q354.3 560.0 354.3 562.0 V566.5 Q354.3 568.5 352.3 568.5 H118.0 Z" fill="#eb6834"/>
 <text x="358.3" y="567.5" font-family="PlexMono" font-size="7.2" fill="#3d3d3d">0.46</text>
 <text x="110.0" y="584.0" font-size="8.2" text-anchor="end" fill="#3d3d3d">forms</text>

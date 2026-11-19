@@ -4,30 +4,30 @@
 <rect x="183.6" y="6.0" width="10.0" height="9.0" rx="2" fill="#d95926"/>
 <text x="198.6" y="14.0" font-size="8" fill="#a4a4a4">Tesseract 5.5</text>
 <text x="96.0" y="40.0" font-size="8.2" text-anchor="end" fill="#a4a4a4">one page at a time</text>
-<path d="M104.0 30.0 H189.2 Q191.2 30.0 191.2 32.0 V36.5 Q191.2 38.5 189.2 38.5 H104.0 Z" fill="#3987e5"/>
-<text x="195.2" y="37.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">5.14</text>
-<path d="M104.0 40.0 H117.7 Q119.7 40.0 119.7 42.0 V46.5 Q119.7 48.5 117.7 48.5 H104.0 Z" fill="#d95926"/>
-<text x="123.7" y="47.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">0.92</text>
+<path d="M104.0 30.0 H192.1 Q194.1 30.0 194.1 32.0 V36.5 Q194.1 38.5 192.1 38.5 H104.0 Z" fill="#3987e5"/>
+<text x="198.1" y="37.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">9.34</text>
+<path d="M104.0 40.0 H110.9 Q112.9 40.0 112.9 42.0 V46.5 Q112.9 48.5 110.9 48.5 H104.0 Z" fill="#d95926"/>
+<text x="116.9" y="47.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">0.92</text>
 <text x="96.0" y="64.0" font-size="8.2" text-anchor="end" fill="#a4a4a4">1 process</text>
-<path d="M104.0 54.0 H191.2 Q193.2 54.0 193.2 56.0 V60.5 Q193.2 62.5 191.2 62.5 H104.0 Z" fill="#3987e5"/>
-<text x="197.2" y="61.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">5.26</text>
-<path d="M104.0 64.0 H118.5 Q120.5 64.0 120.5 66.0 V70.5 Q120.5 72.5 118.5 72.5 H104.0 Z" fill="#d95926"/>
-<text x="124.5" y="71.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">0.97</text>
+<path d="M104.0 54.0 H194.0 Q196.0 54.0 196.0 56.0 V60.5 Q196.0 62.5 194.0 62.5 H104.0 Z" fill="#3987e5"/>
+<text x="200.0" y="61.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">9.54</text>
+<path d="M104.0 64.0 H111.3 Q113.3 64.0 113.3 66.0 V70.5 Q113.3 72.5 111.3 72.5 H104.0 Z" fill="#d95926"/>
+<text x="117.3" y="71.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">0.97</text>
 <text x="96.0" y="88.0" font-size="8.2" text-anchor="end" fill="#a4a4a4">2 processes</text>
-<path d="M104.0 78.0 H277.7 Q279.7 78.0 279.7 80.0 V84.5 Q279.7 86.5 277.7 86.5 H104.0 Z" fill="#3987e5"/>
-<text x="283.7" y="85.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">10.35</text>
-<path d="M104.0 88.0 H134.8 Q136.8 88.0 136.8 90.0 V94.5 Q136.8 96.5 134.8 96.5 H104.0 Z" fill="#d95926"/>
-<text x="140.8" y="95.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">1.93</text>
+<path d="M104.0 78.0 H281.1 Q283.1 78.0 283.1 80.0 V84.5 Q283.1 86.5 281.1 86.5 H104.0 Z" fill="#3987e5"/>
+<text x="287.1" y="85.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">18.56</text>
+<path d="M104.0 88.0 H120.6 Q122.6 88.0 122.6 90.0 V94.5 Q122.6 96.5 120.6 96.5 H104.0 Z" fill="#d95926"/>
+<text x="126.6" y="95.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">1.92</text>
 <text x="96.0" y="112.0" font-size="8.2" text-anchor="end" fill="#a4a4a4">4 processes</text>
-<path d="M104.0 102.0 H442.6 Q444.6 102.0 444.6 104.0 V108.5 Q444.6 110.5 442.6 110.5 H104.0 Z" fill="#3987e5"/>
-<text x="448.6" y="109.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">20.07</text>
-<path d="M104.0 112.0 H166.2 Q168.2 112.0 168.2 114.0 V118.5 Q168.2 120.5 166.2 120.5 H104.0 Z" fill="#d95926"/>
-<text x="172.2" y="119.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">3.78</text>
+<path d="M104.0 102.0 H439.8 Q441.8 102.0 441.8 104.0 V108.5 Q441.8 110.5 439.8 110.5 H104.0 Z" fill="#3987e5"/>
+<text x="445.8" y="109.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">35.01</text>
+<path d="M104.0 112.0 H138.4 Q140.4 112.0 140.4 114.0 V118.5 Q140.4 120.5 138.4 120.5 H104.0 Z" fill="#d95926"/>
+<text x="144.4" y="119.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">3.77</text>
 <text x="96.0" y="136.0" font-size="8.2" text-anchor="end" fill="#a4a4a4">8 processes</text>
-<path d="M104.0 126.0 H634.0 Q636.0 126.0 636.0 128.0 V132.5 Q636.0 134.5 634.0 134.5 H104.0 Z" fill="#3987e5"/>
-<text x="640.0" y="133.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">31.34</text>
-<path d="M104.0 136.0 H204.5 Q206.5 136.0 206.5 138.0 V142.5 Q206.5 144.5 204.5 144.5 H104.0 Z" fill="#d95926"/>
-<text x="210.5" y="143.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">6.04</text>
+<path d="M104.0 126.0 H594.6 Q596.6 126.0 596.6 128.0 V132.5 Q596.6 134.5 594.6 134.5 H104.0 Z" fill="#3987e5"/>
+<text x="600.6" y="133.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">51.06</text>
+<path d="M104.0 136.0 H159.9 Q161.9 136.0 161.9 138.0 V142.5 Q161.9 144.5 159.9 144.5 H104.0 Z" fill="#d95926"/>
+<text x="165.9" y="143.5" font-family="PlexMono" font-size="7.2" fill="#a4a4a4">6.00</text>
 <line x1="104.0" y1="24.0" x2="104.0" y2="146.0" stroke="#efefed" stroke-width="0.8"/>
 <text x="104.0" y="166.0" font-size="7.4" fill="#a4a4a4">pages a second on a desktop's 8 CPUs (i5-13600KF): one core on the 300-page speed set; worker processes of one thread on its first 60 pages</text>
 </svg>
