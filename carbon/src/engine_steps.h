@@ -226,5 +226,10 @@ float model_turn_probability(const std::filesystem::path& set);
 // `rule`.
 float model_turn_probability_of(const std::filesystem::path& file);
 DetRule model_det_rule(const std::filesystem::path& file, DetRule rule);
+// Whether an engine of several workers may open its wide detector (det.onnx in FP32 on ONNX Runtime's threads, for a
+// page that finds fast cores idle): only where the workers' own detector is that file too, so a page reads the same
+// whichever detector it meets. At precision auto a set that ships det.int8.onnx runs that on every worker, and has
+// none.
+bool wide_detector_allowed(Precision precision, const std::filesystem::path& set, const std::filesystem::path& det_file);
 
 }  // namespace carbon::detail

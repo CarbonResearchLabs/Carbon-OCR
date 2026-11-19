@@ -22,7 +22,7 @@ pip install -r Examples/requirements.txt # Jupyter, matplotlib, Pillow, huggingf
 jupyter lab Examples
 ```
 
-- **The model set.** The notebooks read pages with `fullerene-3M` from `models/fullerene-3M`, and download it there from [Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M) the first time (about 20 MB). To use a set kept elsewhere, set `CARBON_OCR_SET` to its folder. Notebook 7 needs a set that ships the language models, `fullerene-1.1-3M`.
+- **The model set.** The notebooks read pages with `fullerene-3M` from `models/fullerene-3M`, and download it there from [Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M) the first time (about 20 MB). To use a set kept elsewhere, set `CARBON_OCR_SET` to its folder. Notebook 7 needs a set that ships both language models, [`fullerene-1.1-3M`](https://huggingface.co/CarbonResearchLabs/fullerene-1.1-3M).
 - **The command line.** Notebook 6 runs `carbon-ocr`, built with CMake as the [build guide](https://github.com/CarbonResearchLabs/Carbon-OCR/blob/main/docs/BUILD.md) describes. It finds the program in `build/<preset>/cli/`, on the `PATH`, or where `CARBON_OCR` points. Notebooks 1 to 5 and 7 need only the Python module (7's last cell runs `carbon-ocr` where it finds it).
 
 ## The files

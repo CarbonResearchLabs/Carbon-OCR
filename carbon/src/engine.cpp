@@ -410,6 +410,10 @@ DetRule model_det_rule(const std::filesystem::path& file, DetRule rule) {
   return rule;
 }
 
+bool wide_detector_allowed(Precision precision, const std::filesystem::path& set, const std::filesystem::path& det_file) {
+  return (precision == Precision::kAuto || precision == Precision::kFp32) && det_file == set / "det.onnx";
+}
+
 }  // namespace detail
 
 std::vector<std::string> load_vocab(const std::filesystem::path& file) {
@@ -1017,8 +1021,8 @@ struct Engine::Impl {
     }
     const auto built = compiled_backends();
     const bool ort = std::find(built.begin(), built.end(), Backend::kOnnxRuntime) != built.end();
-    // (ONNX Runtime on det.onnx: FP32, so not where another precision is asked for)
-    const bool fp32_det = o.precision == Precision::kAuto || o.precision == Precision::kFp32;
+    // (ONNX Runtime on det.onnx: FP32, so only where the workers' detector is det.onnx too)
+    const bool fp32_det = detail::wide_detector_allowed(o.precision, set, det.file);
     // A wide detector's threads on the fast cores: on a hybrid CPU the OS may otherwise put them on an E-core,
     // which the whole run then waits for (processor group 0 alone, where ONNX Runtime's numbers are these).
     std::vector<int> fast_cpus;
@@ -1030,7 +1034,7 @@ struct Engine::Impl {
       }
     }
     if (ort && o.backend != Backend::kNative && fp32_det && pool.fast() >= 2) {
-      wide_head = det.file == set / "det.onnx" ? head : detail::fused_det_head(set / "det.onnx");
+      wide_head = head;  // the workers' file is det.onnx (wide_detector_allowed)
       if (wide_head && o.det_stem && !wide_head->stem) detail::with_det_stem(*wide_head);
     }
     for (int t : {6, 4, 2}) {

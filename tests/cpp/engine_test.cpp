@@ -175,6 +175,18 @@ TEST(Engine, ALinesPitchFromItsRowsInk) {
   EXPECT_EQ(detail::line_pitch(noise.view()), 0);
 }
 
+// The wide detector (det.onnx in FP32 on ONNX Runtime's threads, for a page that finds fast cores idle) only where the
+// workers' detector is det.onnx too: at auto a set that ships det.int8.onnx runs that on every worker, and a page read
+// alone would otherwise meet another detector than in a batch, and read differently.
+TEST(Engine, AWideDetectorOnlyWhereTheWorkersDetectorIsDetOnnx) {
+  const std::filesystem::path set = "set";
+  EXPECT_TRUE(detail::wide_detector_allowed(Precision::kAuto, set, set / "det.onnx"));
+  EXPECT_TRUE(detail::wide_detector_allowed(Precision::kFp32, set, set / "det.onnx"));
+  EXPECT_FALSE(detail::wide_detector_allowed(Precision::kAuto, set, set / "det.int8.onnx"));
+  EXPECT_FALSE(detail::wide_detector_allowed(Precision::kInt8, set, set / "det.int8.onnx"));
+  EXPECT_FALSE(detail::wide_detector_allowed(Precision::kFp16, set, set / "det.fp16.onnx"));
+}
+
 // The page turned 2.5 degrees: levelled before detection, read as it was.
 TEST(Engine, LevelsASkewedPage) {
   const GrayImage level = load_image(kSet / "page.png");

@@ -1070,8 +1070,12 @@ int pages(const Args& a) {
       std::mutex m;
     };
     std::vector<std::unique_ptr<Wide>> wides;
-    const bool fp32_det = a.precision == carbon::Precision::kAuto || a.precision == carbon::Precision::kFp32;
-    if ((a.det == "auto" || a.det == "wide") && fp32_det) {  // det.onnx on ONNX Runtime: FP32, as the engine
+    // det.onnx on ONNX Runtime: FP32, so only where the workers run det.onnx too, as the engine
+    // (detail::wide_detector_allowed): at auto a set that ships det.int8.onnx runs that on every worker
+    const bool fp32_det = (a.precision == carbon::Precision::kAuto || a.precision == carbon::Precision::kFp32) &&
+                          carbon::choose_set_model(dir, "det", a.backend_given ? std::optional(a.backend) : std::nullopt,
+                                                   a.precision).file == dir / "det.onnx";
+    if ((a.det == "auto" || a.det == "wide") && fp32_det) {
       for (int t : {6, 4, 2}) {
         if (t > pool.fast()) continue;
         auto wd = std::make_unique<Wide>();
