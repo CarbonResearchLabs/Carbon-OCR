@@ -8,14 +8,14 @@
   <img alt="C++20" src="https://img.shields.io/badge/C%2B%2B-20-74f2d6?style=flat-square&labelColor=1a1a1a">
   <img alt="GPU: TensorRT 11" src="https://img.shields.io/badge/GPU-TensorRT%2011-79ee5f?style=flat-square&labelColor=1a1a1a">
   <img alt="CPU: ONNX Runtime 1.31" src="https://img.shields.io/badge/CPU-ONNX%20Runtime%201.31-f2b43c?style=flat-square&labelColor=1a1a1a">
-  <img alt="models: fullerene-3M on Hugging Face" src="https://img.shields.io/badge/models-fullerene--3M%20on%20Hugging%20Face-d6352a?style=flat-square&labelColor=1a1a1a">
+  <img alt="models: fullerene-3M and fullerene-1.1-3M on Hugging Face" src="https://img.shields.io/badge/models-fullerene--3M%20and%20fullerene--1.1--3M%20on%20Hugging%20Face-d6352a?style=flat-square&labelColor=1a1a1a">
   <img alt="code: Apache 2.0" src="https://img.shields.io/badge/code-Apache%202.0-5bbff4?style=flat-square&labelColor=1a1a1a">
   <img alt="weights: OpenRAIL-AMS" src="https://img.shields.io/badge/weights-OpenRAIL--AMS-74f2d6?style=flat-square&labelColor=1a1a1a">
 </p>
 
 **Carbon-OCR is an OCR engine in C++ and CUDA, and Fullerene is its family of small models.** It reads scans, photos of documents and PDFs, and gives text, markdown, HTML and JSON with boxes. It runs on CPUs with its own int8 kernels or ONNX Runtime, one worker per core, and on NVIDIA GPUs through TensorRT, with many pages in flight. On either, a model runs in FP32, FP16 or INT8, from the set's file of that precision. You can call it from the command line, C++ or Python, or over HTTP.
 
-The goal is to be far more accurate than Tesseract and faster than every open engine of its class. Every number here is measured, never estimated. The engine is complete and tested. The first Fullerene set, `fullerene-3M` (Latin), is out on [Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-3M) under the Carbon-OCR OpenRAIL-AMS license; the other script groups follow. Every set's files and metadata are specified ([docs/MODELS.md](docs/MODELS.md)), so the engine reads each one as it ships.
+The goal is to be far more accurate than Tesseract and faster than every open engine of its class. Every number here is measured, never estimated. The engine is complete and tested. Two Latin sets are out on Hugging Face under the Carbon-OCR OpenRAIL-AMS license, [`fullerene-3M`](https://huggingface.co/CarbonResearchLabs/fullerene-3M) and the newer [`fullerene-1.1-3M`](https://huggingface.co/CarbonResearchLabs/fullerene-1.1-3M); the other script groups follow. Every set's files and metadata are specified ([docs/MODELS.md](docs/MODELS.md)), so the engine reads each one as it ships.
 
 ## <img src="docs/assets/chip-01.svg" height="22" alt=""> At a glance
 
@@ -42,7 +42,7 @@ On the CPU, a pinned worker per physical core reads pages in parallel, from a li
 
 ## <img src="docs/assets/chip-03.svg" height="22" alt=""> The models
 
-The trained Latin set, `fullerene-3M`, is on Hugging Face: [huggingface.co/CarbonResearchLabs/fullerene-3M](https://huggingface.co/CarbonResearchLabs/fullerene-3M).
+The trained Latin sets are on Hugging Face: [`fullerene-3M`](https://huggingface.co/CarbonResearchLabs/fullerene-3M), and [`fullerene-1.1-3M`](https://huggingface.co/CarbonResearchLabs/fullerene-1.1-3M), its four networks trained again on another mix of rendered and real lines and pages, with a 7-gram and a transformer.
 
 Fullerene is eight small networks, shipped in two sets named by their parameter count:
 - **`fullerene-3M`**, the Latin set, 2.83 M parameters: `orient`, `det`, `script`, `rec-latin` and `order`.
@@ -87,7 +87,7 @@ The trained `fullerene-3M` ([on Hugging Face](https://huggingface.co/CarbonResea
 
 Read as PDFs means through `carbon-ocr ocr`, as you would run it: each page from its text layer where the layer passes its checks, its words set in the lines the detector finds, and by OCR otherwise. Setting the words in the detector's lines costs the text pages about 10% of their speed (`--layer-lines layer` skips it). Tesseract writes text alone, so it scores 0 on tables and layout. Where `fullerene-3M` loses: Tesseract reads OmniDocBench's text better and orders it a little better, most of all on newspapers (an edit distance of 0.097 against 0.282). Tesseract also reads more of olmOCR-Bench's old scans (20.7 to 15.6), and neither writes LaTeX (0 on the math tests). [docs/ENGINE.md](docs/ENGINE.md) has each benchmark's breakdown.
 
-**With the language models** (19 November): `fullerene-1.1-3M`, a newer Latin set that ships them, read greedily and with each mode on every page in its default precision (on the CPU the INT8 files of `orient`, `det` and the recognizer, which ship though each failed its gate; `order` runs in FP32 on the CPU at every precision), each benchmark graded by its own grader. The models' weights and gates were tuned on held-out lines. The 7-gram was tuned twice; the set ships the first tuning (alpha 0.3, beta 2.0), chosen after both were measured on the benchmarks.
+**With the language models** (19 November): `fullerene-1.1-3M` ([on Hugging Face](https://huggingface.co/CarbonResearchLabs/fullerene-1.1-3M)), a newer Latin set that ships them, read greedily and with each mode on every page in its default precision (on the CPU the INT8 files of `orient`, `det` and the recognizer, which ship though each failed its gate; `order` runs in FP32 on the CPU at every precision), each benchmark graded by its own grader. The models' weights and gates were tuned on held-out lines. The 7-gram was tuned twice; the set ships the first tuning (alpha 0.3, beta 2.0), chosen after both were measured on the benchmarks.
 
 | benchmark | greedy | `--lm-mode ngram` | `--lm-mode both` | Tesseract 5.5 |
 |---|---|---|---|---|
@@ -98,11 +98,12 @@ Read as PDFs means through `carbon-ocr ocr`, as you would run it: each page from
 In FP32 (`--precision fp32`) the n-gram scores 55.33 on OmniParseBench and both 55.30, from 54.37 greedy. The beam alone, without a model, removes few of greedy's errors on held-out lines (a mean of 11.58% to greedy's 11.86%, against the 7-gram's 10.30%): the gains are the models'. OmniDocBench's text is the one they barely move. `fullerene-3M` ships the 7-gram tuned for its recognizer: in its default precision it takes OmniParseBench from 53.0 to 54.0 and olmOCR-Bench from 47.0 to 48.4.
 
 **Speed**, on a desktop (a virtual machine with 8 CPUs of an Intel Core i5-13600KF, and an RTX 4060 Ti), 18 November, `fullerene-3M` in its default precision unless a line says otherwise:
-- **9.34 pages a second on one core** against Tesseract's 0.92, so 10.2 times as fast (a median page of 91 ms against 793); with det's INT8 file too (`--precision int8`; not shipped, it failed its gate), 11.12; in FP32, 5.15.
-- **51.1 pages a second in eight processes** against Tesseract's 6.00, 8.5 times as fast; with det's INT8 file too, 65.7; in FP32, 30.6.
+- **9.34 pages a second on one core** against Tesseract's 0.92: `fullerene-3M` is 10.2 times as fast (a median page of 91 ms against 793); with det's INT8 file too (`--precision int8`; not shipped, it failed its gate), 11.12; in FP32, 5.15.
+- **51.1 pages a second in eight processes** against Tesseract's 6.00: `fullerene-3M` is 8.5 times as fast; with det's INT8 file too, 65.7; in FP32, 30.6.
 - **48.2 pages a second** in one process of 8 workers with 16 pages in flight, 53.2 sustained over five minutes; one page at a time on 8 workers, 22.6, a median page of 36 ms. With det's INT8 file too, 58.3 and 63.5 sustained.
 - 56.6 pages a second served over HTTP (`carbon-ocr serve` on the CPU, 32 connections), the images' decoding included; 36.3 through `carbon-ocr ocr` on 8 workers, in runs of 64 pages that each load the models.
 - **209.9 pages a second on the GPU**, sustained over five minutes (`--device cuda`, the FP16 files on TensorRT, 32 pages in flight), scoring 53.4 on OmniParseBench. In INT8 (`--precision int8`) it reads about as fast: 202.1 sustained against 209.9, though a single pass over all of OmniParseBench went 223.8 against 194.3. In INT8 the recognizer runs whole, without the fused CTC head.
+- **`fullerene-1.1-3M`**, greedy in its default precision (19 November): **10.59 pages a second on one core** against Tesseract's 0.92, so `fullerene-1.1-3M` is 11.5 times as fast (a median page of 74 ms against 793); **60.92 pages a second** sustained over five minutes on 8 workers against Tesseract's 6.54 in 8 processes, 9.3 times as fast; **210.4** sustained on the GPU.
 
 **By precision** (18 November): `fullerene-3M` read every way the engine can read it, each benchmark graded by its own grader. det's and order's INT8 files, and the GPU's symmetric INT8 files, fail their gates and the set does not ship them: they change more than 0.3% of their decisions against FP32, the symmetric recognizer its character error rate on codes, amounts and IDs (1.11% against 0.97%, the limit 0.05 points more), though it reads rendered lines better (4.70% against 4.87%). They are measured here all the same.
 
@@ -255,7 +256,7 @@ Three of them are also typeset as PDFs, each in a light and a dark edition:
 
 ## <img src="docs/assets/chip-09.svg" height="22" alt=""> License
 
-The code is licensed under [Apache 2.0](LICENSE). The Fullerene weights are licensed under the [Carbon-OCR OpenRAIL-AMS license](LICENSE-WEIGHTS.md): royalty-free use, modification and redistribution, under the use restrictions of its Attachment A, which every derivative and redistribution carries. The trained set is on Hugging Face: [CarbonResearchLabs/fullerene-3M](https://huggingface.co/CarbonResearchLabs/fullerene-3M).
+The code is licensed under [Apache 2.0](LICENSE). The Fullerene weights are licensed under the [Carbon-OCR OpenRAIL-AMS license](LICENSE-WEIGHTS.md): royalty-free use, modification and redistribution, under the use restrictions of its Attachment A, which every derivative and redistribution carries. The trained sets are on Hugging Face: [CarbonResearchLabs/fullerene-3M](https://huggingface.co/CarbonResearchLabs/fullerene-3M) and [CarbonResearchLabs/fullerene-1.1-3M](https://huggingface.co/CarbonResearchLabs/fullerene-1.1-3M).
 
 ## <img src="docs/assets/chip-10.svg" height="22" alt=""> Citation and credits
 
