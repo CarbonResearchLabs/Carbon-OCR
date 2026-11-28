@@ -13,6 +13,13 @@ target_include_directories(carbon_tests SYSTEM PRIVATE ${CARBON_STB_INCLUDE_DIR}
 target_compile_definitions(carbon_tests PRIVATE
   CARBON_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/data")
 carbon_warnings(carbon_tests)
+# Some tests compute a kernel's arithmetic themselves as its reference (Beam's candidates, every term summed by
+# detail::exp_neg), so the tests must round as the kernels do: no fused multiply-adds, as cmake/CarbonOptions.cmake
+# builds the kernels. A compiler whose baseline has FMA (Armv8-A, or x86-64-v3 where a distribution makes it the
+# default) would otherwise fuse the reference's multiplies and adds.
+if(NOT MSVC)
+  target_compile_options(carbon_tests PRIVATE -ffp-contract=off)
+endif()
 
 if(CARBON_WITH_ONNXRUNTIME)
   target_sources(carbon_tests PRIVATE cpp/ort_session_test.cpp cpp/engine_test.cpp cpp/batch_pipeline_test.cpp
