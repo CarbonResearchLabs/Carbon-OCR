@@ -535,6 +535,10 @@ struct Server::Impl {
   std::condition_variable q_cv;
   std::deque<Work> queue;
   std::deque<Render> renders;
+  // The requests held, from when one is read until its answer goes out: waiting here, on a feeder (which holds
+  // one while the stream is full), in the stream, or being written. Past the stream's pages in flight and
+  // o.queue more, a request is answered 503 at once (route). Under q_m.
+  size_t held = 0;
   // the requests given to the stream, by number; a page's tag is its request's number and its page
   static constexpr int kPageBits = 24;
   std::mutex given_m;
@@ -742,6 +746,10 @@ struct Server::Impl {
                   w.body ? w.body->size() : size_t{0}, w.pages.size(), w.pages.size() == 1 ? "" : "s", body.size(),
                   ms);
     log(line);
+    {  // its place given up as its answer goes out
+      std::lock_guard lk(q_m);
+      --held;
+    }
     post({w.conn, http::response(status, type, body, w.keep_alive, extra), !w.keep_alive});
   }
 
@@ -1153,12 +1161,17 @@ struct Server::Impl {
     w.keep_alive = keep;
     w.t0 = Clock::now();
     w.body = std::make_shared<const std::string>(std::move(body));
-    {
+    {  // every request held counts, not only those still here: each feeder holds one while the stream is full
       std::lock_guard lk(q_m);
-      if (queue.size() >= static_cast<size_t>(o.queue)) {
-        error_reply(c, 503, "busy: " + std::to_string(o.queue) + " requests waiting", keep, {{"Retry-After", "1"}});
+      const size_t limit = static_cast<size_t>(in_flight) + static_cast<size_t>(std::max(0, o.queue));
+      if (held >= limit) {
+        error_reply(c, 503,
+                    "busy: " + std::to_string(held) + " requests held, " + std::to_string(in_flight) +
+                        " pages in flight and " + std::to_string(o.queue) + " waiting",
+                    keep, {{"Retry-After", "1"}});
         return;
       }
+      ++held;
       queue.push_back(std::move(w));
     }
     q_cv.notify_one();

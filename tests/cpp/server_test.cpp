@@ -24,11 +24,15 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -464,6 +468,80 @@ TEST(Server, AnswersBusyPastItsQueueAndGoesOn) {
   EXPECT_EQ(ok + busy, 24);
   Client c(r.port());
   EXPECT_EQ(c.ask(post("/ocr?format=text", big)).status, 200);
+}
+
+// The same with its answers held, so the queue fills however fast the machine reads: the log, which a writer calls
+// with each answer before it goes out, waits until let go. A request is held until its answer goes out, so past
+// the page in flight and the one waiting every request is answered 503 at once, wherever the feeders hold the
+// others; let go, the two held are answered, and it goes on.
+TEST(Server, AnswersBusyPastItsQueueWhileItsAnswersAreHeld) {
+  struct Hold {
+    std::mutex m;
+    std::condition_variable cv;
+    bool holding = true;
+    int answers = 0, busy = 0;  // log lines: answers made (each held), 503s
+  };
+  const auto hold = std::make_shared<Hold>();
+  const auto let_go = [hold] {
+    {
+      std::lock_guard lk(hold->m);
+      hold->holding = false;
+    }
+    hold->cv.notify_all();
+  };
+  const std::string png = file_bytes(kSet / "page.png");
+  carbon::ServerOptions o = options(1);
+  o.engine.in_flight = 1;
+  o.queue = 1;
+  o.log = [hold](const std::string& line) {
+    std::unique_lock lk(hold->m);
+    if (line.rfind("POST /ocr ", 0) == 0) {  // an answer, on a writer: held here until let go
+      ++hold->answers;
+      hold->cv.notify_all();
+      hold->cv.wait(lk, [&] { return !hold->holding; });
+    } else if (line.rfind("503 busy", 0) == 0) {  // on the network thread, which goes on
+      ++hold->busy;
+      hold->cv.notify_all();
+    }
+  };
+  Running r(o);
+  struct LetGo {  // the writers let go before the server stops, whatever fails
+    std::function<void()> f;
+    ~LetGo() { f(); }
+  } guard{let_go};
+  constexpr int kClients = 24, kHeld = 2;  // the page in flight and the one waiting
+  std::vector<std::unique_ptr<Client>> clients;
+  for (int i = 0; i < kClients; ++i) {
+    clients.push_back(std::make_unique<Client>(r.port()));
+    clients.back()->write(post("/ocr?format=text", png));
+  }
+  {
+    std::unique_lock lk(hold->m);
+    const bool refused =
+        hold->cv.wait_for(lk, std::chrono::seconds(20), [&] { return hold->busy >= kClients - kHeld; });
+    EXPECT_TRUE(refused) << hold->busy << " requests answered 503 while " << hold->answers
+                         << " answers were held, not " << kClients - kHeld;
+    EXPECT_LE(hold->answers, kHeld);
+  }
+  let_go();
+  int ok = 0, busy = 0;
+  std::string first;
+  for (auto& c : clients) {
+    const std::optional<Reply> a = c->read();
+    ASSERT_TRUE(a.has_value());
+    if (a->status == 200) {
+      if (!ok++) first = a->body;
+      EXPECT_EQ(a->body, first);
+    } else {
+      EXPECT_EQ(a->status, 503);
+      EXPECT_TRUE(a->has("Retry-After: 1"));
+      ++busy;
+    }
+  }
+  EXPECT_EQ(ok, kHeld);
+  EXPECT_EQ(busy, kClients - kHeld);
+  Client c(r.port());
+  EXPECT_EQ(c.ask(post("/ocr?format=text", png)).status, 200);
 }
 
 // On a GPU: the pages decoded by the server's decoders, read by the batched pipeline in its batches, every client's

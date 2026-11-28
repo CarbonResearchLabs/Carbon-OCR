@@ -29,7 +29,8 @@
 // than a page; 404 an unknown path; 405 a method the path does not take; 411 a body without a Content-Length; 413
 // a body past max_body; 415 a body that is no image or PDF it reads (a PDF where the build reads none); 422 an
 // image that does not decode, or a PDF that does not open or has no pages; 431 a head too large; 500 the engine's
-// error; 503 the queue full (Retry-After: 1). An error's body is its reason, as text.
+// error; 503 the queue full: the pages in flight and `queue` requests more held (Retry-After: 1). An error's body is
+// its reason, as text.
 //
 // Its threads: one for the network (poll over the listening socket and every connection, nothing else on it), a
 // few that give the pages to the stream (on a GPU decoding the images; a PDF's pages rendered one at a time, a
@@ -53,7 +54,10 @@ struct ServerOptions {
   std::string host = "127.0.0.1";  // the address to listen on: 0.0.0.0 for every interface
   int port = 8080;                 // 0: a free one (Server::port)
   size_t max_body = size_t{64} << 20;  // a request's body, past which 413
-  int queue = 64;    // requests waiting for the engine, past its pages in flight; past them, 503
+  // Requests waiting for the engine, past its pages in flight; past them, 503 at once. A request is held from when
+  // it is read until its answer goes out, wherever it waits (the threads that give the pages each hold one while
+  // the stream is full), so at most the pages in flight and this many are held.
+  int queue = 64;
   EngineOptions engine;
   bool cuda = false;          // the batched pipeline on the GPU, with `pipeline`'s options
   PipelineOptions pipeline;   // its engine options are `engine`
