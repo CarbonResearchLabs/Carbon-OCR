@@ -21,7 +21,7 @@ The goal is to be far more accurate than Tesseract and faster than every open en
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/glance-dark.svg">
-  <img src="docs/assets/glance-light.svg" alt="Designed: 2.83 M parameters in fullerene-3M; 10.8 GMAC per Latin page; OmniParseBench 1.8 headline 63.74 for fullerene-1.1-3M on the CPU with the 7-gram. Measured: rec-latin at 62 GMAC/s on one CPU core and 12.8 TMAC/s in FP16 on a laptop RTX 4060; 346 tests, 320 of them in CI" width="100%">
+  <img src="docs/assets/glance-light.svg" alt="Designed: 2.83 M parameters in fullerene-3M; 10.8 GMAC per Latin page; OmniParseBench 1.8 headline 63.74 for fullerene-1.1-3M on the CPU with the 7-gram. Measured: rec-latin at 62 GMAC/s on one CPU core and 12.8 TMAC/s in FP16 on a laptop RTX 4060; 350 tests, 322 of them in CI" width="100%">
 </picture>
 
 The top row is the Latin set: its parameters and its compute for a page, counted from the models' layer shapes, and `fullerene-1.1-3M`'s score on OmniParseBench 1.8 as the engine reads it now. The bottom row is the kernels' speed, measured on random weights since speed does not depend on them, and the tests (Measured so far, below).
@@ -72,7 +72,7 @@ A Latin page is 10.8 GMAC, and 77% of that is recognition. That is why the recog
 
 ## <img src="docs/assets/chip-04.svg" height="22" alt=""> Measured so far
 
-**The engine as it is now** (Carbon-OCR from [[RELEASE_DATE]] on): [`fullerene-1.1-3M`](https://huggingface.co/CarbonResearchLabs/fullerene-1.1-3M) in the setting its model card gives, on every page of three benchmarks, each graded by its own grader. On the CPU it reads its INT8 files (`order` in FP32) with the 7-gram (`--lm-mode ngram`); on the GPU, its FP16 files on TensorRT with the 7-gram. OmniParseBench's pages (2,149 PDFs and 788 images) are read through `carbon-ocr ocr` as you would run it: a PDF page from its text layer where the layer passes its checks, its pictures by OCR, and by OCR otherwise. The engine's rules were tuned on OmniParseBench. olmOCR-Bench and OmniDocBench were held out, only graded, to check that what helps one benchmark holds on pages it was not tuned on. Tesseract 5.5, with its defaults, was not run on OmniParseBench 1.8; on the other two it read the same pages, and accuracy does not depend on the machine.
+**The engine as it is now** (Carbon-OCR from 28 November 2026 on): [`fullerene-1.1-3M`](https://huggingface.co/CarbonResearchLabs/fullerene-1.1-3M) in the setting its model card gives, on every page of three benchmarks, each graded by its own grader. On the CPU it reads its INT8 files (`order` in FP32) with the 7-gram (`--lm-mode ngram`); on the GPU, its FP16 files on TensorRT with the 7-gram. OmniParseBench's pages (2,149 PDFs and 788 images) are read through `carbon-ocr ocr` as you would run it: a PDF page from its text layer where the layer passes its checks, its pictures by OCR, and by OCR otherwise. The engine's rules were tuned on OmniParseBench. olmOCR-Bench and OmniDocBench were held out, only graded, to check that what helps one benchmark holds on pages it was not tuned on. Tesseract 5.5, with its defaults, was not run on OmniParseBench 1.8; on the other two it read the same pages, and accuracy does not depend on the machine.
 
 | benchmark | `fullerene-1.1-3M`, CPU | `fullerene-1.1-3M`, GPU | Tesseract 5.5 |
 |---|---|---|---|
@@ -89,7 +89,7 @@ Where `fullerene-1.1-3M` loses: Tesseract reads OmniDocBench's plain text better
 **Speed**, on an AMD Ryzen Threadripper 3970X (Zen 2, 32 cores) with two RTX A6000s, Linux, nothing else running: `fullerene-1.1-3M` on 900 of OmniParseBench 1.8's pages (662 PDFs, 238 images) through `carbon-ocr ocr`, each page's JSON with its HTML and markdown. Tesseract was not timed on this machine, so no speed ratio is given against it.
 - **114.0 pages a second on 30 workers**, greedy, sustained over about four minutes of passes; 105.1 with the 7-gram. On 8 workers, 38.1 and 35.6.
 - **4.19 pages a second on one core**, greedy (a median page of 168 ms); 3.95 with the 7-gram. The 3970X's AVX2 has no VNNI, so its int8 products widen to 16 bits and one worker reads a page sooner in FP32: 5.01 pages a second with `--precision fp32`. Many workers read more pages in INT8, the default; `carbon-ocr cpus` says which a CPU is.
-- **On the GPU: TODO** (being measured): the batched pipeline on one RTX A6000, the FP16 files on TensorRT.
+- **216.6 pages a second on one RTX A6000**, greedy, the batched pipeline with the FP16 files on TensorRT, sustained; 201.0 with the 7-gram. On two A6000s, a process on each, 221.9 together (204.8 with the 7-gram): rendering the PDF pages on the CPU caps the mix, whose 238 image pages alone run at about 345 a second on one. One page at a time, 19.9 pages a second (about 50 ms a page).
 
 ### Earlier: `fullerene-3M`, 18 November 2026
 
