@@ -257,6 +257,8 @@ Three of them are also typeset as PDFs, each in a light and a dark edition:
 - **The models** ([PDF](docs/Carbon-OCR-Models.pdf), [dark](docs/Carbon-OCR-Models-Dark.pdf)).
 - **Pages, read**: `fullerene-3M` at work on three pages ([PDF](docs/Carbon-OCR-Demo.pdf), [dark](docs/Carbon-OCR-Demo-Dark.pdf)).
 
+The engine guide's and the models' PDFs are typeset as of 19 November 2026. The Markdown pages, [ENGINE](docs/ENGINE.md), [USAGE](docs/USAGE.md), [BUILD](docs/BUILD.md) and [MODELS](docs/MODELS.md), describe the engine as it is now, with its numbers from 28 November.
+
 | document | what it covers |
 |---|---|
 | [docs/ENGINE.md](docs/ENGINE.md) | how the engine reads a page and a batch of pages: inputs, each stage, the CPU layout and the HTTP server, the backends and the precisions, the GPU pipeline, the options |
