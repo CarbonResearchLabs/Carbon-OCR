@@ -199,8 +199,12 @@ std::unique_ptr<PipelineModels> cpu_pipeline_models(const std::filesystem::path&
 // ---------------------------------------------------------------- the pipeline
 
 struct Pipeline::Impl {
+  // What is done with a page: read (by its task), its lines found alone (submit_detect), or ordered alone.
+  enum class Kind : uint8_t { kRead, kDetect, kOrder };
   struct Page {
     size_t index = 0;
+    Kind kind = Kind::kRead;
+    PageTask task;
     GrayImage image;         // as given
     GrayImage small;         // at the detector's scale, until made upright
     std::vector<float> thumb;
@@ -209,11 +213,12 @@ struct Pipeline::Impl {
     int ph = 0, pw = 0;      // the detector's padded size
     Clock::time_point start, lines_start;
     // The lines under the beam's gate (EngineOptions::beam), read by finish on a CPU thread: the line, its
-    // frames, its candidates.
+    // frames, its candidates, the beam's rule for it (detail::beam_rule: by its kind).
     struct Unsure {
       size_t line;
       int32_t length;
       FrameCandidates frames;
+      BeamRule rule;
     };
     std::vector<Unsure> unsure;
   };
@@ -221,6 +226,8 @@ struct Pipeline::Impl {
 
   PipelineOptions o;
   EngineOptions& e;
+  EngineOptions as_given;  // e, for a page read as it stands: no turn, no deskew
+  bool may_turn = true;    // whether orientation can turn a page at all (turn_probability at most 1)
   std::vector<std::string> vocab;
   std::unique_ptr<PipelineModels> models;
   detail::OrderModel order_model;
@@ -255,6 +262,10 @@ struct Pipeline::Impl {
     detail::attach_language_model(e, set, vocab, e.tlm_gpu.value_or(device == Device::kCuda ? o.gpu : -1));
     e.crop = detail::model_crop(set, e.rec, e.crop);
     if (!e.turn_probability) e.turn_probability = detail::model_turn_probability(set);
+    may_turn = *e.turn_probability <= 1.0f;
+    as_given = e;
+    as_given.turn_probability = 2.0f;
+    as_given.deskew = false;
     const int cores = cpu_topology().default_workers();
     if (given) {  // the caller's own (Pipeline's third constructor)
       models = std::move(given);
@@ -358,14 +369,80 @@ struct Pipeline::Impl {
   void cpu_task(std::function<void(int)> t) { tasks.push(std::move(t)); }
 
   // ---- the stages
-  void prepare(Page& p) {
+  // A page's first steps, on a CPU thread, by its kind and task: its order alone; reading the lines found on it;
+  // or its copy at the detector's scale, then orientation's thumbnail, or straight to being made upright where
+  // orientation could not turn it (read as given, its lines found alone, or no turn probability reached).
+  void start(const PagePtr& page, int k) {
+    Page& p = *page;
     p.start = Clock::now();
+    if (p.kind == Kind::kOrder) {
+      detail::order_page(p.out, order[k].get(), e);
+      put_ready(p);
+      return;
+    }
     p.out.width = p.image.width;
     p.out.height = p.image.height;
+    if (p.task.found) {  // its lines found already, on the page as given: straight to reading them
+      const OcrPage& f = *p.task.found;
+      if (f.width != p.image.width || f.height != p.image.height) {
+        throw Error("Pipeline: the lines found are of a " + std::to_string(f.width) + " x " +
+                    std::to_string(f.height) + " page, not this " + std::to_string(p.image.width) + " x " +
+                    std::to_string(p.image.height) + " one");
+      }
+      p.up.view = p.image.view();
+      for (const OcrLine& l : f.lines) {
+        OcrLine line;
+        line.box = l.box;
+        line.det_score = l.det_score;
+        p.out.lines.push_back(std::move(line));
+      }
+      p.out.pictures = f.pictures;
+      p.out.picture_mask = f.picture_mask;
+      p.out.second_pass = f.second_pass;
+      p.out.ms.orient = ms_since(p.start);
+      p.lines_start = Clock::now();
+      if (p.out.lines.empty()) {
+        finish(p, k);
+      } else {
+        to_recognize.push(page);
+      }
+      return;
+    }
     p.small = detail::det_scale(p.image.view(), e.det_long_side);
+    const bool given = p.kind == Kind::kDetect || p.task.as_given;
+    if (given || !may_turn) {
+      upright(page, given ? as_given : e);
+      return;
+    }
     const int side = e.orient_side;
     p.thumb.resize(static_cast<size_t>(side) * side);
     detail::thumbnail_input(p.small.view(), p.image.width, p.image.height, side, p.thumb.data());
+    to_orient.push(page);
+  }
+
+  // The page turned by its rotation and levelled by po's deskew, at the detector's scale too, then to detection.
+  void upright(const PagePtr& page, const EngineOptions& po) {
+    detail::make_upright(page->image.view(), page->out.rotation, std::move(page->small), po, page->up);
+    page->out.skew = page->up.skew;
+    const GrayView sv = page->up.small.view();
+    if (e.grid && e.grid->check) {  // its ruled lines, as the CPU engine finds them
+      page->out.rules = detail::find_rules(sv, page->up.view.width, page->up.view.height, detail::kRuleDarkScaled);
+    }
+    std::tie(page->ph, page->pw) = models->detect_size(sv.width, sv.height);
+    page->out.ms.orient = ms_since(page->start);
+    to_detect.push(page);
+  }
+
+  // A page's result out, for next and next_finished.
+  void put_ready(Page& p) {
+    p.image = GrayImage{};
+    p.up = detail::Upright{};
+    {
+      std::lock_guard lk(m);
+      ready.emplace(p.index, std::move(p.out));
+      ++delivered;
+    }
+    cv.notify_all();
   }
 
   void orient_stage() {
@@ -400,16 +477,7 @@ struct Pipeline::Impl {
           p->out.rotation = detail::rotation_of(std::span<const float>(z.data() + i * classes, classes),
                                                 *e.turn_probability, e.turn_by_quarters);
           p->thumb = {};
-          cpu_task([this, page = p](int) {
-            for_page(*page, [&] {
-              detail::make_upright(page->image.view(), page->out.rotation, std::move(page->small), e, page->up);
-              page->out.skew = page->up.skew;
-              const GrayView sv = page->up.small.view();
-              std::tie(page->ph, page->pw) = models->detect_size(sv.width, sv.height);
-              page->out.ms.orient = ms_since(page->start);
-              to_detect.push(page);
-            });
-          });
+          cpu_task([this, page = p](int) { for_page(*page, [&] { upright(page, e); }); });
         });
       }
     }
@@ -473,7 +541,10 @@ struct Pipeline::Impl {
           p->up.small = GrayImage{};
           p->out.ms.decode = ms_since(t2) - p->out.ms.second_pass;
           p->lines_start = Clock::now();
-          if (p->out.lines.empty()) {
+          if (p->kind == Kind::kDetect) {  // its lines found alone (submit_detect): out as they are
+            p->out.ms.total = ms_since(p->start);
+            put_ready(*p);
+          } else if (p->out.lines.empty()) {
             cpu_task([this, p](int k) { for_page(*p, [&] { finish(*p, k); }); });
           } else {
             to_recognize.push(p);
@@ -587,6 +658,7 @@ struct Pipeline::Impl {
       std::vector<LineBox> boxes;
       std::vector<CtcLine> decoded;
       std::vector<FrameCandidates> cands;
+      std::vector<BeamRule> rules;  // the gated lines' (detail::beam_rule)
       std::vector<int8_t> unsure;
       for (size_t a = 0; a < items.size();) {
         size_t b = a;
@@ -617,18 +689,22 @@ struct Pipeline::Impl {
         unsure.assign(b - a, -1);
         if (e.beam.on()) {
           gated.clear();
+          rules.clear();
           for (size_t i = a; i < b; ++i) {
-            if (!errors[items[i].page] &&
-                detail::decoded_confidence(decoded[i - a], vocab, e.char_confidence) < e.beam.gate) {
+            if (errors[items[i].page]) continue;
+            const BeamRule rule = detail::beam_rule(e, decoded[i - a], vocab);
+            if (detail::decoded_confidence(decoded[i - a], vocab, e.char_confidence) < rule.gate) {
               gated.push_back(static_cast<int32_t>(i - a));
+              rules.push_back(rule);
             }
           }
           try {
             if (!gated.empty() && models->candidates(gated, e.beam.topk, cands)) {
               for (size_t j = 0; j < gated.size(); ++j) {
                 const size_t i = a + static_cast<size_t>(gated[j]);
-                group[items[i].page]->unsure.push_back(
-                    {static_cast<size_t>(items[i].line), lengths[static_cast<size_t>(gated[j])], std::move(cands[j])});
+                group[items[i].page]->unsure.push_back({static_cast<size_t>(items[i].line),
+                                                         lengths[static_cast<size_t>(gated[j])], std::move(cands[j]),
+                                                         rules[j]});
                 unsure[static_cast<size_t>(gated[j])] = 1;
               }
             }
@@ -671,13 +747,13 @@ struct Pipeline::Impl {
         detail::UnsureLine w;
         w.line = u.line;
         w.length = u.length;
-        w.nbest = ctc_beam_nbest(u.frames, e.beam, e.language_model.get(), e.beam.width);
+        w.nbest = ctc_beam_nbest(u.frames, u.rule, e.language_model.get(), u.rule.width);
         waiting.push_back(std::move(w));
       }
       detail::rescore_page(out, waiting, e, vocab);
     } else {
       for (Page::Unsure& u : p.unsure) {  // the beam's lines (EngineOptions::beam), as the CPU engine reads them
-        const CtcLine d = detail::beam_read(u.frames, e);
+        const CtcLine d = detail::beam_read(u.frames, u.rule, e);
         detail::read_line(out.lines[u.line], d, u.length, e.crop, vocab, nullptr, 0, nullptr, e.char_confidence);
       }
     }
@@ -686,35 +762,35 @@ struct Pipeline::Impl {
     detail::finish_page(out, order[k].get(), e);  // the gate, the split and the order, as the CPU engine's
     out.ms.total = ms_since(p.start);
     ++pages;
-    p.image = GrayImage{};
-    p.up = detail::Upright{};
-    {
-      std::lock_guard lk(m);
-      ready.emplace(p.index, std::move(out));
-      ++delivered;
-    }
-    cv.notify_all();
+    put_ready(p);
   }
 
   // ---- the caller's side
-  size_t submit(GrayImage image) {
-    if (image.pixels.empty() || image.width <= 0 || image.height <= 0) throw Error("Pipeline::submit: an empty page");
+  // A page into the pipeline: numbered once there is room, its first steps a CPU task.
+  size_t give(const PagePtr& page) {
     std::unique_lock lk(m);
     cv.wait(lk, [&] { return stopping || submitted - delivered < static_cast<size_t>(o.in_flight); });
     if (error) std::rethrow_exception(error);
     if (closed || stopping) throw Error("Pipeline::submit: the pipeline is closed");
-    auto page = std::make_shared<Page>();
     page->index = submitted++;
-    page->image = std::move(image);
     lk.unlock();
     const size_t index = page->index;
-    cpu_task([this, page](int) {
-      for_page(*page, [&] {
-        prepare(*page);
-        to_orient.push(page);
-      });
-    });
+    cpu_task([this, page](int k) { for_page(*page, [&] { start(page, k); }); });
     return index;
+  }
+  size_t submit(GrayImage image, PageTask task = {}, Kind kind = Kind::kRead) {
+    if (image.pixels.empty() || image.width <= 0 || image.height <= 0) throw Error("Pipeline::submit: an empty page");
+    auto page = std::make_shared<Page>();
+    page->kind = kind;
+    page->task = std::move(task);
+    page->image = std::move(image);
+    return give(page);
+  }
+  size_t submit_order(OcrPage p) {
+    auto page = std::make_shared<Page>();
+    page->kind = Kind::kOrder;
+    page->out = std::move(p);
+    return give(page);
   }
 
   void close() {
@@ -783,6 +859,14 @@ Pipeline::Pipeline(const std::filesystem::path& set, PipelineOptions options, st
 Pipeline::~Pipeline() = default;
 
 size_t Pipeline::submit(GrayImage page) { return impl_->submit(std::move(page)); }
+
+size_t Pipeline::submit(GrayImage page, PageTask task) { return impl_->submit(std::move(page), std::move(task)); }
+
+size_t Pipeline::submit_detect(GrayImage page) {
+  return impl_->submit(std::move(page), PageTask{}, Impl::Kind::kDetect);
+}
+
+size_t Pipeline::submit_order(OcrPage page) { return impl_->submit_order(std::move(page)); }
 
 void Pipeline::close() { impl_->close(); }
 

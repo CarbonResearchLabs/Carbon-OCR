@@ -44,7 +44,7 @@ int run_pdf_helper() {
     for (size_t i = 0; i < chars.size(); ++i) {
       const PdfChar& c = chars[i];
       wire[i] = {static_cast<uint32_t>(c.code), c.x0, c.y0, c.x1, c.y1, c.lx0, c.ly0, c.lx1, c.ly1, c.size,
-                 c.mcid, static_cast<uint8_t>((c.generated ? 1 : 0) | (c.bad_map ? 2 : 0) | (c.invisible ? 4 : 0))};
+                 c.matrix_scale, c.angle, c.mcid, c.object, static_cast<uint8_t>((c.generated ? 1 : 0) | (c.bad_map ? 2 : 0) | (c.invisible ? 4 : 0))};
     }
     const uint32_t n = static_cast<uint32_t>(wire.size());
     return put(&n, 4) && put(wire.data(), wire.size() * sizeof(WireChar));
@@ -126,7 +126,8 @@ int run_pdf_helper() {
         const bool region = shared && (want & kPdfImage);
         const PdfPage pg = doc->page(page, scale, want, region ? shared : nullptr, region ? shared_bytes : 0);
         if (!put(&ok, 4)) return 1;
-        if ((op & 0xFF) == kPage && !put(&pg.scale, 8)) return 1;  // the scale read at (auto's, where asked)
+        const int32_t turn = pg.turn;  // the scale read at (auto's, where asked), and the turn (kPdfUpright)
+        if ((op & 0xFF) == kPage && (!put(&pg.scale, 8) || !put(&turn, 4))) return 1;
         if ((want & kPdfImage) && !put_image(pg.image)) return 1;
         if ((want & kPdfChars) && !put_chars(pg.chars)) return 1;
         if ((want & kPdfPictures) && !put_pictures(pg.pictures)) return 1;

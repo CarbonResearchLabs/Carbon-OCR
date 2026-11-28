@@ -3,29 +3,68 @@
 #include "carbon/image.h"
 
 #include <algorithm>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <new>
+#include <optional>
 #include <string>
+#include <string_view>
 
 #include "carbon/cpu.h"
 #include "carbon/error.h"
 #include "png.h"
+#include "webp.h"
 
-// stb_image for PNG, JPEG, BMP and PNM only, from memory (paths with any
-// characters work through std::filesystem), at most 32768 px a side.  PNG goes
-// to png.cpp first, which gives the same bytes faster and leaves to stb_image
-// what it does not read itself.
+// stb_image for PNG, JPEG, BMP, PNM and GIF only (a GIF's first frame), from memory (paths with any characters work
+// through std::filesystem), at most 32768 px a side.  PNG goes to png.cpp first, which gives the same bytes faster and
+// leaves to stb_image what it does not read itself; WebP to webp.cpp (libwebp).
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
 #define STBI_ONLY_JPEG
 #define STBI_ONLY_BMP
 #define STBI_ONLY_PNM
+#define STBI_ONLY_GIF
 #define STBI_NO_STDIO
 #define STBI_MAX_DIMENSIONS 32768
 #include <stb_image.h>
 
 namespace carbon {
+
+FileKind file_kind(std::span<const uint8_t> b) {
+  auto starts = [&](std::string_view m, size_t at = 0) {
+    return b.size() >= at + m.size() && std::memcmp(b.data() + at, m.data(), m.size()) == 0;
+  };
+  if (starts("\x89PNG\r\n\x1a\n")) return FileKind::kPng;
+  if (starts("\xff\xd8\xff")) return FileKind::kJpeg;
+  if (starts("GIF87a") || starts("GIF89a")) return FileKind::kGif;
+  if (starts("RIFF") && starts("WEBP", 8)) return FileKind::kWebp;
+  if (starts("%PDF-")) return FileKind::kPdf;
+  if (starts("BM")) return FileKind::kBmp;
+  if (b.size() >= 2 && b[0] == 'P' && b[1] >= '1' && b[1] <= '6') return FileKind::kPnm;
+  return FileKind::kUnknown;
+}
+
+FileKind file_kind(const std::filesystem::path& file) {
+  std::ifstream f(file, std::ios::binary);
+  if (!f) return FileKind::kUnknown;
+  uint8_t head[12] = {};
+  f.read(reinterpret_cast<char*>(head), sizeof head);
+  return file_kind(std::span<const uint8_t>(head, static_cast<size_t>(f.gcount())));
+}
+
+std::string_view file_kind_name(FileKind kind) {
+  switch (kind) {
+    case FileKind::kPng: return "png";
+    case FileKind::kJpeg: return "jpeg";
+    case FileKind::kBmp: return "bmp";
+    case FileKind::kPnm: return "pnm";
+    case FileKind::kGif: return "gif";
+    case FileKind::kWebp: return "webp";
+    case FileKind::kPdf: return "pdf";
+    default: return "unknown";
+  }
+}
 
 GrayImage decode_image(std::span<const uint8_t> bytes) { return decode_image(bytes, cpu::best_isa()); }
 
@@ -33,11 +72,22 @@ GrayImage decode_image(std::span<const uint8_t> bytes, cpu::Isa isa) {
   if (!cpu::isa_available(isa)) {
     throw Error(std::string("decode_image: ") + cpu::isa_name(isa) + " is not available on this CPU");
   }
-  try {
-    GrayImage img;
-    if (detail::png_to_gray(bytes, isa, img)) return img;
-  } catch (const std::bad_alloc&) {
-    // stb_image reports running out of memory itself
+  // the format by the file's signature; stb_image reads the rest (and refuses what it does not know)
+  switch (file_kind(bytes)) {
+    case FileKind::kWebp:
+      return detail::webp_to_gray(bytes);
+    case FileKind::kPdf:
+      throw Error("the image could not be read: a PDF, whose pages are rendered (carbon/pdf.h), not an image");
+    case FileKind::kPng:
+      try {
+        GrayImage img;
+        if (detail::png_to_gray(bytes, isa, img)) return img;
+      } catch (const std::bad_alloc&) {
+        // stb_image reports running out of memory itself
+      }
+      break;
+    default:
+      break;
   }
   int w = 0, h = 0, channels = 0;
   // gray and alpha, the gray over white by the alpha, as the PNG decoder above
@@ -50,6 +100,37 @@ GrayImage decode_image(std::span<const uint8_t> bytes, cpu::Isa isa) {
   for (size_t i = 0; i < img.pixels.size(); ++i) img.pixels[i] = over_white(data[2 * i], data[2 * i + 1]);
   stbi_image_free(data);
   return img;
+}
+
+GrayImage decode_image_resized(std::span<const uint8_t> bytes, const ImageFit& fit) {
+  return decode_image_resized(bytes, fit, cpu::best_isa());
+}
+
+GrayImage decode_image_resized(std::span<const uint8_t> bytes, const ImageFit& fit, cpu::Isa isa) {
+  if (!cpu::isa_available(isa)) {
+    throw Error(std::string("decode_image_resized: ") + cpu::isa_name(isa) + " is not available on this CPU");
+  }
+  // fit once, whichever reading it is: a caller drawing a scale in it draws one
+  std::optional<std::array<int, 2>> got;
+  const ImageFit once = [&](int w, int h) {
+    if (!got) got = fit(w, h);
+    return *got;
+  };
+  try {
+    GrayImage img;
+    if (detail::png_to_gray_resized(bytes, isa, once, img)) return img;
+  } catch (const std::bad_alloc&) {
+    // decode_image's reading, and its own report
+  }
+  const GrayImage whole = decode_image(bytes, isa);
+  const std::array<int, 2> size = once(whole.width, whole.height);
+  if (size[0] <= 0 || size[1] <= 0) throw Error("decode_image_resized: an empty size");
+  GrayImage out;
+  out.width = size[0];
+  out.height = size[1];
+  out.pixels.resize(static_cast<size_t>(size[0]) * size[1]);
+  resample_gray(whole.view(), 0, 0, whole.width, whole.height, size[0], size[1], out.pixels.data(), size[0], isa);
+  return out;
 }
 
 GrayImage load_image(const std::filesystem::path& file) {

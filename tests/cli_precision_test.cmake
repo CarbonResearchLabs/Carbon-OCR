@@ -1,7 +1,8 @@
 # carbon-ocr ocr --precision on the fake set, which has its models in FP32 alone (its
 # orient.fp16.onnx and det.fp16.onnx are the GPU's, with no recognizer beside them):
 # fp32 reads the page as auto does, int8 finds no file, fp16 does not open, and a
-# precision that is not one is a usage error.
+# precision that is not one is a usage error; and cpus names how the CPU's int8
+# products are made.
 #   cmake -DCLI=<carbon-ocr> -DDATA=<tests/data> -P cli_precision_test.cmake
 set(page "${DATA}/fake-set/page.png")
 foreach(precision auto fp32)
@@ -26,4 +27,9 @@ execute_process(COMMAND "${CLI}" ocr "${page}" --set "${DATA}/fake-set" --precis
                 RESULT_VARIABLE code ERROR_VARIABLE err)
 if(NOT code EQUAL 2 OR NOT err MATCHES "unknown precision 'half'")
   message(FATAL_ERROR "--precision half: ${code}, ${err}")
+endif()
+# cpus says how this CPU's int8 kernels multiply, and where they widen, that FP32 is the one-worker latency choice
+execute_process(COMMAND "${CLI}" cpus RESULT_VARIABLE code OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT code EQUAL 0 OR NOT out MATCHES "\nint8 products: (widened to 16 bits, [^\n]*--precision fp32|a dot product)")
+  message(FATAL_ERROR "cpus: ${code}, '${out}', ${err}")
 endif()

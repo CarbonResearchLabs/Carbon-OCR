@@ -6,6 +6,9 @@
 #include <cmath>
 #include <limits>
 #include <map>
+#include <utility>
+
+#include "engine_steps.h"
 
 namespace carbon {
 namespace {
@@ -52,6 +55,20 @@ std::vector<PdfChar> paired(std::span<const PdfChar> chars) {
 }
 
 bool space(char32_t c) { return c == U' ' || c == U'\t' || c == 0xA0 || c == U'\r' || c == U'\n'; }
+
+// A letter, as a run of a broken encoding would hold one: ASCII's; past Latin-1's symbols, any code point
+// outside the spacing modifiers and combining marks, the general punctuation, symbol and operator blocks
+// (U+2000-2BFF), CJK punctuation and the full-width forms' symbols (a mathematical alphanumeric is a letter).
+bool letter(char32_t c) {
+  if (c < 0x80) return (c | 0x20) >= 'a' && (c | 0x20) <= 'z';
+  if (c < 0xC0) return c == 0xAA || c == 0xB5 || c == 0xBA;
+  if (c == 0xD7 || c == 0xF7) return false;
+  if (c >= 0x2B0 && c <= 0x36F) return false;
+  if (c >= 0x2000 && c <= 0x2BFF) return false;
+  if (c >= 0x3000 && c <= 0x303F) return false;
+  if (c >= 0xFF00 && c <= 0xFF20) return false;
+  return true;
+}
 
 void put_utf8(std::string& s, char32_t c) {
   if (c < 0x80) {
@@ -140,13 +157,84 @@ LineBox as_given(const LineBox& b, const OcrPage& read) {
   }
 }
 
-// Whether `c` carries on the line `prev` is on: its centre inside prev's band
-// across the direction from prev to it.
-bool carries_on(const PdfChar& prev, const PdfChar& c) {
+// The way a line runs: by the step from its first character to its second.
+enum class Run { kUnknown, kAlongX, kAlongY };
+
+// Whether `c` carries on the line whose last character is `prev`: its centre inside prev's band across the
+// direction from prev to it (its height range along x, its width range along y); or, a step the way the line runs,
+// inside the line's running band across it (the line's box so far, the union of its characters' loose boxes), so
+// the text after a raised or lowered script, back on the line's band but off the script's, carries on. A step
+// across the way the line runs (to the row below, in a table PDFium breaks no line in) is held to prev's band.
+bool carries_on(const PdfChar& prev, const PdfChar& c, const LineBox& band, Run run) {
   const float cx = (c.lx0 + c.lx1) / 2, cy = (c.ly0 + c.ly1) / 2;
   const float px = (prev.lx0 + prev.lx1) / 2, py = (prev.ly0 + prev.ly1) / 2;
-  if (std::abs(cx - px) >= std::abs(cy - py)) return cy >= prev.ly0 && cy <= prev.ly1;  // along x
-  return cx >= prev.lx0 && cx <= prev.lx1;                                               // along y
+  if (std::abs(cx - px) >= std::abs(cy - py)) {  // along x
+    return run == Run::kAlongX ? cy >= band.y0 && cy <= band.y1 : cy >= prev.ly0 && cy <= prev.ly1;
+  }
+  return run == Run::kAlongY ? cx >= band.x0 && cx <= band.x1 : cx >= prev.lx0 && cx <= prev.lx1;  // along y
+}
+
+// The way the step from prev to c runs.
+Run step(const PdfChar& prev, const PdfChar& c) {
+  const float dx = (c.lx0 + c.lx1 - prev.lx0 - prev.lx1) / 2, dy = (c.ly0 + c.ly1 - prev.ly0 - prev.ly1) / 2;
+  return std::abs(dx) >= std::abs(dy) ? Run::kAlongX : Run::kAlongY;
+}
+
+// A character of a line as read_text_layer puts it there: its word (an index into the line's words) and its bytes
+// in that word's text.
+struct Placed {
+  const PdfChar* c;
+  size_t word;
+  uint32_t begin, end;
+};
+
+float median(std::vector<float> v) {
+  const auto mid = v.begin() + static_cast<std::ptrdiff_t>(v.size() / 2);
+  std::nth_element(v.begin(), mid, v.end());
+  return *mid;
+}
+
+// A line's scripts, marked in its words (OcrWord::scripts) and in the line (scripts_of_words). Its characters
+// that run across, upright (their angle within 45 degrees of none): their median size as drawn; its body those at
+// 0.9 of that or more, at least 3 of 4 or more, their loose boxes' median centre and height; a character at most
+// rule.script_size of the median, its centre more than rule.script_shift of the height above the body's centre a
+// superscript, below it a subscript.
+void mark_scripts(OcrLine& line, std::span<const Placed> placed, const TextLayerRule& rule) {
+  auto across = [](const PdfChar& c) {
+    return c.angle < 0 || std::fmod(c.angle + 45.0f, 360.0f) < 90.0f;  // within 45 degrees of upright
+  };
+  auto drawn = [](const PdfChar& c) { return c.size * c.matrix_scale; };
+  std::vector<float> sizes;
+  for (const Placed& p : placed) {
+    if (across(*p.c)) sizes.push_back(drawn(*p.c));
+  }
+  if (sizes.size() < 4) return;
+  const float ms = median(sizes);
+  if (!(ms > 0)) return;
+  std::vector<float> centres, heights;
+  for (const Placed& p : placed) {
+    if (!across(*p.c) || drawn(*p.c) < 0.9f * ms) continue;
+    centres.push_back((p.c->ly0 + p.c->ly1) / 2);
+    heights.push_back(p.c->ly1 - p.c->ly0);
+  }
+  if (centres.size() < 3) return;
+  const float mcy = median(centres), shift = static_cast<float>(rule.script_shift) * median(heights);
+  bool any = false;
+  for (const Placed& p : placed) {
+    const PdfChar& c = *p.c;
+    if (!across(c) || drawn(c) > static_cast<float>(rule.script_size) * ms) continue;
+    const float cy = (c.ly0 + c.ly1) / 2;
+    if (std::abs(cy - mcy) <= shift) continue;
+    const bool sub = cy > mcy;  // y runs down the page
+    std::vector<TextScript>& s = line.words[p.word].scripts;
+    if (!s.empty() && s.back().end == p.begin && s.back().sub == sub) {
+      s.back().end = p.end;  // the run goes on
+    } else {
+      s.push_back({p.begin, p.end, sub});
+    }
+    any = true;
+  }
+  if (any) line.scripts = scripts_of_words(line.words);
 }
 
 }  // namespace
@@ -156,37 +244,78 @@ TextLayer read_text_layer(std::span<const PdfChar> drawn, const GrayView& page, 
   const std::span<const PdfChar> chars(whole);
   TextLayer out;
   TextLayerCheck& k = out.check;
-  for (const PdfChar& c : chars) {
-    if (c.generated) continue;
-    ++k.chars;
-    out.marked += c.mcid >= 0;
-    if (c.bad_map || bad_code(c.code)) ++k.bad;
-    if (c.invisible) ++k.invisible;
-    // ink: two tones over the box and its surround (a quarter of its height around it, a pixel at least), so a
-    // glyph that fills its box shows against the paper about it, and white on white shows nothing
-    const float m = std::max(1.0f, 0.25f * (c.y1 - c.y0));
-    if (page.data && !space(c.code) && c.x1 > c.x0 && c.y1 > c.y0 &&
-        spread(page, c.x0 - m, c.y0 - m, c.x1 + m, c.y1 + m) < rule.contrast) {
-      ++k.no_ink;
+  std::vector<uint8_t> aside(chars.size(), 0);  // in a bad-code run set aside
+  auto bad = [](const PdfChar& c) { return c.bad_map || bad_code(c.code); };
+  auto count = [&] {  // the checks' counts over the drawn characters not set aside
+    TextLayerCheck t;
+    for (size_t i = 0; i < chars.size(); ++i) {
+      const PdfChar& c = chars[i];
+      if (c.generated) continue;
+      if (aside[i]) {
+        ++t.set_aside;
+        continue;
+      }
+      ++t.chars;
+      if (bad(c)) ++t.bad;
+      if (c.invisible) ++t.invisible;
+      // ink: two tones over the box and its surround (a quarter of its height around it, a pixel at least), so a
+      // glyph that fills its box shows against the paper about it, and white on white shows nothing
+      const float m = std::max(1.0f, 0.25f * (c.y1 - c.y0));
+      if (page.data && !space(c.code) && c.x1 > c.x0 && c.y1 > c.y0 &&
+          spread(page, c.x0 - m, c.y0 - m, c.x1 + m, c.y1 + m) < rule.contrast) {
+        ++t.no_ink;
+      }
+    }
+    return t;
+  };
+  auto decide = [&](TextLayerCheck& t) {
+    const double n = std::max(1, t.chars);
+    if (t.chars < rule.min_chars) {
+      t.reason = "too few characters (" + std::to_string(t.chars) + ")";
+    } else if (t.bad / n > rule.max_bad) {
+      t.reason = std::to_string(t.bad) + " of " + std::to_string(t.chars) + " characters are not readable text";
+    } else if (t.invisible / n > rule.max_invisible) {
+      t.reason = std::to_string(t.invisible) + " of " + std::to_string(t.chars) + " characters are invisible";
+    } else if (t.no_ink / n > rule.max_no_ink) {
+      t.reason = std::to_string(t.no_ink) + " of " + std::to_string(t.chars) + " characters have no ink";
+    }
+    t.usable = t.reason.empty();
+  };
+  for (const PdfChar& c : chars) out.marked += !c.generated && c.mcid >= 0;
+  k = count();
+  decide(k);
+  const TextLayerCheck whole_check = k;
+  // Refused for its bad codes, but all of them in runs of their own that hold no letter: those runs set aside,
+  // the checks on the rest
+  bool setting_aside = false;
+  if (rule.set_aside_bad_runs && !k.usable && k.chars >= rule.min_chars && k.bad > rule.max_bad * k.chars) {
+    std::map<int, bool> runs;  // the text objects with bad codes, and whether one holds a letter
+    for (const PdfChar& c : chars) {
+      if (!c.generated && bad(c)) runs.emplace(c.object, false);
+    }
+    for (const PdfChar& c : chars) {
+      const auto it = runs.find(c.object);
+      if (!c.generated && it != runs.end() && !bad(c) && letter(c.code)) it->second = true;
+    }
+    if (!runs.count(-1) && std::none_of(runs.begin(), runs.end(), [](const auto& r) { return r.second; })) {
+      for (size_t i = 0; i < chars.size(); ++i) aside[i] = !chars[i].generated && runs.count(chars[i].object);
+      TextLayerCheck rest = count();
+      decide(rest);
+      if (rest.usable) {
+        k = rest;
+        setting_aside = true;
+      } else {
+        std::fill(aside.begin(), aside.end(), uint8_t{0});
+      }
     }
   }
-  const double n = std::max(1, k.chars);
-  if (k.chars < rule.min_chars) {
-    k.reason = "too few characters (" + std::to_string(k.chars) + ")";
-  } else if (k.bad / n > rule.max_bad) {
-    k.reason = std::to_string(k.bad) + " of " + std::to_string(k.chars) + " characters are not readable text";
-  } else if (k.invisible / n > rule.max_invisible) {
-    k.reason = std::to_string(k.invisible) + " of " + std::to_string(k.chars) + " characters are invisible";
-  } else if (k.no_ink / n > rule.max_no_ink) {
-    k.reason = std::to_string(k.no_ink) + " of " + std::to_string(k.chars) + " characters have no ink";
-  }
-  k.usable = k.reason.empty();
 
   // The lines, and their words.
   OcrLine line;
   OcrWord word;
   bool open = false, pending_space = false;
   const PdfChar* prev = nullptr;
+  Run run = Run::kUnknown;  // the open line's
   auto end_word = [&] {
     if (word.text.empty()) return;
     word.confidence = 1.0f;
@@ -194,18 +323,28 @@ TextLayer read_text_layer(std::span<const PdfChar> drawn, const GrayView& page, 
     word = OcrWord{};
   };
   int line_mcid = -1;
+  std::vector<Placed> placed;  // the line's characters, for its scripts
+  bool touched = false;        // the line holds a character set aside: its box to OCR, not the line
   auto close = [&] {
     end_word();
     if (open && !line.text.empty()) {
-      line.confidence = 1.0f;
-      out.lines.push_back(line);
-      out.mcids.push_back(line_mcid);
+      if (touched) {
+        out.set_aside.push_back(line.box);
+      } else {
+        line.confidence = 1.0f;
+        mark_scripts(line, placed, rule);
+        out.lines.push_back(line);
+        out.mcids.push_back(line_mcid);
+      }
     }
     line = OcrLine{};
-    open = pending_space = false;
+    placed.clear();
+    open = pending_space = touched = false;
     prev = nullptr;
+    run = Run::kUnknown;
   };
-  for (const PdfChar& c : chars) {
+  for (size_t i = 0; i < chars.size(); ++i) {
+    const PdfChar& c = chars[i];
     if (c.generated) {
       if (c.code == U'\r' || c.code == U'\n') {
         close();
@@ -215,7 +354,7 @@ TextLayer read_text_layer(std::span<const PdfChar> drawn, const GrayView& page, 
       }
       continue;
     }
-    if (prev && !carries_on(*prev, c)) close();
+    if (prev && !carries_on(*prev, c, line.box, run)) close();
     if (space(c.code)) {
       pending_space = open;
       end_word();
@@ -243,10 +382,23 @@ TextLayer read_text_layer(std::span<const PdfChar> drawn, const GrayView& page, 
       word.box.x1 = std::max<double>(word.box.x1, c.lx1);
       word.box.y1 = std::max<double>(word.box.y1, c.ly1);
     }
+    const auto begin = static_cast<uint32_t>(word.text.size());
     put_utf8(word.text, c.code);
+    placed.push_back({&c, line.words.size(), begin, static_cast<uint32_t>(word.text.size())});
+    touched |= aside[i] != 0;
+    if (prev && run == Run::kUnknown) run = step(*prev, c);
     prev = &c;
   }
   close();
+  // the runs set aside touch over half the layer's lines: the page refused as a whole, as before
+  if (setting_aside && 2 * out.set_aside.size() > out.lines.size() + out.set_aside.size()) {
+    k = whole_check;
+    out.set_aside.clear();
+  }
+  // the page's ruled lines, for the false-table check (GridRule::check), on the render as drawn
+  if (rule.rules && k.usable && page.data) {
+    out.rules = detail::find_rules(page, page.width, page.height, detail::kRuleDarkFull);
+  }
   return out;
 }
 
@@ -268,6 +420,30 @@ bool reads_across(const TextLayer& layer) {
   }
   if (lines > 0) return across >= 0.9 * lines;
   return words > 0 && 2 * wide >= words;  // single words only: most of them wider than tall
+}
+
+int upright_turn(std::span<const PdfChar> chars) {
+  int drawn = 0;
+  int quarter[4] = {0, 0, 0, 0};
+  for (const PdfChar& c : chars) {
+    if (c.generated) continue;
+    ++drawn;
+    if (c.angle < 0) continue;
+    const double k = c.angle / 90.0, q = std::round(k);
+    if (std::abs(k - q) < 0.05) ++quarter[static_cast<int>(q) % 4];
+  }
+  int most = 1;
+  for (int q = 2; q < 4; ++q) {
+    if (quarter[q] > quarter[most]) most = q;
+  }
+  return 2 * quarter[most] > drawn ? (4 - most) % 4 : 0;  // run `most` quarters clockwise: turned back
+}
+
+void read_turned(OcrPage& page, int turn) {
+  turn = ((turn % 4) + 4) % 4;
+  if (turn == 0) return;
+  page.rotation = 90 * ((4 - turn) % 4);
+  if (turn % 2) std::swap(page.width, page.height);
 }
 
 bool lines_from_detection(TextLayer& layer, std::span<const LineBox> detected, double tall) {
@@ -325,7 +501,10 @@ bool lines_from_detection(TextLayer& layer, std::span<const LineBox> detected, d
       left.text += w.text;
       left.words.push_back(w);
     }
-    if (!left.words.empty()) rest.push_back(std::move(left));
+    if (!left.words.empty()) {
+      left.scripts = scripts_of_words(left.words);
+      rest.push_back(std::move(left));
+    }
   }
   std::vector<OcrLine> lines;
   for (size_t k = 0; k < m; ++k) {
@@ -342,6 +521,7 @@ bool lines_from_detection(TextLayer& layer, std::span<const LineBox> detected, d
       l.text += ws[i].text;
     }
     l.words = std::move(ws);
+    l.scripts = scripts_of_words(l.words);
     lines.push_back(std::move(l));
   }
   for (OcrLine& l : rest) lines.push_back(std::move(l));
@@ -363,6 +543,7 @@ OcrPage page_from_text_layer(const TextLayer& layer, int width, int height) {
   std::vector<LineBox> boxes;
   for (const OcrLine& l : lines) boxes.push_back(l.box);
   for (size_t i : reading_order(boxes)) page.lines.push_back(std::move(lines[i]));
+  page.rules = layer.rules;
   return page;
 }
 
@@ -512,6 +693,17 @@ std::vector<LineBox> pictures_to_read(std::span<const LineBox> pictures, int wid
   return out;
 }
 
+std::vector<LineBox> set_aside_to_read(const TextLayer& layer, int width, int height) {
+  std::vector<LineBox> out;
+  for (const LineBox& b : layer.set_aside) {
+    const double m = std::max(1.0, 0.1 * (b.y1 - b.y0));
+    const LineBox c{std::max(0.0, b.x0 - m), std::max(0.0, b.y0 - m), std::min<double>(width, b.x1 + m),
+                    std::min<double>(height, b.y1 + m)};
+    if (c.x1 > c.x0 && c.y1 > c.y0) out.push_back(c);
+  }
+  return out;
+}
+
 GrayImage pictures_only(const GrayView& page, std::span<const LineBox> pictures) {
   GrayImage out;
   out.width = page.width;
@@ -526,6 +718,26 @@ GrayImage pictures_only(const GrayView& page, std::span<const LineBox> pictures)
       std::copy_n(page.data + y * page.stride + x0, x1 - x0,
                   out.pixels.begin() + static_cast<int64_t>(y) * page.width + x0);
     }
+  }
+  return out;
+}
+
+OcrPage picture_lines(const OcrPage& found, const OcrPage& page, std::span<const LineBox> to_read,
+                      const HybridRule& rule) {
+  OcrPage out;
+  out.width = found.width;
+  out.height = found.height;
+  out.pictures = found.pictures;
+  out.picture_mask = found.picture_mask;
+  out.second_pass = found.second_pass;
+  for (const OcrLine& l : found.lines) {
+    const double a = area(l.box);
+    if (a <= 0) continue;
+    double inside = 0, under = 0;  // the regions to read do not overlap one another (pictures may: capped)
+    for (const LineBox& r : to_read) inside += overlap(l.box, r);
+    for (const OcrLine& own : page.lines) under += overlap(l.box, own.box);
+    if (std::min(inside, a) < 0.5 * a || under >= rule.max_covered * a) continue;
+    out.lines.push_back(l);
   }
   return out;
 }

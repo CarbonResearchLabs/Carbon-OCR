@@ -2,18 +2,21 @@
 // instruction set's kernels: PNGs made here of every colour type and bit depth, every
 // filter, odd widths, runs of Paeth rows, several IDAT chunks, tRNS; and the files the
 // decoder leaves to stb_image (interlaced, damaged, odd), which must come out as
-// stb_image's, errors included.
+// stb_image's, errors included; and decoded straight to a scale (decode_image_resized), the
+// same bytes as the page decoded and then resampled.
 
 #include <gtest/gtest.h>
 #include <libdeflate.h>
 #include <stb_image.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
@@ -507,6 +510,117 @@ TEST(Png, TransparencyIsOverWhitePaper) {
   EXPECT_EQ(half.pixels[0], 255);
   EXPECT_EQ(half.pixels[7], 10);
   EXPECT_TRUE(as_stb(png(rgba), "RGBA, half the page transparent"));
+}
+
+// ------------------------------------------------------------------ decoded straight to a scale
+
+// decode_image_resized with every instruction set against resize_gray of decode_image's page, at scales down (to a
+// tenth), up, the page's own and one pixel: the same bytes, or the same error; fit called once whatever the reading.
+void as_resized(const std::vector<uint8_t>& file, const std::string& what) {
+  const std::vector<std::function<std::array<int, 2>(int, int)>> scales = {
+      [](int w, int h) { return std::array<int, 2>{std::max(1, w * 37 / 100), std::max(1, h * 37 / 100)}; },
+      [](int w, int h) { return std::array<int, 2>{std::max(1, w / 2), std::max(1, (h + 1) / 2)}; },
+      [](int w, int h) { return std::array<int, 2>{std::max(1, w / 10), std::max(1, h / 10)}; },
+      [](int w, int h) { return std::array<int, 2>{w * 17 / 10 + 1, h * 17 / 10 + 1}; },
+      [](int w, int h) { return std::array<int, 2>{w, h}; },
+      [](int, int) { return std::array<int, 2>{1, 1}; },
+      [](int w, int h) { return std::array<int, 2>{std::max(1, w * 3 / 4), h * 5 / 4 + 1}; },
+  };
+  for (cpu::Isa isa : cpu::isas_available()) {
+    std::optional<GrayImage> whole;
+    std::string refused;
+    try {
+      whole = decode_image(file, isa);
+    } catch (const Error& e) {
+      refused = e.what();
+    }
+    for (size_t k = 0; k < scales.size(); ++k) {
+      const std::string at = what + ", scale " + std::to_string(k) + " (" + cpu::isa_name(isa) + ")";
+      int calls = 0;
+      const ImageFit fit = [&](int w, int h) {
+        ++calls;
+        return scales[k](w, h);
+      };
+      if (!whole) {
+        try {
+          decode_image_resized(file, fit, isa);
+          ADD_FAILURE() << at << ": read, where decode_image says " << refused;
+        } catch (const Error& e) {
+          EXPECT_EQ(std::string(e.what()), refused) << at;
+        }
+        continue;
+      }
+      const GrayImage got = decode_image_resized(file, fit, isa);
+      EXPECT_EQ(calls, 1) << at;
+      const std::array<int, 2> size = scales[k](whole->width, whole->height);
+      const GrayImage want = resize_gray(whole->view(), size[0], size[1]);
+      ASSERT_EQ(got.width, want.width) << at;
+      ASSERT_EQ(got.height, want.height) << at;
+      const auto miss = std::mismatch(got.pixels.begin(), got.pixels.end(), want.pixels.begin());
+      if (miss.first != got.pixels.end()) {
+        const auto i = miss.first - got.pixels.begin();
+        ADD_FAILURE() << at << ": pixel (" << i % got.width << ", " << i / got.width << ") is " << int{*miss.first}
+                      << ", resize_gray's " << int{*miss.second};
+      }
+    }
+  }
+}
+
+// Every colour type and bit depth, every filter, the 16-row blocks the kernels unfilter whole cut every way (heights
+// about multiples of 16, runs of Paeth rows across them), odd widths, tRNS, several IDAT chunks.
+TEST(Png, DecodedToAScaleIsTheScaledPage) {
+  std::mt19937 rng(29);
+  const std::function<int(int)> filters[] = {[](int y) { return y % 5; }, [](int) { return 4; },
+                                             [&rng](int) { return static_cast<int>(rng() % 5); }};
+  for (const Kind& k : kKinds) {
+    for (int w : {1, 3, 33, 250}) {
+      for (int h : {1, 15, 16, 17, 37}) {
+        const uint32_t top = k.color == 3 ? (k.depth == 8 ? 256u : 1u << k.depth) : 1u << k.depth;
+        const Samples im = samples(w, h, k.depth, k.color, top, w > 3, rng);
+        Write how;
+        how.filter = filters[static_cast<size_t>(w + h) % 3];
+        if (k.color == 3) how.palette = palette(static_cast<int>(top), rng);
+        as_resized(png(im, how), name(im));
+      }
+    }
+  }
+  for (int h : {31, 32, 33, 48, 120}) {  // Paeth runs across the blocks, 8-bit gray as the pages are
+    const Samples im = samples(517, h, 8, 0, 256, true, rng);
+    Write how;
+    how.filter = [](int y) { return (y / 7) % 2 ? 4 : y % 3; };
+    how.idat_piece = 4096;
+    as_resized(png(im, how), name(im, "Paeth runs"));
+  }
+  Samples gray = samples(64, 40, 8, 0, 256, true, rng);
+  Write how;
+  how.trns = {0, 7};
+  as_resized(png(gray, how), name(gray, "tRNS"));
+  Samples rgb = samples(64, 40, 8, 2, 256, true, rng);
+  how.trns = {0, 1, 0, 2, 0, 3};
+  as_resized(png(rgb, how), name(rgb, "tRNS"));
+}
+
+// The files the decoder leaves to stb_image, read or refused as decode_image reads or refuses them: interlaced,
+// damaged; and a page past a block's buffer, then small ones (the kept buffers).
+TEST(Png, DecodedToAScaleAsDecodeImageForTheRest) {
+  std::mt19937 rng(31);
+  Samples im = samples(45, 33, 8, 0, 256, true, rng);
+  Write how;
+  how.interlace = true;
+  as_resized(png(im, how), "interlaced");
+  // (a palette's index past its entries is left out: stb_image reads whatever its buffer holds there, so two of its
+  // readings of the page differ)
+  how = {};
+  how.edit_raw = [](std::vector<uint8_t>& raw) { raw[46 * 3] = 5; };
+  as_resized(png(im, how), "an invalid filter");
+  how.edit_raw = [](std::vector<uint8_t>& raw) { raw.resize(raw.size() - 46); };
+  as_resized(png(im, how), "a row short");
+  as_resized(std::vector<uint8_t>{1, 2, 3}, "not an image");
+  for (int w : {2400, 9, 300}) {
+    im = samples(w, w > 100 ? 140 : 5, 8, 0, 256, true, rng);
+    as_resized(png(im), name(im));
+  }
+  EXPECT_THROW(decode_image_resized(png(im), [](int, int) { return std::array<int, 2>{0, 5}; }), Error);
 }
 
 TEST(Png, OnlyTheInstructionSetsThisCpuHas) {

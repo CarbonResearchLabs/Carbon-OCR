@@ -290,13 +290,21 @@ TEST(Server, RefusesWhatItCannotRead) {
   const std::string png = file_bytes(kSet / "page.png");
   carbon::ServerOptions o = options(1);
   o.max_body = png.size() * 4;
+#if defined(CARBON_PDF_HELPER)
+  o.pdf_helper = CARBON_PDF_HELPER;
+#endif
   Running r(o);
   {
     Client c(r.port());
     EXPECT_EQ(c.ask(post("/ocr", "plain text, no image")).status, 415);
-    const Reply pdf = c.ask(post("/ocr", "%PDF-1.7 and the rest"));
-    EXPECT_EQ(pdf.status, 415);
-    EXPECT_NE(pdf.body.find("carbon-ocr ocr reads PDFs"), std::string::npos);
+    const Reply pdf = c.ask(post("/ocr", "%PDF-1.7 and the rest"));  // a PDF's start, and no PDF after it
+#if defined(CARBON_PDF_HELPER)
+    EXPECT_EQ(pdf.status, 422) << pdf.body;
+#else
+    if (!carbon::pdf_supported()) EXPECT_EQ(pdf.status, 415);
+#endif
+    EXPECT_EQ(c.ask(post("/parse", "{\"page\": 7}")).status, 400);
+    EXPECT_EQ(c.ask(post("/parse", "not json")).status, 400);
     const Reply cut = c.ask(post("/ocr", png.substr(0, 64)));  // a PNG's start, and nothing after
     EXPECT_EQ(cut.status, 422) << cut.body;
     EXPECT_EQ(c.ask(post("/ocr?format=docx", png)).status, 400);
@@ -326,6 +334,105 @@ TEST(Server, RefusesWhatItCannotRead) {
     EXPECT_EQ(c.ask(post("/ocr?format=text", png)).status, 200);  // the server itself goes on
   }
 }
+
+// Base64 (RFC 4648), as a /parse client sends a page.
+std::string base64(const std::string& s) {
+  static constexpr char kAlphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  size_t i = 0;
+  for (; i + 2 < s.size(); i += 3) {
+    const uint32_t v = static_cast<unsigned char>(s[i]) << 16 | static_cast<unsigned char>(s[i + 1]) << 8 |
+                       static_cast<unsigned char>(s[i + 2]);
+    for (int k = 18; k >= 0; k -= 6) out += kAlphabet[(v >> k) & 63];
+  }
+  if (i + 1 == s.size()) {
+    const uint32_t v = static_cast<unsigned char>(s[i]) << 16;
+    out += kAlphabet[(v >> 18) & 63];
+    out += kAlphabet[(v >> 12) & 63];
+    out += "==";
+  } else if (i + 2 == s.size()) {
+    const uint32_t v = static_cast<unsigned char>(s[i]) << 16 | static_cast<unsigned char>(s[i + 1]) << 8;
+    out += kAlphabet[(v >> 18) & 63];
+    out += kAlphabet[(v >> 12) & 63];
+    out += kAlphabet[(v >> 6) & 63];
+    out += '=';
+  }
+  return out;
+}
+
+// Every page object's timings left out ("ms": {...}, which hold no braces of their own).
+std::string without_all_ms(std::string json) {
+  for (size_t at; (at = json.find(", \"ms\": {")) != std::string::npos;) json.erase(at, json.find('}', at) + 1 - at);
+  return json;
+}
+
+// /parse, a route for document-parsing benchmark clients: the page's file in base64 and its settings in a JSON
+// object; the answer its pages, each with its html and markdown, and what answered (GET /served's).
+TEST(Server, ParsesAPageForABenchmarksClient) {
+  const std::string png = file_bytes(kSet / "page.png");
+  carbon::ServerOptions o = options(2);
+  const OcrPage want = carbon::Engine(kSet, o.engine).ocr(carbon::load_image(kSet / "page.png").view());
+  Running r(o);
+  Client c(r.port());
+  const Reply served = c.ask(get("/served"));
+  EXPECT_EQ(served.status, 200);
+  EXPECT_EQ(served.body.rfind("{\"weights\": \"fake-set\", \"revision\": \"fnv1a64:", 0), 0u) << served.body;
+  const Reply p = c.ask(post("/parse", "{\"page\": \"" + base64(png) + "\", \"suffix\": \".png\", \"settings\": "
+                                       "{\"dpi\": 200}}"));
+  ASSERT_EQ(p.status, 200) << p.body;
+  EXPECT_TRUE(p.has("Content-Type: application/json"));
+  const std::string got = without_all_ms(p.body);  // the page's object, then its html and markdown, the writers'
+  EXPECT_EQ(got.rfind("{\"pages\": [" + without_ms(want.json()), 0), 0u) << got;
+  EXPECT_NE(got.find(", \"html\": \"<"), std::string::npos);
+  EXPECT_NE(got.find(", \"markdown\": \"aaa"), std::string::npos);
+  EXPECT_NE(got.find("], \"served\": " + served.body.substr(0, served.body.size() - 1) + ", \"vendor\": "),
+            std::string::npos);
+  EXPECT_EQ(c.ask(post("/parse", "{\"page\": \"" + base64(png) + "\", \"settings\": {\"dpi\": 1}}")).status, 400);
+  EXPECT_EQ(c.ask(post("/parse", "{\"page\": \"" + base64(png) + "\", \"settings\": {\"model\": 2}}")).status, 400);
+  EXPECT_EQ(c.ask(post("/parse", "{\"page\": \"@@@\"}")).status, 400);
+}
+
+#if defined(CARBON_PDF_HELPER)
+// A PDF: its pages rendered and read as carbon-ocr ocr reads them (the document stream: its text layer's), the
+// pages answered together; /parse takes one as it takes an image.
+TEST(Server, ReadsAPdfsPagesTogether) {
+  const std::filesystem::path file = std::filesystem::path(CARBON_TEST_DATA) / "text.pdf";
+  const std::string pdf = file_bytes(file);
+  carbon::ServerOptions o = options(2);
+  o.pdf_helper = CARBON_PDF_HELPER;
+  std::vector<std::string> want;  // each page as the stream reads it
+  {
+    carbon::DocumentOptions d;
+    d.engine = o.engine;
+    carbon::DocumentStream stream(kSet, d);
+    carbon::PdfPool pool(1, CARBON_PDF_HELPER);
+    for (int p = 0; p < 2; ++p) stream.pdf_page(pool.page(file, p, 200 / 72.0, stream.pdf_want()), p);
+    stream.close();
+    want.resize(2);
+    while (auto done = stream.next()) {
+      ASSERT_FALSE(done->error);
+      EXPECT_TRUE(done->from_text_layer);
+      want[done->tag] = without_all_ms(done->page.json());
+    }
+  }
+  Running r(o);
+  Client c(r.port());
+  const Reply j = c.ask(post("/ocr", pdf));
+  ASSERT_EQ(j.status, 200) << j.body;
+  EXPECT_TRUE(j.has("X-Carbon-Pages: 2"));
+  EXPECT_EQ(without_all_ms(j.body), "{\"pages\": [{\"page\": 1, " + want[0].substr(1) + ", {\"page\": 2, " +
+                                         want[1].substr(1) + "]}\n");
+  const Reply t = c.ask(post("/ocr?format=text", pdf));
+  EXPECT_EQ(t.status, 200);
+  EXPECT_NE(t.body.find("\f\n"), std::string::npos) << "two pages, a form feed between";
+  EXPECT_EQ(c.ask(post("/ocr?format=page", pdf)).status, 400) << "PAGE XML is one page's";
+  const Reply p = c.ask(post("/parse", "{\"page\": \"" + base64(pdf) + "\", \"suffix\": \".pdf\"}"));
+  ASSERT_EQ(p.status, 200) << p.body;
+  EXPECT_NE(p.body.find("{\"pages\": [{\"page\": 1, "), std::string::npos);
+  EXPECT_NE(p.body.find("{\"page\": 2, "), std::string::npos);
+  EXPECT_NE(p.body.find("\"source\": \"text layer\""), std::string::npos);
+}
+#endif
 
 TEST(Server, AnswersBusyPastItsQueueAndGoesOn) {
   const std::string big = tiled_pgm(carbon::load_image(kSet / "page.png"), 4);

@@ -241,6 +241,49 @@ TEST(Output, WritesATablesSpans) {
   EXPECT_EQ(to_markdown(std::vector<OcrPage>{p}), want + "\n");
 }
 
+// A text layer's scripts (OcrLine::scripts) as <sup> and <sub> in HTML: in a paragraph whose lines join (the
+// marks moved with the text, a broken word's dropped hyphen too), a list item without its bullet, a table's cell,
+// the text escaped inside them; markdown as before, the scripts as plain text.
+TEST(Output, WritesALinesScriptsInHtml) {
+  OcrPage p;
+  p.width = p.height = 600;
+  using S = std::vector<TextScript>;
+  auto line = [&](const char* text, S scripts) {
+    OcrLine l;
+    l.box = {10, 10.0 + 30 * p.lines.size(), 300, 30.0 + 30 * p.lines.size()};
+    l.text = text;
+    l.confidence = 1;
+    l.scripts = std::move(scripts);
+    p.lines.push_back(l);
+  };
+  line("Water is H2O and", {{10, 11, true}});
+  line("x2 + y<2 is hy-", {{1, 2, false}, {6, 8, false}});  // "<2" escaped in its <sup>; the hyphen at 14 unmarked
+  line("phenated", {});
+  line("• the area m2", {{14, 15, false}});  // the bullet three bytes and a space: the 2 at 14
+  line("[Ca2+]i", {{3, 5, false}, {6, 7, true}});
+  line("31", {});
+  p.blocks = {{"Text", 1, {0, 1, 2}, {}}, {"List-Group", 1, {3}, {}}, {"Table", 1, {4, 5}, {}}};
+  p.blocks[2].cells = {{0, 0, {4}}, {0, 1, {5}}};
+  EXPECT_EQ(to_html_body(p),
+            "<p>Water is H<sub>2</sub>O and x<sup>2</sup> + y<sup>&lt;2</sup> is hyphenated</p>\n"
+            "<ul><li>the area m<sup>2</sup></li></ul>\n"
+            "<table>\n<tr><td>[Ca<sup>2+</sup>]<sub>i</sub></td><td>31</td></tr>\n</table>\n");
+  EXPECT_EQ(to_markdown(std::vector<OcrPage>{p}),
+            "Water is H2O and x2 + y<2 is hyphenated\n\n- the area m2\n\n<table>\n"
+            "<tr><td>[Ca2+]i</td><td>31</td></tr>\n</table>\n");
+  // a script that holds the hyphen a broken word drops ends where the text is cut
+  OcrPage q;
+  q.width = q.height = 600;
+  OcrLine a, b;
+  a.box = {10, 10, 300, 30};
+  a.text = "see note-";
+  a.scripts = {{8, 9, false}};
+  b.box = {10, 40, 300, 60};
+  b.text = "worthy";
+  q.lines = {a, b};
+  EXPECT_EQ(to_html_body(q), "<p>see noteworthy</p>\n");
+}
+
 // Boxes on the page as given: a page read turned a quarter (its boxes the upright page's) and one levelled.
 TEST(Output, PlacesBoxesOnThePageAsGiven) {
   OcrPage p;

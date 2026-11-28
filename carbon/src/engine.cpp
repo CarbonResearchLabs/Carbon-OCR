@@ -447,6 +447,16 @@ std::vector<size_t> reading_order(std::span<const LineBox> boxes) {
   return out;
 }
 
+std::vector<TextScript> scripts_of_words(std::span<const OcrWord> words) {
+  std::vector<TextScript> out;
+  uint32_t at = 0;  // where the word starts in the line's text
+  for (const OcrWord& w : words) {
+    for (const TextScript& s : w.scripts) out.push_back({at + s.begin, at + s.end, s.sub});
+    at += static_cast<uint32_t>(w.text.size()) + 1;  // and the space after it
+  }
+  return out;
+}
+
 std::vector<OcrLine> split_lines(std::vector<OcrLine> lines, const SplitRule& rule) {
   std::vector<OcrLine> out;
   out.reserve(lines.size());
@@ -500,6 +510,7 @@ std::vector<OcrLine> split_lines(std::vector<OcrLine> lines, const SplitRule& ru
         p.words.push_back(l.words[i]);
       }
       p.confidence = n ? static_cast<float>(conf / static_cast<double>(n)) : 0.0f;
+      if (!l.scripts.empty()) p.scripts = scripts_of_words(p.words);
       out.push_back(std::move(p));
     };
     // a list's bullet first: its item's indent is no gutter
@@ -733,6 +744,16 @@ std::string OcrPage::json() const {
     s += ", \"text_layer\": ";
     json_escape(s, text_layer);
   }
+  if (!turn_reads.empty()) {
+    s += ", \"turn_reads\": [";
+    for (size_t i = 0; i < turn_reads.size(); ++i) {
+      s += i ? ", {\"rotation\": " : "{\"rotation\": ";
+      s += std::to_string(turn_reads[i].rotation) + ", \"sure\": ";
+      put_fixed(s, turn_reads[i].sure, 4);
+      s += "}";
+    }
+    s += "]";
+  }
   s += ", \"lines\": [";
   for (size_t i = 0; i < lines.size(); ++i) {
     const OcrLine& l = lines[i];
@@ -859,6 +880,55 @@ std::optional<LmMode> parse_lm_mode(std::string_view name) {
   return std::nullopt;
 }
 
+namespace {
+
+// A code point a letter of the scripts the recognizers read: ASCII's, Latin-1's and Latin Extended's (but x and the
+// division sign), Greek's, Cyrillic's, Latin Extended Additional's and the Latin ligatures.
+bool letter_code(uint32_t c) {
+  if ((c | 0x20) >= 'a' && (c | 0x20) <= 'z') return true;
+  if (c >= 0xC0 && c <= 0x24F) return c != 0xD7 && c != 0xF7;
+  return (c >= 0x370 && c <= 0x3FF && c != 0x37E && c != 0x387) || (c >= 0x400 && c <= 0x52F) ||
+         (c >= 0x1E00 && c <= 0x1EFF) || (c >= 0xFB00 && c <= 0xFB06);
+}
+
+}  // namespace
+
+LineKind line_kind(std::string_view s) {
+  int64_t letters = 0, digits = 0, all = 0;
+  for (size_t i = 0; i < s.size();) {
+    const unsigned char b = static_cast<unsigned char>(s[i]);
+    const int n = b < 0x80 ? 1 : (b >> 5) == 6 ? 2 : (b >> 4) == 14 ? 3 : (b >> 3) == 30 ? 4 : 1;
+    uint32_t c = n == 1 ? b : b & (0x7F >> n);
+    for (int j = 1; j < n && i + static_cast<size_t>(j) < s.size(); ++j) {
+      c = (c << 6) | (static_cast<unsigned char>(s[i + static_cast<size_t>(j)]) & 0x3F);
+    }
+    i += static_cast<size_t>(n);
+    if (c == ' ' || c == '\t' || c == 0xA0) continue;
+    ++all;
+    letters += letter_code(c);
+    digits += c >= '0' && c <= '9';
+  }
+  if (digits > 0 && 2 * letters <= all) return LineKind::kCode;
+  if (all > 0 && 10 * letters >= 6 * all && 10 * digits <= all) return LineKind::kProse;
+  return LineKind::kMixed;
+}
+
+std::string_view line_kind_name(LineKind kind) {
+  switch (kind) {
+    case LineKind::kProse: return "prose";
+    case LineKind::kMixed: return "mixed";
+    case LineKind::kCode: return "code";
+  }
+  return "?";
+}
+
+std::optional<LineKind> parse_line_kind(std::string_view name) {
+  for (LineKind k : {LineKind::kProse, LineKind::kMixed, LineKind::kCode}) {
+    if (name == line_kind_name(k)) return k;
+  }
+  return std::nullopt;
+}
+
 SetModel choose_set_model(const std::filesystem::path& set, const std::string& name, std::optional<Backend> backend,
                           Precision precision) {
   const std::filesystem::path int8 = set / (name + ".int8.onnx"), fp32 = set / (name + ".onnx");
@@ -916,6 +986,8 @@ struct Engine::Impl {
     std::filesystem::path file;        // or its file, decoded by the worker that takes the page
     std::span<const uint8_t> bytes;    // or its encoded image (held by keep), decoded so too
     bool unreadable = false;           // its file or bytes did not give an image
+    PageTask task;                     // read as given, or from lines found already
+    bool order_only = false;           // out given (a text layer's page): only its reading order
     detail::Upright up;  // the page turned upright and levelled, and its copy at the detector's scale
     OcrPage out;
     std::atomic<int> left{0};
@@ -942,6 +1014,7 @@ struct Engine::Impl {
   };
 
   EngineOptions o;
+  EngineOptions as_given;  // o, for a page read as it stands (PageTask::as_given): no turn, no deskew
   std::vector<std::string> vocab;
   WorkerPool pool;
   std::vector<Worker> w;
@@ -1048,6 +1121,9 @@ struct Engine::Impl {
       wd->session = open_session(Backend::kOnnxRuntime, set / "det.onnx", so);
       wides.push_back(std::move(wd));
     }
+    as_given = o;
+    as_given.turn_probability = 2.0f;
+    as_given.deskew = false;
   }
 
   ~Impl() {
@@ -1061,6 +1137,11 @@ struct Engine::Impl {
   // the last of its line tasks instead).
   void start(Job& j, int k) {
     try {
+      if (j.order_only) {
+        order_page(j.out, k);
+        done(j);
+        return;
+      }
       if (!j.file.empty() || !j.bytes.empty()) {
         const auto t = Clock::now();
         try {
@@ -1083,6 +1164,14 @@ struct Engine::Impl {
     }
   }
   void page(Job& j, int k);
+  // The page's lines read: in tasks by width bucket, the last task its end.
+  void read_page_lines(Job& j, int k);
+  // The page's lines found on j.up (its detection, the second pass and the merge), into j.out.
+  void detect(Job& j, int k);
+  // A turn read before it is made (TurnCheck): the page's `count` widest lines on j.up read greedily as they stand
+  // and (half_round) turned half round: each reading's sureness, the mean probability of its characters, spaces
+  // aside (0 for none or unread).
+  std::array<double, 2> read_both_ways(Job& j, int k, int count, bool half_round);
   void recognize(Job& j, std::span<const size_t> lines, int k);
   void read_lines(Job& j, std::span<const size_t> lines, int k);
   // The page's last task: its lines split and ordered, unless a task failed.
@@ -1177,32 +1266,144 @@ void Engine::Impl::page(Job& j, int k) {
   OcrPage& out = j.out;
   out.width = j.page.width;
   out.height = j.page.height;
+  if (j.task.found) {  // its lines found already, on the page as given: straight to reading them
+    const OcrPage& f = *j.task.found;
+    if (f.width != out.width || f.height != out.height) {
+      throw Error("Engine: the lines found are of a " + std::to_string(f.width) + " x " + std::to_string(f.height) +
+                  " page, not this " + std::to_string(out.width) + " x " + std::to_string(out.height) + " one");
+    }
+    j.up.view = j.page;
+    for (const OcrLine& l : f.lines) {
+      OcrLine line;
+      line.box = l.box;
+      line.det_score = l.det_score;
+      out.lines.push_back(std::move(line));
+    }
+    out.pictures = f.pictures;
+    out.picture_mask = f.picture_mask;
+    out.second_pass = f.second_pass;
+    out.ms.orient = ms_since(j.start);
+    read_page_lines(j, k);
+    return;
+  }
+  const EngineOptions& po = j.task.as_given ? as_given : o;  // the page's: as its task reads it
 
   // The page at the detector's scale, once; orientation reads a thumbnail of it,
-  // and turns the page only by a quarter turn, only when sure.
+  // and turns the page only by a quarter turn, only when sure. Where it could not turn it (turn_probability over
+  // 1: no probability reaches it), it is not run.
   GrayImage small = detail::det_scale(j.page, o.det_long_side, o.det_area);
   const int side = o.orient_side;
+  const bool may_turn = *po.turn_probability <= 1.0f;
+  // The turn read before it is made (TurnCheck), where one can be made at all; a quarter's three bins summed
+  // where it is (sum_bins)
+  const TurnCheck* check = po.turn_check && may_turn ? &*po.turn_check : nullptr;
+  const bool by_quarters = po.turn_by_quarters || (check && check->sum_bins);
+  std::vector<float> odds;  // orientation's logits, for the turn checks
+  int unread = 0;           // its turn as it is made without the check: where no reading can judge a half turn
   const auto orient = [&] {
+    if (!may_turn) return;
     Tensor thumb = Tensor::empty(DType::kFloat32, {1, 1, side, side});
     detail::thumbnail_input(small.view(), j.page.width, j.page.height, side, thumb.data<float>().data());
     const Tensor logits = std::move(w[k].orient->run(one(std::move(thumb)))[0]);
-    out.rotation = detail::rotation_of(logits.data<float>(), *o.turn_probability, o.turn_by_quarters);
+    const std::span<const float> z = logits.data<float>();
+    odds.assign(z.begin(), z.end());
+    out.rotation = detail::rotation_of(z, *po.turn_probability, by_quarters);
+    unread = by_quarters == po.turn_by_quarters ? out.rotation
+                                                : detail::rotation_of(z, *po.turn_probability, po.turn_by_quarters);
   };
   // With fast cores idle (a page alone), the skew's search on the page as given runs beside orientation: a page
   // orientation does not turn keeps it, a turned one searches again (the same bytes either way).
   std::optional<Skew> skew;
-  if (o.deskew && pool.idle() > 0) {
-    together({orient, [&] { skew = find_skew(small.view(), o.max_skew); }});
+  if (po.deskew && may_turn && pool.idle() > 0) {
+    together({orient, [&] { skew = find_skew(small.view(), po.max_skew); }});
   } else {
     orient();
   }
+  // The turns read: a half turn, a quarter turn, or an unsure page whose sideways bins hold most of orientation's
+  // probability (its likelier side).
+  int sideways = 0;
+  if (check && out.rotation == 0 && odds.size() >= 12) {
+    const detail::SidewaysMass m = detail::sideways_mass(odds);
+    if (m.right + m.left >= check->sideways) sideways = m.right >= m.left ? 90 : 270;
+  }
+  const bool checked = check && (out.rotation == 180 || (out.rotation != 0 && check->quarters) || sideways != 0);
+  GrayImage small_given;  // the page at the detector's scale as given, for the page read another way up
+  if (checked) small_given = small;
+  const RowSplit split = [this](int rows, const std::function<void(int, int)>& band) { split_rows(rows, band); };
   // What is left of a turn, a few degrees: the page and its copy at the
   // detector's scale levelled, when the level angle clearly wins.
-  detail::make_upright(j.page, out.rotation, std::move(small), o, j.up, skew,
-                       [this](int rows, const std::function<void(int, int)>& band) { split_rows(rows, band); });
+  detail::make_upright(j.page, out.rotation, std::move(small), po, j.up, skew, split);
   out.skew = j.up.skew;
+  // its ruled lines, for the false-table check: on the upright page at the detector's scale, a rule's pixels as
+  // its resampling greys them
+  if (o.grid && o.grid->check) {
+    out.rules = detail::find_rules(j.up.small.view(), j.up.view.width, j.up.view.height, detail::kRuleDarkScaled);
+  }
   out.ms.orient = ms_since(j.start);
+  detect(j, k);
+  if (checked) {
+    // the page read again, turned another way: made upright and its lines found again
+    const auto turn_to = [&](int rotation) {
+      out.rotation = rotation;
+      out.lines.clear();
+      out.pictures.clear();
+      out.picture_mask = {};
+      out.second_pass = false;
+      out.ms.second_pass = 0;
+      j.up = {};
+      detail::make_upright(j.page, rotation, GrayImage(small_given), o, j.up, skew, split);
+      out.skew = j.up.skew;
+      detect(j, k);
+    };
+    double read_ms = 0;
+    const auto read = [&](bool half_round) {
+      const auto t0 = Clock::now();
+      const std::array<double, 2> r = read_both_ways(j, k, check->lines, half_round);
+      read_ms += ms_since(t0);
+      out.turn_reads.push_back({out.rotation, r[0]});
+      if (half_round) out.turn_reads.push_back({(out.rotation + 180) % 360, r[1]});
+      return r;
+    };
+    if (sideways) {
+      const double as_given = read(false)[0];
+      turn_to(sideways);
+      const std::array<double, 2> at = read(true);
+      const int turn = detail::settle_sideways(sideways, as_given, at[0], at[1], *check);
+      if (turn != sideways) turn_to(turn);
+    } else {
+      const std::array<double, 2> r = read(true);
+      const int turn = detail::settle_turn(out.rotation, r[0], r[1], *check, unread);
+      if (turn != out.rotation) turn_to(turn);
+    }
+    out.ms.orient += read_ms;
+  }
+  read_page_lines(j, k);
+}
 
+// Recognition: the lines by their width buckets, in a task for each free fast
+// core, or in tasks of line_batch when every core is busy.
+void Engine::Impl::read_page_lines(Job& j, int k) {
+  OcrPage& out = j.out;
+  j.lines_start = Clock::now();
+  const size_t n = out.lines.size();
+  if (n == 0) {
+    end(j, k);
+    return;
+  }
+  const detail::LineTasks plan = detail::line_tasks(out.lines, o.crop, pool.idle() > 0 ? free_fast(k) : 0,
+                                                    o.line_batch, o.bucket_ratio);
+  auto lines = std::make_shared<std::vector<size_t>>(std::move(plan.lines));
+  const int tasks = static_cast<int>(plan.starts.size()) - 1;
+  j.left.store(tasks);
+  for (int t2 = 1; t2 < tasks; ++t2) {
+    const size_t a = plan.starts[t2], b = plan.starts[t2 + 1];
+    pool.submit([this, &j, lines, a, b](int v) { recognize(j, std::span<const size_t>(lines->data() + a, b - a), v); });
+  }
+  recognize(j, std::span<const size_t>(lines->data(), plan.starts[1]), k);
+}
+
+void Engine::Impl::detect(Job& j, int k) {
+  OcrPage& out = j.out;
   // Detection: the page at its scale, padded to a multiple of 32, on threads
   // when fast cores are idle (the same bytes as on one).
   auto t = Clock::now();
@@ -1264,25 +1465,89 @@ void Engine::Impl::page(Job& j, int k) {
       decode_det(maps.data<float>().data(), static_cast<int>(shape[2]), static_cast<int>(shape[3]), 1.0, o.det);
   detail::place_detection(d, j.up.view, dw, dh, o, run, out);
   out.ms.decode = ms_since(t) - out.ms.second_pass;
+}
 
-  // Recognition: the lines by their width buckets, in a task for each free fast
-  // core, or in tasks of line_batch when every core is busy.
-  j.lines_start = Clock::now();
-  const size_t n = out.lines.size();
-  if (n == 0) {
-    end(j, k);
-    return;
+std::array<double, 2> Engine::Impl::read_both_ways(Job& j, int k, int count, bool half_round) {
+  // the page's widest boxes, in one batch at the widest of their buckets, each crop then again turned half round
+  // within its own width (its padding as it was: its ground), read greedily
+  const std::vector<OcrLine>& lines = j.out.lines;
+  std::vector<size_t> by(lines.size());
+  std::iota(by.begin(), by.end(), size_t{0});
+  const size_t m = std::min(by.size(), static_cast<size_t>(std::max(0, count)));
+  if (m == 0) return {0.0, 0.0};
+  const auto wide = [&](size_t a) { return lines[a].box.x1 - lines[a].box.x0; };
+  std::partial_sort(by.begin(), by.begin() + static_cast<std::ptrdiff_t>(m), by.end(),
+                    [&](size_t a, size_t b) { return wide(a) != wide(b) ? wide(a) > wide(b) : a < b; });
+  std::vector<LineBox> boxes;
+  int bw = 0;
+  for (size_t i = 0; i < m; ++i) {
+    boxes.push_back(lines[by[i]].box);
+    bw = std::max(bw, width_bucket(crop_region(boxes.back(), o.crop).width, o.bucket_ratio));
   }
-  const detail::LineTasks plan = detail::line_tasks(out.lines, o.crop, pool.idle() > 0 ? free_fast(k) : 0,
-                                                    o.line_batch, o.bucket_ratio);
-  auto lines = std::make_shared<std::vector<size_t>>(std::move(plan.lines));
-  const int tasks = static_cast<int>(plan.starts.size()) - 1;
-  j.left.store(tasks);
-  for (int t2 = 1; t2 < tasks; ++t2) {
-    const size_t a = plan.starts[t2], b = plan.starts[t2 + 1];
-    pool.submit([this, &j, lines, a, b](int v) { recognize(j, std::span<const size_t>(lines->data() + a, b - a), v); });
+  const int h = o.crop.height;
+  const size_t ways = half_round ? 2 : 1;
+  const int n = static_cast<int>(ways * m);
+  const size_t per = static_cast<size_t>(h) * bw;
+  std::vector<uint8_t> crops(ways * m * per);
+  std::vector<int32_t> widths(ways * m);
+  crop_lines(j.up.view, boxes, bw, crops.data(), std::span<int32_t>(widths.data(), m), o.crop);
+  for (size_t i = 0; half_round && i < m; ++i) {
+    const uint8_t* a = crops.data() + i * per;
+    uint8_t* b = crops.data() + (m + i) * per;
+    const int wi = widths[i];
+    for (int y = 0; y < h; ++y) {
+      const uint8_t* src = a + static_cast<size_t>(h - 1 - y) * bw;
+      uint8_t* dst = b + static_cast<size_t>(y) * bw;
+      for (int x = 0; x < wi; ++x) dst[x] = src[wi - 1 - x];
+      std::copy(src + wi, src + bw, dst + wi);
+    }
+    widths[m + i] = wi;
   }
-  recognize(j, std::span<const size_t>(lines->data(), plan.starts[1]), k);
+  Tensor x = Tensor::empty(DType::kFloat32, {n, 1, h, bw});
+  float* px = x.data<float>().data();
+  for (size_t i = 0; i < crops.size(); ++i) px[i] = 1.0f - crops[i] / 255.0f;
+  std::vector<int32_t> lengths(static_cast<size_t>(n));
+  std::vector<CtcLine> decoded;
+  const std::vector<Tensor> in = one(std::move(x));
+  w[k].rec->run(in, [&](std::span<const Session::OutputView> outs) {
+    const Session::OutputView& v = outs[0];
+    if (rec_head) {  // the head and the argmax a line at a time
+      if (v.dtype != DType::kFloat32 || v.shape.size() != 4 || v.shape[0] != n || v.shape[1] != rec_head->head.k) {
+        throw Error(o.rec + " gives features " + shape_string(v.shape) + " for " + std::to_string(n) + " lines");
+      }
+      const int kk = static_cast<int>(v.shape[1]), frames = static_cast<int>(v.shape[3]);
+      std::vector<int32_t> ids(static_cast<size_t>(n) * frames, 0);
+      std::vector<float> probs(static_cast<size_t>(n) * frames, 0.0f);
+      const float* fv = v.as<float>();
+      for (int i = 0; i < n; ++i) {
+        lengths[i] = std::min<int32_t>(frames, widths[i] / o.crop.frame_px);
+        cpu::ctc_head(fv + static_cast<size_t>(i) * kk * frames, kk, frames, lengths[i], rec_head->head,
+                      ids.data() + static_cast<size_t>(i) * frames, probs.data() + static_cast<size_t>(i) * frames);
+      }
+      decoded = ctc_collapse(ids.data(), probs.data(), n, frames, lengths);
+      return;
+    }
+    if (v.dtype != DType::kFloat32 || v.shape.size() != 3 || v.shape[0] != n) {
+      throw Error(o.rec + " gives logits " + shape_string(v.shape) + " for " + std::to_string(n) + " lines");
+    }
+    for (int i = 0; i < n; ++i) {
+      lengths[i] = std::min<int32_t>(static_cast<int32_t>(v.shape[2]), widths[i] / o.crop.frame_px);
+    }
+    decoded = ctc_greedy(v.as<float>(), n, static_cast<int>(v.shape[1]), static_cast<int>(v.shape[2]), lengths);
+  });
+  std::array<double, 2> sum{}, chars{};
+  for (int i = 0; i < n; ++i) {
+    const CtcLine& d = decoded[static_cast<size_t>(i)];
+    const size_t way = static_cast<size_t>(i) < m ? 0 : 1;
+    for (size_t c = 0; c < d.ids.size(); ++c) {
+      const int32_t id = d.ids[c];
+      if (id <= 0 || static_cast<size_t>(id) >= vocab.size()) continue;
+      if (vocab[static_cast<size_t>(id)].find_first_not_of(" \t") == std::string::npos) continue;  // a space
+      sum[way] += d.probs[c];
+      chars[way] += 1;
+    }
+  }
+  return {chars[0] > 0 ? sum[0] / chars[0] : 0.0, chars[1] > 0 ? sum[1] / chars[1] : 0.0};
 }
 
 void Engine::Impl::recognize(Job& j, std::span<const size_t> lines, int k) {
@@ -1504,6 +1769,32 @@ int rotation_of(std::span<const float> z, float turn_probability, bool quarters)
   return p >= turn_probability && (best == 3 || best == 6 || best == 9) ? static_cast<int>(best) * 30 : 0;
 }
 
+SidewaysMass sideways_mass(std::span<const float> z) {
+  SidewaysMass m;
+  if (z.size() < 12) return m;
+  const float top = *std::max_element(z.begin(), z.end());
+  double sum = 0;
+  for (float v : z) sum += std::exp(v - top);
+  for (size_t b = 2; b <= 4; ++b) m.right += std::exp(z[b] - top) / sum;
+  for (size_t b = 8; b <= 10; ++b) m.left += std::exp(z[b] - top) / sum;
+  return m;
+}
+
+int settle_turn(int rotation, double as_turned, double half_round, const TurnCheck& check, int unread) {
+  const bool judged = std::max(as_turned, half_round) >= check.floor;  // else the readings are no evidence
+  if (rotation == 180) return !judged ? unread : half_round > as_turned ? 0 : 180;
+  if ((rotation == 90 || rotation == 270) && check.quarters && judged && half_round > as_turned) {
+    return (rotation + 180) % 360;
+  }
+  return rotation;
+}
+
+int settle_sideways(int side, double as_given, double at_side, double opposite, const TurnCheck& check) {
+  const int turn = opposite > at_side ? (side + 180) % 360 : side;
+  const double sure = std::max(at_side, opposite);
+  return sure >= check.floor && sure > as_given ? turn : 0;
+}
+
 void make_upright(const GrayView& page, int rotation, GrayImage small, const EngineOptions& o, Upright& u,
                   std::optional<Skew> skew, const RowSplit& split) {
   u.view = page;
@@ -1601,10 +1892,10 @@ std::optional<Detection> second_pass(const GrayView& upright, int dw, int dh, co
   const StripRule rule{StripRule{}.halo, StripRule{}.align, o.det.stride};
   const int64_t side = round_up(o.det_long_side, 32);
   const int pw = round_up(w, 32), ph = round_up(h, 32);
-  if (o.det.second_pass_bands && first.median_line_height() >= o.det.second_pass_below) {
-    // The tiny lines' bands alone. Their rows at the second scale, widened either side by the tiny lines'
-    // median spacing (at least two of their heights): the first pass misses tiny lines, often every other one, so
-    // a missed one lies within a spacing of a found one ...
+  if (o.det.second_pass_bands) {
+    // The tiny lines' bands alone, whether the pass was taken by the median or by share. Their rows at the second
+    // scale, widened either side by the tiny lines' median spacing (at least two of their heights): the first pass
+    // misses tiny lines, often every other one, so a missed one lies within a spacing of a found one ...
     const double sy = 1.0 * h / dh;
     std::vector<const DetBox*> tiny;
     for (const DetBox& l : first.lines) {
@@ -1902,6 +2193,27 @@ float attach_rescorer(EngineOptions& o, const std::filesystem::path& set, const 
     o.rescorer = std::move(t);
   }
   return gate;
+}
+
+std::string decoded_text(const CtcLine& d, const std::vector<std::string>& vocab) {
+  std::string s;
+  for (const int32_t id : d.ids) {
+    if (id > 0 && static_cast<size_t>(id) < vocab.size()) s += vocab[static_cast<size_t>(id)];
+  }
+  return s;
+}
+
+BeamRule beam_rule(const EngineOptions& o, const CtcLine& greedy, const std::vector<std::string>& vocab) {
+  BeamRule r = o.beam;
+  const bool any = std::any_of(o.lm_kinds.begin(), o.lm_kinds.end(), [](const EngineOptions::KindWeights& k) {
+    return k.alpha || k.beta || k.gate;
+  });
+  if (!any) return r;
+  const EngineOptions::KindWeights& k = o.lm_kinds[static_cast<size_t>(line_kind(decoded_text(greedy, vocab)))];
+  if (k.alpha) r.alpha = *k.alpha;
+  if (k.beta) r.beta = *k.beta;
+  if (k.gate) r.gate = *k.gate;
+  return r;
 }
 
 float decoded_confidence(const CtcLine& d, const std::vector<std::string>& vocab, bool char_confidence) {
@@ -2374,6 +2686,7 @@ void order_page(OcrPage& page, Session* model, const EngineOptions& o) {
   page.blocks.clear();
   page.order = "xy-cut";
   std::vector<size_t> order;
+  std::vector<std::vector<float>> probs;  // each block's label probabilities, the model's (for GridRule::check)
   if (!model || n == 0) {
     order = reading_order(boxes);
   } else {
@@ -2408,6 +2721,7 @@ void order_page(OcrPage& page, Session* model, const EngineOptions& o) {
         ob.cells.push_back(std::move(cell));
       }
       page.blocks.push_back(std::move(ob));
+      probs.push_back(b.probs);
     }
   }
   std::vector<OcrLine> ordered;
@@ -2417,7 +2731,7 @@ void order_page(OcrPage& page, Session* model, const EngineOptions& o) {
   // its cells are no measure of that)
   text_tables_as_text(page, o.tables ? o.tables->max_cell_chars : TableRule{}.max_cell_chars);
   if (o.table_spans) table_spans(page);
-  if (o.grid) tables_by_geometry(page, *o.grid);  // the model's tables by geometry
+  if (o.grid) tables_by_geometry(page, *o.grid, probs);  // the model's tables by geometry
   if (page.blocks.empty() && o.tables) find_tables(page, *o.tables);  // no model's blocks: tables from geometry
 }
 
@@ -2472,11 +2786,30 @@ size_t Engine::submit(const GrayView& page, std::shared_ptr<const void> keep) {
   return impl_->give(std::move(job));
 }
 
-size_t Engine::submit(GrayImage page) {
+size_t Engine::submit(GrayImage page) { return submit(std::move(page), PageTask{}); }
+
+size_t Engine::submit(const GrayView& page, std::shared_ptr<const void> keep, PageTask task) {
+  if (!page.data || page.width <= 0 || page.height <= 0) throw Error("Engine::submit: an empty page");
+  auto job = std::make_unique<Impl::Job>();
+  job->page = page;
+  job->keep = std::move(keep);
+  job->task = std::move(task);
+  return impl_->give(std::move(job));
+}
+
+size_t Engine::submit_order(OcrPage page) {
+  auto job = std::make_unique<Impl::Job>();
+  job->out = std::move(page);
+  job->order_only = true;
+  return impl_->give(std::move(job));
+}
+
+size_t Engine::submit(GrayImage page, PageTask task) {
   if (page.pixels.empty() || page.width <= 0 || page.height <= 0) throw Error("Engine::submit: an empty page");
   auto job = std::make_unique<Impl::Job>();
   job->own = std::move(page);
   job->page = job->own.view();
+  job->task = std::move(task);
   return impl_->give(std::move(job));
 }
 
@@ -2563,6 +2896,14 @@ LineFinder::LineFinder(const std::filesystem::path& set, const EngineOptions& op
 LineFinder::~LineFinder() = default;
 
 std::vector<LineBox> LineFinder::find(const GrayView& page) {
+  const OcrPage out = detect(page);
+  std::vector<LineBox> boxes;
+  boxes.reserve(out.lines.size());
+  for (const OcrLine& l : out.lines) boxes.push_back(l.box);
+  return boxes;
+}
+
+OcrPage LineFinder::detect(const GrayView& page) {
   if (!page.data || page.width <= 0 || page.height <= 0) throw Error("LineFinder::find: an empty page");
   const GrayImage small = detail::det_scale(page, o_.det_long_side, o_.det_area);
   const GrayView sv = small.view();
@@ -2574,11 +2915,10 @@ std::vector<LineBox> LineFinder::find(const GrayView& page) {
   const Shape& s = maps.shape();
   const Detection d = decode_det(maps.data<float>().data(), static_cast<int>(s[2]), static_cast<int>(s[3]), 1.0, o_.det);
   OcrPage out;
+  out.width = page.width;
+  out.height = page.height;
   detail::place_detection(d, page, dw, dh, o_, run, out);
-  std::vector<LineBox> boxes;
-  boxes.reserve(out.lines.size());
-  for (const OcrLine& l : out.lines) boxes.push_back(l.box);
-  return boxes;
+  return out;
 }
 
 float Engine::turn_probability() const { return *impl_->o.turn_probability; }

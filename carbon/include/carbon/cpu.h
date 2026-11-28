@@ -60,6 +60,14 @@ bool isa_available(Isa isa);       // compiled in and supported by this CPU
 std::vector<Isa> isas_available();  // the scalar reference first, the best last
 Isa best_isa();                     // CARBON_ISA=<name> in the environment chooses another (tests, benchmarks)
 
+// Whether the int8 kernels `isa` runs widen their products to 16 bits: AVX2 without VNNI multiplies u8 by s8 with
+// vpmaddwd once both are widened, 16 products an instruction, FP32's FMA rate; the scalar reference (and plain NEON,
+// which runs it) likewise. With a dot product (AVX-VNNI's and AVX-512's vpdpbusd, Arm's sdot) each instruction makes
+// four products a lane. Where they widen, INT8 is no faster than FP32 an instruction and wins by its smaller memory
+// traffic alone: one worker reads a page sooner in FP32 (ONNX Runtime's), many workers more pages in INT8 (the
+// default, precision auto), so FP32 is the one-worker latency choice there (carbon-ocr cpus says which).
+bool int8_widens(Isa isa = best_isa());
+
 // ---------------------------------------------------------------- A's rows
 //
 // A GEMM's A, m rows of k values, each row given as `taps` pieces end to end,

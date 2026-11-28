@@ -28,6 +28,12 @@
 //     most pages, is unfiltered straight into the image's pixels, the rest in place in
 //     the inflated buffer and converted from there.
 //
+// A page read at another scale (png_to_gray_resized: a page at the detector's scale, say)
+// is unfiltered a block of rows at a time into a buffer of a block's
+// rows and resampled from there, each row as it comes (resample_rows.h), so the page is
+// never whole in memory: the inflated rows alone, read once, where decoding it whole and
+// then resampling wrote it and read it again.
+//
 // The inflated rows, and the IDAT chunks end to end when there are several, are in
 // buffers each thread keeps from page to page: a fresh page of memory costs the
 // operating system's zeroing on first touch, about half a millisecond a megabyte on
@@ -37,14 +43,18 @@
 
 #include <libdeflate.h>
 
+#include <algorithm>
+#include <array>
 #include <climits>
 #include <cstring>
 #include <optional>
 #include <utility>
 #include <vector>
 
+#include "carbon/error.h"
 #include "carbon/image.h"
 #include "cpu/png_kernels.h"
+#include "resample_rows.h"
 
 namespace carbon::detail {
 namespace {
@@ -120,13 +130,13 @@ uint8_t* scratch(std::vector<uint8_t>& v, size_t n) {
 }
 
 struct Scratch {
-  std::vector<uint8_t> rows, zlib;
+  std::vector<uint8_t> rows, zlib, block;  // block: png_to_gray_resized's rows, a block of them, and the one before
 };
 
 struct Release {
   Scratch& s;
   ~Release() {
-    for (std::vector<uint8_t>* v : {&s.rows, &s.zlib}) {
+    for (std::vector<uint8_t>* v : {&s.rows, &s.zlib, &s.block}) {
       if (v->size() > kKeep) std::vector<uint8_t>().swap(*v);
     }
   }
@@ -466,6 +476,108 @@ bool png_to_gray(std::span<const uint8_t> png, cpu::Isa isa, GrayImage& out) {
     y += done;
   }
   return !gray.past_palette();
+}
+
+namespace {
+
+// The rows of an inflated PNG, gray, a block at a time: unfiltered (and turned to gray) into a buffer of kBlock rows,
+// the block before's last row kept as the next one's prior, for resample_gray_from, which asks for them in order.
+class Unfiltered {
+ public:
+  static constexpr size_t kBlock = 16;  // the AVX2 kernel's block
+
+  Unfiltered(const Png& p, const Kernels& k, uint8_t* rows, size_t stride, size_t n, std::vector<uint8_t>& buffer)
+      : k_(k), rows_(rows), stride_(stride), w_(p.width), h_(p.height), zeros_(n, 0) {
+    gray8_ = p.color == 0 && p.depth == 8 && !p.trns;
+    if (!gray8_) gray_.emplace(p, k);
+    block_ = scratch(buffer, (kBlock + 1) * w_);  // the block's rows, then the row before it
+    before_ = block_ + kBlock * w_;
+    r_.raw_stride = stride;
+    r_.n = n;
+    r_.bpp = p.depth < 8 ? 1 : p.channels * p.depth / 8;  // stb_image's filter_bytes
+    r_.cur_stride = gray8_ ? w_ : stride;
+  }
+
+  static const uint8_t* row_of(void* self, int y) { return static_cast<Unfiltered*>(self)->row(static_cast<size_t>(y)); }
+
+  const uint8_t* row(size_t y) {
+    while (y >= end_) next_block();
+    return block_ + (y - begin_) * w_;
+  }
+
+  bool past_palette() const { return gray_ && gray_->past_palette(); }
+
+ private:
+  // The block after the one held: 8-bit gray unfiltered straight into it, the block before's last row its first's
+  // prior; anything else unfiltered in place in the inflated rows (its prior the row above there) and turned to gray.
+  void next_block() {
+    if (end_ > begin_) std::memcpy(before_, block_ + (end_ - 1 - begin_) * w_, w_);
+    begin_ = end_;
+    size_t filled = 0;
+    while (filled < kBlock && begin_ + filled < h_) {
+      const size_t y = begin_ + filled;
+      r_.raw = rows_ + y * stride_ + 1;
+      r_.rows = std::min(h_ - y, kBlock - filled);
+      if (gray8_) {
+        r_.cur = block_ + filled * w_;
+        r_.prior = filled ? r_.cur - w_ : y ? before_ : zeros_.data();
+      } else {
+        r_.cur = rows_ + y * stride_ + 1;
+        r_.prior = y ? r_.cur - stride_ : zeros_.data();
+      }
+      const size_t done = std::min(k_.unfilter(r_), r_.rows);
+      if (!gray8_) {
+        for (size_t t = 0; t < done; ++t) gray_->row(r_.cur + t * stride_, block_ + (filled + t) * w_, w_);
+      }
+      filled += done;
+    }
+    end_ = begin_ + filled;
+  }
+
+  const Kernels& k_;
+  uint8_t* rows_;
+  size_t stride_, w_, h_;
+  std::vector<uint8_t> zeros_;
+  bool gray8_ = false;
+  std::optional<ToGray> gray_;
+  uint8_t* block_ = nullptr;
+  uint8_t* before_ = nullptr;
+  size_t begin_ = 0, end_ = 0;  // the rows the block holds
+  PngRows r_{};
+};
+
+}  // namespace
+
+bool png_to_gray_resized(std::span<const uint8_t> png, cpu::Isa isa, const ImageFit& fit, GrayImage& out) {
+  thread_local Scratch s;
+  const Release release{s};
+  Png p;
+  if (!parse(png.data(), png.size(), p, s)) return false;
+  const Kernels k = kernels(isa);
+  const size_t w = p.width, h = p.height;
+  const size_t n = (static_cast<size_t>(p.channels) * w * p.depth + 7) / 8;
+  const size_t stride = n + 1;
+  uint8_t* rows = scratch(s.rows, stride * h);
+  static const bool fast = cpu::features().avx2 && cpu::features().bmi2;
+  if (!detail::zlib_inflate(p.zlib, p.zlib_len, rows, stride * h, fast)) return false;
+  for (size_t y = 0; y < h; ++y) {
+    if (rows[y * stride] > 4) return false;  // stb_image: "invalid filter"
+  }
+  const std::array<int, 2> size = fit(static_cast<int>(w), static_cast<int>(h));
+  if (size[0] <= 0 || size[1] <= 0) throw Error("decode_image_resized: an empty size");
+  out.width = size[0];
+  out.height = size[1];
+  out.pixels.resize(static_cast<size_t>(size[0]) * size[1]);
+  Unfiltered rows_of(p, k, rows, stride, n, s.block);
+  if (!resample_gray_from(static_cast<int>(w), static_cast<int>(h), Unfiltered::row_of, &rows_of, size[0], size[1],
+                          out.pixels.data(), size[0], isa)) {
+    // the scalar reference's passes: the page whole first
+    GrayImage whole;
+    if (!png_to_gray(png, isa, whole)) return false;
+    resample_gray(whole.view(), 0, 0, whole.width, whole.height, size[0], size[1], out.pixels.data(), size[0], isa);
+    return true;
+  }
+  return !rows_of.past_palette();
 }
 
 }  // namespace carbon::detail

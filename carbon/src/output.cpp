@@ -395,23 +395,24 @@ std::pair<int, int> letters_of(const std::string& t) {
   return {letters, chars};
 }
 
-// t joined to a paragraph's text so far: by a space, or, where a hyphen broke a word at the line's end (a letter,
-// then -, U+00AD, U+2010 or ¬, then a lowercase letter on the next line), by nothing, the hyphen dropped.
-void join_into(std::string& out, const std::string& t) {
-  if (t.empty()) return;
-  if (out.empty()) {
-    out = t;
-    return;
-  }
+// How t joins a paragraph's text so far: the size the text is cut to, and whether a space goes between. By a
+// space, or, where a hyphen broke a word at the line's end (a letter, then -, U+00AD, U+2010 or ¬, then a lowercase
+// letter on the next line), by nothing, the hyphen dropped.
+std::pair<size_t, bool> join_at(const std::string& out, const std::string& t) {
+  if (out.empty()) return {0, false};
   const size_t h = code_before(out, out.size());
   const uint32_t hy = code_at(out, h).first;
   const bool broken = (hy == '-' || hy == 0xAD || hy == 0x2010 || hy == 0xAC) && h > 0 &&
                       is_letter(code_at(out, code_before(out, h)).first) && starts_lowercase(t);
-  if (broken) {
-    out.resize(h);
-  } else {
-    out += ' ';
-  }
+  return broken ? std::pair<size_t, bool>{h, false} : std::pair<size_t, bool>{out.size(), true};
+}
+
+// t joined to a paragraph's text so far (join_at).
+void join_into(std::string& out, const std::string& t) {
+  if (t.empty()) return;
+  const auto [cut, space] = join_at(out, t);
+  out.resize(cut);
+  if (space) out += ' ';
   out += t;
 }
 
@@ -420,6 +421,45 @@ void join_into(std::string& out, const std::string& t) {
 std::string paragraph(const OcrPage& page, const std::vector<int>& lines) {
   std::string out;
   for (int i : lines) join_into(out, page.lines[static_cast<size_t>(i)].text);
+  return out;
+}
+
+// A text with its runs set as scripts (TextScript: a text layer's sub- and superscripts), for the HTML.
+struct Marked {
+  std::string text;
+  std::vector<TextScript> scripts;
+};
+
+Marked marked(const OcrLine& l) { return {l.text, l.scripts}; }
+
+// The text from byte `from` on, its scripts with it.
+Marked tail(const Marked& m, size_t from) {
+  Marked out{m.text.substr(std::min(from, m.text.size())), {}};
+  for (const TextScript& s : m.scripts) {
+    if (s.end <= from) continue;
+    out.scripts.push_back({static_cast<uint32_t>(std::max<size_t>(s.begin, from) - from),
+                           static_cast<uint32_t>(s.end - from), s.sub});
+  }
+  return out;
+}
+
+// t joined to a marked paragraph so far, as join_into joins the text: a script that held a dropped hyphen ends where
+// the text is cut.
+void join_into(Marked& out, const Marked& t) {
+  if (t.text.empty()) return;
+  const auto [cut, space] = join_at(out.text, t.text);
+  out.text.resize(cut);
+  std::erase_if(out.scripts, [cut](const TextScript& s) { return s.begin >= cut; });
+  for (TextScript& s : out.scripts) s.end = std::min<uint32_t>(s.end, static_cast<uint32_t>(cut));
+  if (space) out.text += ' ';
+  const auto at = static_cast<uint32_t>(out.text.size());
+  for (const TextScript& s : t.scripts) out.scripts.push_back({at + s.begin, at + s.end, s.sub});
+  out.text += t.text;
+}
+
+Marked marked_paragraph(const OcrPage& page, const std::vector<int>& lines) {
+  Marked out;
+  for (int i : lines) join_into(out, marked(page.lines[static_cast<size_t>(i)]));
   return out;
 }
 
@@ -471,6 +511,21 @@ std::string html(const std::string& t) {
   return out;
 }
 
+// A marked text as HTML: escaped, its scripts in <sup> and <sub>.
+std::string html(const Marked& m) {
+  if (m.scripts.empty()) return html(m.text);
+  std::string out;
+  size_t at = 0;
+  for (const TextScript& s : m.scripts) {
+    if (s.begin < at || s.begin >= s.end || s.end > m.text.size()) continue;  // not a run of this text
+    const char* tag = s.sub ? "sub>" : "sup>";
+    out += html(m.text.substr(at, s.begin - at)) + "<" + tag + html(m.text.substr(s.begin, s.end - s.begin)) + "</" +
+           tag;
+    at = s.end;
+  }
+  return out + html(m.text.substr(at));
+}
+
 // A list item's text without its bullet, or nullopt where the line has no bullet.
 std::optional<std::string> bulleted(const std::string& t) {
   static const char* const kBullets[] = {"•", "◦", "▪", "▫", "‣", "●", "○", "■", "□", "-", "–", "—", "*", "·", "►",
@@ -492,8 +547,8 @@ bool numbered(const std::string& t) {
 // A table's cells as HTML, markdown's and HTML's alike: a <td> a cell at its row and column, colspan and rowspan
 // where it covers more (OcrCell's spans), the places a span covers left out; a cell's lines a line each, <br>
 // between them (a heading set on two lines, or values set one a line in one cell). A cell at a place another's span
-// covers gives its lines to that one, so no text is lost.
-std::string table_html(const OcrPage& page, const OcrBlock& b) {
+// covers gives its lines to that one, so no text is lost. scripts: the lines' scripts as <sup> and <sub> (HTML's).
+std::string table_html(const OcrPage& page, const OcrBlock& b, bool scripts) {
   int rows = 0, cols = 0;
   for (const OcrCell& c : b.cells) {
     rows = std::max(rows, c.row + std::max(1, c.row_span));
@@ -533,7 +588,8 @@ std::string table_html(const OcrPage& page, const OcrBlock& b) {
       out += '>';
       for (size_t i = 0; i < s.lines.size(); ++i) {
         if (i) out += "<br>";
-        out += html(page.lines[static_cast<size_t>(s.lines[i])].text);
+        const OcrLine& l = page.lines[static_cast<size_t>(s.lines[i])];
+        out += scripts ? html(marked(l)) : html(l.text);
       }
       out += "</td>";
     }
@@ -570,7 +626,7 @@ std::string md_block(const OcrPage& page, const Region& r) {
     for (size_t k = 0; k < items.size(); ++k) out += (k ? "\n" : "") + items[k];
     return out;
   }
-  if (r.label == "Table" && r.block && !r.block->cells.empty()) return table_html(page, *r.block);
+  if (r.label == "Table" && r.block && !r.block->cells.empty()) return table_html(page, *r.block, false);
   return md_line(paragraph(page, r.lines));  // a paragraph: its lines joined, as HTML's <p>
 }
 
@@ -583,20 +639,21 @@ std::string html_list(const OcrPage& page, const std::vector<int>& lines) {
   struct Item {
     bool ordered;
     int number;
-    std::string text;
+    Marked text;
   };
   std::vector<Item> items;
   for (int i : lines) {
-    const std::string& t = page.lines[static_cast<size_t>(i)].text;
+    const Marked m = marked(page.lines[static_cast<size_t>(i)]);
+    const std::string& t = m.text;
     if (const auto b = bulleted(t)) {
-      items.push_back({false, 0, *b});
+      items.push_back({false, 0, tail(m, t.size() - b->size())});
     } else if (numbered(t)) {
       const size_t dot = t.find_first_of(".)");
-      items.push_back({true, std::atoi(t.substr(0, dot).c_str()), t.substr(dot + 2)});
+      items.push_back({true, std::atoi(t.substr(0, dot).c_str()), tail(m, dot + 2)});
     } else if (!items.empty()) {
-      join_into(items.back().text, t);  // the item before, carried on
+      join_into(items.back().text, m);  // the item before, carried on
     } else {
-      items.push_back({false, 0, t});
+      items.push_back({false, 0, m});
     }
   }
   std::string out;
@@ -610,15 +667,15 @@ std::string html_list(const OcrPage& page, const std::vector<int>& lines) {
   return out;
 }
 
-// A block as HTML, by its label.
+// A block as HTML, by its label; its lines' scripts as <sup> and <sub>.
 std::string html_block(const OcrPage& page, const Region& r) {
-  auto text = [&](int i) { return html(page.lines[static_cast<size_t>(i)].text); };
+  auto text = [&](int i) { return html(marked(page.lines[static_cast<size_t>(i)])); };
   auto each = [&](const char* tag) {
     std::string out;
     for (int i : r.lines) out += std::string("<") + tag + ">" + text(i) + "</" + tag + ">";
     return out;
   };
-  const std::string para = html(paragraph(page, r.lines));
+  const std::string para = html(marked_paragraph(page, r.lines));
   if (r.label == "Section-Header") {
     return heading_like(page, r.lines) ? "<h2>" + para + "</h2>\n" : "<p>" + para + "</p>\n";
   }
@@ -635,7 +692,7 @@ std::string html_block(const OcrPage& page, const Region& r) {
     for (int i : sure_lines(page, r.lines)) out += "<p>" + text(i) + "</p>";
     return out.empty() ? std::string() : "<figure>" + out + "</figure>\n";
   }
-  if (r.label == "Table" && r.block && !r.block->cells.empty()) return table_html(page, *r.block) + "\n";
+  if (r.label == "Table" && r.block && !r.block->cells.empty()) return table_html(page, *r.block, true) + "\n";
   if (r.label == "Table") return "<div class=\"table\">" + each("p") + "</div>\n";  // no cells found
   return "<p>" + para + "</p>\n";
 }
@@ -659,24 +716,36 @@ std::string to_html_body(const OcrPage& page) {
       const LineBox& a = page.lines[i - 1].box;
       const LineBox& b = page.lines[i].box;
       if (b.y0 - a.y1 > h || b.y1 < a.y0) {
-        s += "<p>" + html(paragraph(page, run)) + "</p>\n";
+        s += "<p>" + html(marked_paragraph(page, run)) + "</p>\n";
         run.clear();
       }
     }
     run.push_back(static_cast<int>(i));
   }
-  if (!run.empty()) s += "<p>" + html(paragraph(page, run)) + "</p>\n";
+  if (!run.empty()) s += "<p>" + html(marked_paragraph(page, run)) + "</p>\n";
   return s;
 }
 
-std::string to_html(std::span<const OcrPage> pages) {
-  std::string s = "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"generator\" content=\"" +
-                  std::string("Carbon-OCR ") + std::string(kVersion) + "\">\n<title>Carbon-OCR</title>\n</head>\n<body>\n";
-  for (size_t p = 0; p < pages.size(); ++p) {
-    s += "<section class=\"page\" id=\"page-" + std::to_string(p + 1) + "\">\n" + to_html_body(pages[p]) +
+std::string html_head() {
+  return "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"generator\" content=\"" +
+         std::string("Carbon-OCR ") + std::string(kVersion) + "\">\n<title>Carbon-OCR</title>\n</head>\n<body>\n";
+}
+
+std::string html_page(const OcrPage& page, size_t index) {
+  return "<section class=\"page\" id=\"page-" + std::to_string(index + 1) + "\">\n" + to_html_body(page) +
          "</section>\n";
-  }
-  return s + "</body>\n</html>\n";
+}
+
+std::string html_tail() { return "</body>\n</html>\n"; }
+
+std::string to_html(std::span<const OcrPage> pages) {
+  std::string s = html_head();
+  for (size_t p = 0; p < pages.size(); ++p) s += html_page(pages[p], p);
+  return s + html_tail();
+}
+
+std::string markdown_page(const OcrPage& page, size_t index) {
+  return (index ? "\n---\n\n" : "") + to_markdown(std::span<const OcrPage>(&page, 1));
 }
 
 std::string to_markdown(std::span<const OcrPage> pages) {

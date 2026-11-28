@@ -4,15 +4,18 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "carbon/beam.h"
 #include "carbon/cpu.h"
 #include "carbon/error.h"
 #include "carbon/lines.h"
+#include "../../carbon/src/cpu/kernels.h"
 
 namespace {
 
@@ -127,6 +130,74 @@ TEST(Beam, CandidatesAreTheSameBitsOnEveryIsa) {
       EXPECT_EQ(ids_a, ids_b) << t_n << " " << k;
       EXPECT_EQ(lp_a, lp_b) << t_n << " " << k;
       EXPECT_EQ(bl_a, bl_b) << t_n << " " << k;
+    }
+  }
+}
+
+// The candidates as defined: each frame's best the first class at its largest logit, its sum every class's
+// exp_neg(logit - best) in class order, its top k but the blank by insertion. The kernels find the best with the top
+// k and pass over the terms that cannot move a sum of 1 or more; the bits must be the definition's on every
+// instruction set, at logits narrow (every term counts) and wide (most are passed over), with ties, signed zeros and a
+// blank of -inf.
+TEST(Beam, CandidatesAreEveryTermSummedBitForBit) {
+  std::mt19937 rng(41);
+  const float inf = std::numeric_limits<float>::infinity();
+  auto bits = [](const std::vector<float>& v) {
+    std::vector<uint32_t> out(v.size());
+    if (!v.empty()) std::memcpy(out.data(), v.data(), v.size() * sizeof(float));
+    return out;
+  };
+  for (const float spread : {0.5f, 6.0f, 25.0f}) {
+    for (const int classes : {2, 9, 800}) {
+      for (const int t_n : {1, 7, 8, 13, 64, 263}) {
+        for (const int k : {0, 1, 5}) {
+          if (k > classes - 1) continue;
+          const int frames = t_n + 3;
+          std::vector<float> logits = random_logits(rng, classes, frames, spread);
+          auto at = [&](int c, int t) -> float& { return logits[static_cast<size_t>(c) * frames + t]; };
+          if (t_n > 2 && classes > 2) {
+            at(1, 0) = at(classes - 1, 0) = 40.0f;  // the best tied between two classes
+            at(0, 1) = at(1, 1) = 40.0f;            // the blank tied with the best
+            at(0, 2) = -inf;                        // no blank
+            at(1, 2) = 0.0f;
+            at(2, 2) = -0.0f;
+          }
+          std::vector<int32_t> want_ids(static_cast<size_t>(t_n) * k, 0);
+          std::vector<float> want_lp(static_cast<size_t>(t_n) * k, -inf), want_blank(static_cast<size_t>(t_n));
+          for (int t = 0; t < t_n; ++t) {
+            float best = -inf, sum = 0.0f;
+            for (int c = 0; c < classes; ++c) best = at(c, t) > best ? at(c, t) : best;
+            for (int c = 0; c < classes; ++c) sum = sum + carbon::cpu::detail::exp_neg(at(c, t) - best);
+            float* lt = want_lp.data() + static_cast<size_t>(t) * k;
+            int32_t* it = want_ids.data() + static_cast<size_t>(t) * k;
+            for (int c = 1; c < classes && k > 0; ++c) {
+              const float v = at(c, t);
+              if (!(v > lt[k - 1])) continue;
+              int j = k - 1;
+              for (; j > 0 && lt[j - 1] < v; --j) {
+                lt[j] = lt[j - 1];
+                it[j] = it[j - 1];
+              }
+              lt[j] = v;
+              it[j] = c;
+            }
+            const float off = best + std::log(sum);
+            for (int j = 0; j < k; ++j) lt[j] = lt[j] - off;
+            want_blank[static_cast<size_t>(t)] = at(0, t) - off;
+          }
+          for (const carbon::cpu::Isa isa : carbon::cpu::isas_available()) {
+            std::vector<int32_t> ids(want_ids.size(), -1);
+            std::vector<float> lp(want_lp.size()), blank(want_blank.size());
+            carbon::cpu::ctc_topk(logits.data(), classes, frames, t_n, k, ids.data(), lp.data(), blank.data(), isa);
+            const std::string where = std::string(carbon::cpu::isa_name(isa)) + " spread " + std::to_string(spread) +
+                                      " classes " + std::to_string(classes) + " t_n " + std::to_string(t_n) + " k " +
+                                      std::to_string(k);
+            EXPECT_EQ(ids, want_ids) << where;
+            EXPECT_EQ(bits(lp), bits(want_lp)) << where;
+            EXPECT_EQ(bits(blank), bits(want_blank)) << where;
+          }
+        }
+      }
     }
   }
 }
@@ -301,6 +372,158 @@ TEST(Beam, EachPrefixAsksTheModelOnce) {
   // at most a new prefix per kept prefix and candidate a frame, plus greedy's
   EXPECT_LE(toy.calls, frames * (r.width + 1) * f.k + frames);
   EXPECT_GT(toy.calls, 0);
+}
+
+// Two readings bit for bit: ids, frames, probabilities and the three scores.
+void expect_same(const carbon::BeamLine& a, const carbon::BeamLine& b, const std::string& where) {
+  EXPECT_EQ(a.line.ids, b.line.ids) << where;
+  EXPECT_EQ(a.line.frames, b.line.frames) << where;
+  ASSERT_EQ(a.line.probs.size(), b.line.probs.size()) << where;
+  EXPECT_EQ(0, std::memcmp(a.line.probs.data(), b.line.probs.data(), a.line.probs.size() * sizeof(float))) << where;
+  EXPECT_EQ(0, std::memcmp(&a.ctc, &b.ctc, sizeof(double))) << where;
+  EXPECT_EQ(0, std::memcmp(&a.lm, &b.lm, sizeof(double))) << where;
+  EXPECT_EQ(0, std::memcmp(&a.score, &b.score, sizeof(double))) << where;
+}
+
+// Toy with a bound on its scores (0: its best class costs nothing) where `bounded`, else none.
+class BoundedToy : public Toy {
+ public:
+  BoundedToy(int32_t liked, bool bounded) : Toy(liked), bounded_(bounded) {}
+  float max_score() const override { return bounded_ ? 0.0f : std::numeric_limits<float>::infinity(); }
+
+ private:
+  bool bounded_;
+};
+
+TEST(Beam, AModelsBoundPrunesQueriesNotReadings) {
+  // the beam with the bound asks for fewer prefixes and reads every line, its n best too, as the beam asking for all
+  std::mt19937 rng(43);
+  int fewer = 0;
+  for (int trial = 0; trial < 60; ++trial) {
+    const int classes = 9, frames = 25 + trial;
+    const std::vector<float> logits = random_logits(rng, classes, frames, trial % 3 ? 1.5f : 4.0f);
+    const carbon::FrameCandidates f = carbon::frame_candidates(logits.data(), classes, frames, frames, 4);
+    carbon::BeamRule r = rule_of(3 + trial % 6, trial % 2 ? 0.999f : 1.0f);
+    r.alpha = 0.2f + 0.1f * (trial % 5);
+    r.beta = 0.5f;
+    BoundedToy with(1 + trial % 8, true), without(1 + trial % 8, false);
+    const auto a = carbon::ctc_beam_nbest(f, r, &with, r.width), b = carbon::ctc_beam_nbest(f, r, &without, r.width);
+    ASSERT_EQ(a.size(), b.size());
+    for (size_t i = 0; i < a.size(); ++i) expect_same(a[i], b[i], "trial " + std::to_string(trial));
+    EXPECT_LE(with.calls, without.calls) << trial;
+    fewer += with.calls < without.calls;
+  }
+  EXPECT_GT(fewer, 30);
+  // alpha 0: the bound cannot prune (every query asked, as without one)
+  const std::vector<float> logits = random_logits(rng, 9, 30, 1.5f);
+  const carbon::FrameCandidates f = carbon::frame_candidates(logits.data(), 9, 30, 30, 4);
+  BoundedToy with(2, true), without(2, false);
+  expect_same(carbon::ctc_beam(f, rule_of(5), &with), carbon::ctc_beam(f, rule_of(5), &without), "alpha 0");
+  EXPECT_EQ(with.calls, without.calls);
+}
+
+// A model that reads another line inside each of its queries, as a model that runs a search of its own might.
+class Nesting : public Toy {
+ public:
+  Nesting(int32_t liked, const carbon::FrameCandidates& inner, const carbon::BeamRule& rule)
+      : Toy(liked), inner_(inner), rule_(rule) {}
+  void score_batch(std::span<const uint64_t> states, std::span<const int32_t> classes, std::span<float> out,
+                   std::span<uint64_t> next) const override {
+    last = carbon::ctc_beam(inner_, rule_, nullptr);
+    Toy::score_batch(states, classes, out, next);
+  }
+  mutable carbon::BeamLine last;
+
+ private:
+  const carbon::FrameCandidates& inner_;
+  carbon::BeamRule rule_;
+};
+
+TEST(Beam, ALineReadsTheSameWhateverTheThreadReadBefore) {
+  // a search keeps its working memory on its thread: a line reads the same after a far longer one (the prefixes'
+  // table grown), and a search a model runs inside another reads as it reads alone
+  std::mt19937 rng(47);
+  const std::vector<float> small = random_logits(rng, 12, 30, 1.2f), huge = random_logits(rng, 40, 900, 0.3f);
+  const carbon::FrameCandidates fs = carbon::frame_candidates(small.data(), 12, 30, 30, 5);
+  const carbon::FrameCandidates fh = carbon::frame_candidates(huge.data(), 40, 900, 900, 5);
+  carbon::BeamRule r = rule_of(8, 0.999f);
+  r.alpha = 0.3f;
+  Toy toy(3);
+  const auto first = carbon::ctc_beam_nbest(fs, r, &toy, 8);
+  const auto big = carbon::ctc_beam_nbest(fh, r, &toy, 8);
+  ASSERT_FALSE(big.empty());
+  const auto again = carbon::ctc_beam_nbest(fs, r, &toy, 8);
+  ASSERT_EQ(first.size(), again.size());
+  for (size_t i = 0; i < first.size(); ++i) expect_same(first[i], again[i], "after a long line, " + std::to_string(i));
+  const carbon::BeamLine alone = carbon::ctc_beam(fs, r, nullptr);
+  Nesting nesting(3, fs, r);
+  expect_same(carbon::ctc_beam(fh, r, &nesting), big.front(), "the outer search");
+  expect_same(nesting.last, alone, "the inner search");
+}
+
+// A sure frame far enough from any unsure one keeps its likeliest class alone (a character's frame loses its
+// blank and its other candidates, a blank's frame its candidates); the unsure frames, and those within the margin of
+// one, keep every candidate.
+TEST(Beam, SureSpansKeepTheirGreedyClassAlone) {
+  // frames: 0 blank 0.99+, 1 class 1 sure, 2 class 2 unsure (1 and 2 near a tie), 3 blank sure, 4 class 1 sure,
+  // 5 blank sure, 6 blank sure
+  const std::vector<float> logits = logits_of({{9, 0, 0}, {0, 9, 0}, {0, 2.0f, 2.2f}, {9, 0, 0}, {0, 9, 0},
+                                               {9, 0, 0}, {9, 0, 0}});
+  const carbon::FrameCandidates f = all_of(logits, 3, 7);
+  const float neg = -std::numeric_limits<float>::infinity();
+  for (int margin : {0, 1, 2}) {
+    const carbon::FrameCandidates s = carbon::sure_spans(f, 0.99f, margin);
+    ASSERT_EQ(s.ids, f.ids);
+    for (int t = 0; t < 7; ++t) {
+      const bool searched = std::abs(t - 2) <= margin;
+      const bool character = f.logp[static_cast<size_t>(t) * 2] > f.blank[static_cast<size_t>(t)];
+      for (int j = 0; j < 2; ++j) {
+        const size_t i = static_cast<size_t>(t) * 2 + j;
+        const bool kept = searched || (character && j == 0);
+        EXPECT_EQ(s.logp[i], kept ? f.logp[i] : neg) << "margin " << margin << " frame " << t << " candidate " << j;
+      }
+      EXPECT_EQ(s.blank[static_cast<size_t>(t)], searched || !character ? f.blank[static_cast<size_t>(t)] : neg)
+          << "margin " << margin << " frame " << t;
+    }
+  }
+  // off: 0, or over 1; a span of 1 cuts nothing short of certainty
+  for (float off : {0.0f, 1.5f}) {
+    const carbon::FrameCandidates s = carbon::sure_spans(f, off, 2);
+    EXPECT_EQ(s.logp, f.logp);
+    EXPECT_EQ(s.blank, f.blank);
+  }
+  EXPECT_EQ(carbon::sure_spans(f, 1.0f, 0).logp, f.logp);
+}
+
+TEST(Beam, SpansKeepTheSureCharactersFromTheLanguageModel) {
+  // frame 1 reads class 1 at 0.99+, frame 3 a near tie of 1 and 2: a model that wants 2 everywhere takes both without
+  // spans, only the unsure one with them
+  const std::vector<float> logits =
+      logits_of({{6, 0, 0}, {0, 8.0f, 2.0f}, {6, 0, 0}, {0, 3.1f, 3.0f}, {6, 0, 0}});
+  const carbon::FrameCandidates f = all_of(logits, 3, 5);
+  Toy toy(2);
+  carbon::BeamRule r = rule_of(8);
+  r.alpha = 2.0f;
+  EXPECT_EQ(carbon::ctc_beam(f, r, &toy).line.ids, Ids({2, 2}));
+  r.span = 0.99f;
+  r.span_margin = 0;
+  const carbon::BeamLine b = carbon::ctc_beam(f, r, &toy);
+  EXPECT_EQ(b.line.ids, Ids({1, 2}));
+  EXPECT_EQ(b.line.frames, Ids({1, 3}));
+  // the greedy reading wherever every frame is sure; and with no model, spans read greedy's or a likelier line
+  const std::vector<float> sure = logits_of({{9, 0, 0}, {0, 9, 0}, {9, 0, 0}, {0, 0, 9}, {9, 0, 0}});
+  const int32_t len[] = {5};
+  EXPECT_EQ(carbon::ctc_beam(all_of(sure, 3, 5), r, &toy).line.ids,
+            carbon::ctc_greedy(sure.data(), 1, 3, 5, len)[0].ids);
+  std::mt19937 rng(53);
+  for (int trial = 0; trial < 50; ++trial) {
+    const std::vector<float> l = random_logits(rng, 6, 20, 3.0f);
+    const carbon::FrameCandidates fc = carbon::frame_candidates(l.data(), 6, 20, 20, 3);
+    carbon::BeamRule s = rule_of(5);
+    s.span = 0.9f;
+    const carbon::BeamLine g = carbon::ctc_beam(fc, rule_of(1)), b2 = carbon::ctc_beam(fc, s);
+    EXPECT_GE(b2.ctc, carbon::ctc_logprob(carbon::sure_spans(fc, 0.9f, 2), g.line.ids) - 1e-9) << trial;
+  }
 }
 
 TEST(Beam, ABonusPerCharacterKeepsCharacters) {

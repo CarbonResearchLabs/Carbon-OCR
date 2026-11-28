@@ -65,10 +65,12 @@ struct DetRule {
   // pass runs on the tiny lines' bands alone.
   double second_pass_share = 0;
   int second_pass_lines = 8;
-  // A pass by share (its median line not tiny) runs on the bands of rows that hold the tiny lines, not the
-  // page: each tiny line's rows at the second scale, a line height either side, bands closer than
-  // second_pass_join rows joined, each run with the strips' halo; a band's line is kept where its centre lies in
-  // the band's own rows. False: the whole page, as a pass by the median.
+  // The second pass, by the median or by share, runs on the bands of rows that hold the first pass's tiny lines,
+  // not the page: each tiny line's rows at the second scale, widened by the tiny lines' median spacing (at least two
+  // of their heights) either side, bands closer than second_pass_join rows joined, each run with the strips' halo; a
+  // band's line is kept where its centre lies in the band's own rows. A page whose tiny print fills it takes about
+  // the whole page; one with its tiny print in a corner (a title block, a legend, a footnote) only those rows. False:
+  // the whole page.
   bool second_pass_bands = true;
   int second_pass_join = 256;
   // The second pass at the scale that makes the tiny lines' median height this many pixels, capped by the

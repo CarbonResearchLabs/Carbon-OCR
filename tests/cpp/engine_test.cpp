@@ -5,8 +5,11 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -16,6 +19,7 @@
 #include <random>
 #include <span>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -80,9 +84,9 @@ GrayImage tiny_page() {
   return p;
 }
 
-// The page of tiny text takes the second pass (its median line 4 px, under 9),
-// whose page at twice the scale (1600 x 2048) runs in 4 strips: every bar is
-// found, once, its box the second pass's.  A page of print takes none.
+// The page of tiny text takes the second pass (its median line 4 px, under 9), at
+// twice the scale on the band of rows its tiny bars hold: every bar is found,
+// once, its box the second pass's.  A page of print takes none.
 TEST(Engine, DetectsAPageOfTinyTextAgainAtTwiceTheScale) {
   const GrayImage tiny = tiny_page();
   EngineOptions o;
@@ -147,6 +151,36 @@ TEST(Engine, ThePassByShareRunsOnTheTinyLinesBands) {
   EXPECT_TRUE(a.second_pass);
   EXPECT_TRUE(b.second_pass);
   ASSERT_EQ(a.lines.size(), 14u);
+  ASSERT_EQ(b.lines.size(), a.lines.size());
+  for (size_t i = 0; i < a.lines.size(); ++i) {
+    EXPECT_EQ(a.lines[i].text, b.lines[i].text) << "line " << i;
+    EXPECT_NEAR(a.lines[i].box.y0, b.lines[i].box.y0, 0.25) << "line " << i;
+    EXPECT_NEAR(a.lines[i].box.y1, b.lines[i].box.y1, 0.25) << "line " << i;
+    EXPECT_NEAR(a.lines[i].box.x0, b.lines[i].box.x0, 0.25) << "line " << i;
+  }
+}
+
+// A page all of tiny print in two blocks far apart (the six bars, and six more 600 rows below): its median line
+// is tiny, so it takes the pass by the median, on two bands, and finds what the whole page's pass (in 4 strips of
+// the page at twice the scale) finds, every bar once.
+TEST(Engine, ThePassByTheMedianRunsOnTheTinyLinesBands) {
+  GrayImage page = tiny_page();
+  const int dashes[] = {2, 3, 4, 2, 3, 4};
+  for (int i = 0; i < 6; ++i) {
+    const int y = 800 + 31 * i;
+    for (int d = 0; d < dashes[i]; ++d) {
+      for (int r = y; r < y + 5; ++r) std::fill_n(page.pixels.begin() + r * 800 + 300 + 32 * d, 24, uint8_t{20});
+    }
+  }
+  EngineOptions o;
+  o.pool.workers = 2;
+  o.crop.flip_margin = 0;
+  EngineOptions whole = o;
+  whole.det.second_pass_bands = false;
+  const OcrPage a = Engine(kSet, o).ocr(page.view()), b = Engine(kSet, whole).ocr(page.view());
+  EXPECT_TRUE(a.second_pass);
+  EXPECT_TRUE(b.second_pass);
+  ASSERT_EQ(a.lines.size(), 12u);
   ASSERT_EQ(b.lines.size(), a.lines.size());
   for (size_t i = 0; i < a.lines.size(); ++i) {
     EXPECT_EQ(a.lines[i].text, b.lines[i].text) << "line " << i;
@@ -316,6 +350,67 @@ TEST(Engine, StreamsPagesInOrderAsOcrReadsThem) {
   EXPECT_EQ(c->lines.size(), 3u);
   EXPECT_FALSE(engine.next().has_value());
   EXPECT_EQ(engine.ocr(page.view()).lines.size(), 3u);  // ocr() still reads after a stream
+}
+
+// A page's task (PageTask): read as given, it is what an engine whose options never turn or level a page reads
+// (orientation is not run: it could not turn it), whatever the engine's own options; read from lines found already
+// (LineFinder::detect), detection is skipped and those lines are read, as the engine reads the lines it finds.
+TEST(Engine, ReadsAPageAsGivenOrFromTheLinesFoundOnIt) {
+  const GrayImage level = load_image(kSet / "page.png");
+  const GrayImage page = rotate_page(level.view(), 2.5);  // deskew levels it, unless read as given
+  EngineOptions o;
+  o.pool.workers = 2;
+  Engine engine(kSet, o);
+  EngineOptions given = o;
+  given.turn_probability = 2.0f;
+  given.deskew = false;
+  const OcrPage want = Engine(kSet, given).ocr(page.view());
+  EXPECT_EQ(want.skew, 0.0);
+  ASSERT_GT(std::abs(engine.ocr(page.view()).skew), 1.0) << "levelled when read by the engine's own options";
+  PageTask as_given;
+  as_given.as_given = true;
+  engine.submit(GrayImage(page), as_given);
+  const OcrPage got = *engine.next();
+  EXPECT_EQ(got.rotation, 0);
+  EXPECT_EQ(got.skew, 0.0);
+  ASSERT_EQ(got.lines.size(), want.lines.size());
+  for (size_t i = 0; i < want.lines.size(); ++i) {
+    EXPECT_EQ(got.lines[i].text, want.lines[i].text);
+    EXPECT_EQ(got.lines[i].box.x0, want.lines[i].box.x0);
+    EXPECT_EQ(got.lines[i].box.y1, want.lines[i].box.y1);
+    EXPECT_EQ(got.lines[i].confidence, want.lines[i].confidence);
+  }
+
+  // From the lines found: the level page's three bars, or the first two of them alone.
+  LineFinder finder(kSet, o);
+  const OcrPage found = finder.detect(level.view());
+  ASSERT_EQ(found.lines.size(), 3u);
+  EXPECT_EQ(found.width, level.width);
+  EXPECT_TRUE(found.lines[0].text.empty());
+  const OcrPage read = engine.ocr(level.view());
+  PageTask from;
+  from.found = std::make_shared<const OcrPage>(found);
+  engine.submit(GrayImage(level), from);
+  OcrPage two = found;
+  two.lines.pop_back();
+  from.found = std::make_shared<const OcrPage>(two);
+  engine.submit(GrayImage(level), from);
+  OcrPage small = found;
+  small.width = 10;
+  from.found = std::make_shared<const OcrPage>(small);
+  engine.submit(GrayImage(level), from);
+  const OcrPage all = *engine.next();
+  ASSERT_EQ(all.lines.size(), 3u);
+  for (size_t i = 0; i < 3; ++i) {
+    EXPECT_EQ(all.lines[i].text, read.lines[i].text);
+    EXPECT_EQ(all.lines[i].det_score, found.lines[i].det_score);
+    EXPECT_NEAR(all.lines[i].box.y0, read.lines[i].box.y0, 1.0);
+  }
+  const OcrPage first_two = *engine.next();
+  ASSERT_EQ(first_two.lines.size(), 2u);
+  EXPECT_EQ(first_two.lines[1].text, read.lines[1].text);
+  EXPECT_THROW(engine.next(), Error) << "lines found on a page of another size";
+  EXPECT_FALSE(engine.next().has_value());
 }
 
 // The stream taken as pages finish (a server's): images as their encoded bytes, decoded by the workers, each
@@ -997,6 +1092,349 @@ TEST(Gate, TablesByGeometryHeaderCellsSpanTwoHeaderRows) {
   EXPECT_NE(html.find("<tr><td>Q1</td><td>Q2</td><td>Q3</td><td>Q4</td></tr>"), std::string::npos) << html;
 }
 
+namespace {
+// A page of one Table block holding every line, each (x0, y, x1, text) 20 px tall, laid out by geometry.
+OcrPage grid_page(const std::vector<std::tuple<double, double, double, const char*>>& lines, const GridRule& rule) {
+  OcrPage p;
+  p.width = p.height = 1000;
+  for (const auto& [x0, y, x1, t] : lines) p.lines.push_back(gate_line({x0, y, x1, y + 20}, t, 1, 1));
+  std::vector<int> all(p.lines.size());
+  std::iota(all.begin(), all.end(), 0);
+  p.blocks = {{"Table", 0.8f, all, {}}};
+  detail::tables_by_geometry(p, rule);
+  return p;
+}
+}  // namespace
+
+// Tables by geometry, a body cell's next line (GridRule 5, body_wrap): a row at the table's own pitch, of fewer
+// lines than the row above and under half its columns, that reads as going on (lowercase first, or under a line
+// that ends open) joins the cell above; a capitalised line under one that ends closed is a row of its own.
+TEST(Gate, TablesByGeometryJoinABodyCellsNextLine) {
+  const std::vector<std::tuple<double, double, double, const char*>> lines = {
+      {100, 0, 180, "Drug"},       {300, 0, 350, "Dose"}, {450, 0, 520, "Effect"},
+      {100, 25, 180, "Aspirin"},   {300, 25, 330, "100"}, {450, 25, 600, "Pain relief and"},
+      {450, 50, 500, "fever"},
+      {100, 75, 190, "Ibuprofen"}, {300, 75, 330, "200"}, {450, 75, 560, "Swelling"},
+      {100, 100, 190, "Naproxen"}, {300, 100, 330, "250"}, {450, 100, 560, "Long acting"},
+      {450, 125, 500, "Daily"}};
+  const OcrPage on = grid_page(lines, GridRule{});
+  const std::string html = to_html_body(on);
+  EXPECT_NE(html.find("<tr><td>Aspirin</td><td>100</td><td>Pain relief and<br>fever</td></tr>\n<tr><td>Ibuprofen"),
+            std::string::npos) << html;
+  EXPECT_NE(html.find("<tr><td></td><td></td><td>Daily</td></tr>"), std::string::npos) << html;
+  GridRule off;
+  off.body_wrap = false;
+  const std::string apart = to_html_body(grid_page(lines, off));
+  EXPECT_NE(apart.find("<tr><td></td><td></td><td>fever</td></tr>"), std::string::npos) << apart;
+  // a hyphen at the end of the line above carries a capitalised line on; a value never joins
+  const std::vector<std::tuple<double, double, double, const char*>> more = {
+      {100, 0, 180, "Site"},   {300, 0, 350, "n"},   {450, 0, 520, "Note"},
+      {100, 25, 180, "North"}, {300, 25, 330, "12"}, {450, 25, 600, "Anti-"},
+      {450, 50, 520, "Inflammatory"},
+      {100, 75, 180, "South"}, {300, 75, 330, "14"}, {450, 75, 560, "Mild and"},
+      {450, 100, 480, "12"}};
+  const std::string h2 = to_html_body(grid_page(more, GridRule{}));
+  EXPECT_NE(h2.find("<td>Anti-<br>Inflammatory</td>"), std::string::npos) << h2;
+  EXPECT_NE(h2.find("<td>Mild and</td></tr>"), std::string::npos) << h2;
+}
+
+// Tables by geometry, a section row (GridRule 8): a lone body cell centred in a table of three columns spans it;
+// one set off centre stays in its column, and with section_rows off the centred one does too; a wrapped cell's line,
+// set where the line above it in its column starts, is no section either, centred or not.
+TEST(Gate, TablesByGeometrySpanACentredSectionRow) {
+  const std::vector<std::tuple<double, double, double, const char*>> lines = {
+      {100, 0, 200, "Gene"},     {300, 0, 360, "Cases"}, {450, 0, 560, "Controls"},
+      {100, 25, 180, "BRCA1"},   {300, 25, 330, "12"},   {450, 25, 480, "30"},
+      {100, 50, 180, "BRCA2"},   {300, 50, 315, "8"},    {450, 50, 480, "25"},
+      {320, 75, 400, "Women"},
+      {100, 100, 180, "BRCA1"},  {300, 100, 330, "15"},  {450, 100, 480, "28"},
+      {450, 125, 530, "Others"},
+      {100, 150, 180, "BRCA2"},  {300, 150, 315, "9"},   {450, 150, 480, "22"}};
+  const std::string html = to_html_body(grid_page(lines, GridRule{}));
+  EXPECT_NE(html.find("<tr><td colspan=\"3\">Women</td></tr>"), std::string::npos) << html;
+  EXPECT_NE(html.find("<tr><td></td><td></td><td>Others</td></tr>"), std::string::npos) << html;
+  GridRule off;
+  off.section_rows = false;
+  const std::string kept = to_html_body(grid_page(lines, off));
+  EXPECT_NE(kept.find("<tr><td></td><td>Women</td><td></td></tr>"), std::string::npos) << kept;
+  const std::vector<std::tuple<double, double, double, const char*>> wrapped = {
+      {100, 0, 140, "No."},    {300, 0, 420, "Description"},     {600, 0, 660, "Date"},
+      {100, 25, 110, "1"},     {300, 25, 450, "Amendment No. 1"}, {600, 25, 660, "3-30-95"},
+      {300, 50, 470, "Agreement (PVNGS Unit"},
+      {100, 75, 110, "2"},     {300, 75, 440, "Amendment No. 2"}, {600, 75, 660, "3-28-97"}};
+  const std::string w = to_html_body(grid_page(wrapped, GridRule{}));
+  EXPECT_NE(w.find("<tr><td></td><td>Agreement (PVNGS Unit</td><td></td></tr>"), std::string::npos) << w;
+}
+
+// Tables by geometry, a heading over columns (GridRule 4, header_cover): a header line spans each column it lies
+// over by more than header_cover of the column's width, though it covers under half of the last; a body line keeps
+// `cover`; with header_cover 0 the heading takes the one column it covers half of.
+TEST(Gate, TablesByGeometryHeadingSpansTheColumnsItOverlaps) {
+  const std::vector<std::tuple<double, double, double, const char*>> lines = {
+      {100, 0, 180, "Drug"},  {310, 0, 430, "Treatment group"},
+      {300, 25, 340, "A"},    {420, 25, 460, "B"},
+      {100, 50, 180, "X"},    {300, 50, 340, "1"},  {420, 50, 460, "2"},
+      {100, 75, 180, "Y"},    {300, 75, 340, "3"},  {420, 75, 460, "4"},
+      {100, 100, 180, "Z"},   {310, 100, 430, "5 to 6"}};
+  const OcrPage on = grid_page(lines, GridRule{});
+  const std::string html = to_html_body(on);
+  EXPECT_NE(html.find("<tr><td>Drug</td><td colspan=\"2\">Treatment group</td></tr>"), std::string::npos) << html;
+  EXPECT_NE(html.find("<tr><td>Z</td><td>5 to 6</td><td></td></tr>"), std::string::npos) << html;
+  GridRule off;
+  off.header_cover = 0;
+  const std::string one = to_html_body(grid_page(lines, off));
+  EXPECT_NE(one.find("<tr><td>Drug</td><td>Treatment group</td><td></td></tr>"), std::string::npos) << one;
+}
+
+// Tables by geometry, a column of group labels (GridRule 4, label_band): labels set left of the items, between
+// their groups' rows, are no column of the fullest rows; they get one of their own and span their groups
+// (GridRule 6), the items in the next. Without it each label is a row of its own in the items' column. A stub set
+// out left of its totals (each such line its row's first, the row's values beside it) gets no column of its own.
+TEST(Gate, TablesByGeometryGiveGroupLabelsAColumn) {
+  const std::vector<std::tuple<double, double, double, const char*>> lines = {
+      {150, 0, 220, "Crop"},     {300, 0, 340, "Yield"}, {420, 0, 460, "Area"},
+      {150, 30, 210, "Wheat"},   {300, 30, 330, "12"},  {420, 30, 450, "14"},
+      {20, 45, 90, "North"},
+      {150, 60, 210, "Barley"},  {300, 60, 315, "8"},   {420, 60, 435, "9"},
+      {150, 90, 210, "Wheat"},   {300, 90, 315, "5"},   {420, 90, 435, "6"},
+      {20, 105, 90, "South"},
+      {150, 120, 210, "Barley"}, {300, 120, 315, "7"},  {420, 120, 435, "3"}};
+  const OcrPage on = grid_page(lines, GridRule{});
+  const std::string html = to_html_body(on);
+  EXPECT_NE(html.find("<tr><td></td><td>Crop</td><td>Yield</td><td>Area</td></tr>"), std::string::npos) << html;
+  EXPECT_NE(html.find("<tr><td rowspan=\"3\">North</td><td>Wheat</td><td>12</td><td>14</td></tr>"), std::string::npos)
+      << html;
+  EXPECT_NE(html.find("<tr><td rowspan=\"3\">South</td><td>Wheat</td><td>5</td><td>6</td></tr>"), std::string::npos)
+      << html;
+  GridRule off;
+  off.label_band = false;
+  const std::string same = to_html_body(grid_page(lines, off));
+  EXPECT_NE(same.find("<tr><td>North</td><td></td><td></td></tr>"), std::string::npos) << same;
+  const std::vector<std::tuple<double, double, double, const char*>> stub = {
+      {60, 0, 120, "Total"},  {200, 0, 210, "$"}, {250, 0, 280, "530"},
+      {10, 25, 55, "JBI"},    {250, 25, 280, "375"},
+      {10, 50, 55, "DCS"},    {250, 50, 280, "116"},
+      {10, 75, 55, "ICS"},    {250, 75, 280, "16"},
+      {60, 100, 150, "Sum"},  {200, 100, 210, "$"}, {250, 100, 280, "900"}};
+  const std::string s = to_html_body(grid_page(stub, GridRule{}));
+  EXPECT_NE(s.find("<tr><td>JBI</td><td></td><td>375</td></tr>"), std::string::npos) << s;
+}
+
+namespace {
+// A page of lines (x0, y, x1, text, block), each 20 px tall, its blocks labelled as given, laid out by geometry.
+OcrPage blocks_page(const std::vector<std::tuple<double, double, double, const char*, int>>& lines,
+                    const std::vector<std::string>& labels, const GridRule& rule) {
+  OcrPage p;
+  p.width = p.height = 1000;
+  for (const std::string& l : labels) p.blocks.push_back({l, 0.8f, {}, {}});
+  for (const auto& [x0, y, x1, t, b] : lines) {
+    p.blocks[static_cast<size_t>(b)].lines.push_back(static_cast<int>(p.lines.size()));
+    p.lines.push_back(gate_line({x0, y, x1, y + 20}, t, 1, 1));
+  }
+  detail::tables_by_geometry(p, rule);
+  return p;
+}
+
+std::vector<std::string> labels_of(const OcrPage& p) {
+  std::vector<std::string> out;
+  for (const OcrBlock& b : p.blocks) out.push_back(b.label);
+  return out;
+}
+}  // namespace
+
+// Tables by geometry, a heading above the table (GridRule 2, heading_up): a block of one line just above the
+// table, over its value columns, joins it as its first header row, spanning the columns it lies over; a
+// paragraph's line above it, over its first column too, does not.
+TEST(Gate, TablesByGeometryTakeAHeadingOverTheirColumns) {
+  const std::vector<std::tuple<double, double, double, const char*, int>> lines = {
+      {300, 0, 560, "Mean error, trials 2-8", 0},
+      {100, 50, 180, "Group", 1}, {300, 50, 370, "Stage 1", 1}, {420, 50, 490, "Stage 2", 1}, {540, 50, 610, "Stage 3", 1},
+      {100, 75, 180, "A", 1},     {300, 75, 340, "1.2", 1},     {420, 75, 460, "3.4", 1},     {540, 75, 580, "5.6", 1},
+      {100, 100, 180, "B", 1},    {300, 100, 340, "2.2", 1},    {420, 100, 460, "4.4", 1},    {540, 100, 580, "6.6", 1}};
+  const OcrPage on = blocks_page(lines, {"Caption", "Table"}, GridRule{});
+  EXPECT_EQ(labels_of(on), std::vector<std::string>{"Table"});
+  const std::string html = to_html_body(on);
+  EXPECT_NE(html.find("<table>\n<tr><td></td><td colspan=\"3\">Mean error, trials 2-8</td></tr>\n<tr><td>Group</td>"),
+            std::string::npos) << html;
+  GridRule off;
+  off.heading_up = false;
+  EXPECT_EQ(labels_of(blocks_page(lines, {"Caption", "Table"}, off)), (std::vector<std::string>{"Caption", "Table"}));
+  auto para = lines;
+  std::get<0>(para[0]) = 100;
+  std::get<3>(para[0]) = "the last line of a paragraph above it";
+  EXPECT_EQ(labels_of(blocks_page(para, {"Text", "Table"}, GridRule{})), (std::vector<std::string>{"Text", "Table"}));
+  // over the value columns too, but a caption's next line (lowercase first) or a sentence's end is no heading
+  for (const char* t : {"with the electron donor", "Means of three trials."}) {
+    auto tail = lines;
+    std::get<3>(tail[0]) = t;
+    EXPECT_EQ(labels_of(blocks_page(tail, {"Caption", "Table"}, GridRule{})),
+              (std::vector<std::string>{"Caption", "Table"})) << t;
+  }
+}
+
+// Tables by geometry, captions (caption_out) and a title row (GridRule 9, title_out): the table's own "Table 2."
+// line above its others leaves the grid as a Caption block before it; a lone first row over its columns, from the
+// first, is its title, a Caption block before it, and the grid is laid out without it.
+TEST(Gate, TablesByGeometryLeaveTheirCaptionAndTitleOut) {
+  const std::vector<std::tuple<double, double, double, const char*, int>> cap = {
+      {100, 0, 400, "Table 2. Results", 0},
+      {100, 30, 180, "Name", 0}, {300, 30, 340, "Age", 0},
+      {100, 55, 180, "Ann", 0},  {300, 55, 330, "31", 0},
+      {100, 80, 180, "Bob", 0},  {300, 80, 330, "40", 0}};
+  const OcrPage on = blocks_page(cap, {"Table"}, GridRule{});
+  ASSERT_EQ(labels_of(on), (std::vector<std::string>{"Caption", "Table"}));
+  EXPECT_EQ(on.lines[static_cast<size_t>(on.blocks[0].lines[0])].text, "Table 2. Results");
+  EXPECT_EQ(on.blocks[1].cells.size(), 6u);
+  GridRule off;
+  off.caption_out = false;
+  off.title_out = false;
+  const OcrPage kept = blocks_page(cap, {"Table"}, off);
+  EXPECT_EQ(labels_of(kept), std::vector<std::string>{"Table"});
+  EXPECT_EQ(kept.blocks[0].cells.size(), 7u);
+  const std::vector<std::tuple<double, double, double, const char*, int>> title = {
+      {100, 0, 450, "STANDARD RESISTANCE VALUES", 0},
+      {100, 30, 180, "Code", 0}, {250, 30, 300, "Ohms", 0}, {400, 30, 450, "Watts", 0},
+      {100, 55, 180, "R1", 0},   {250, 55, 290, "100", 0},  {400, 55, 430, "0.5", 0},
+      {100, 80, 180, "R2", 0},   {250, 80, 290, "220", 0},  {400, 80, 430, "1", 0}};
+  const OcrPage t = blocks_page(title, {"Table"}, GridRule{});
+  ASSERT_EQ(labels_of(t), (std::vector<std::string>{"Caption", "Table"}));
+  EXPECT_EQ(t.lines[static_cast<size_t>(t.blocks[0].lines[0])].text, "STANDARD RESISTANCE VALUES");
+  const std::string html = to_html_body(t);
+  EXPECT_NE(html.find("<table>\n<tr><td>Code</td><td>Ohms</td><td>Watts</td></tr>"), std::string::npos) << html;
+  GridRule stay;
+  stay.title_out = false;
+  const std::string with = to_html_body(blocks_page(title, {"Table"}, stay));
+  EXPECT_NE(with.find("<tr><td colspan=\"3\">STANDARD RESISTANCE VALUES</td></tr>"), std::string::npos) << with;
+}
+
+// A page's ruled lines (find_rules): a rule across and one down, thin, are found and scaled to the page's pixels;
+// a line of text's strokes, short, and a filled box, thick, are not.
+TEST(Gate, FindsAPagesRuledLines) {
+  GrayImage g;
+  g.width = 400;
+  g.height = 300;
+  g.pixels.assign(static_cast<size_t>(g.width) * g.height, 255);
+  auto fill = [&](int x0, int y0, int x1, int y1, uint8_t v) {
+    for (int y = y0; y < y1; ++y) {
+      for (int x = x0; x < x1; ++x) g.pixels[static_cast<size_t>(y) * g.width + x] = v;
+    }
+  };
+  fill(50, 100, 350, 102, 0);    // a rule across, 2 px
+  fill(200, 20, 201, 280, 120);  // a grey rule down, 1 px
+  for (int k = 0; k < 20; ++k) fill(40 + 12 * k, 40, 48 + 12 * k, 52, 0);  // letters: strokes 8 px wide
+  fill(60, 200, 160, 240, 0);    // a filled box
+  const std::vector<LineBox> r = detail::find_rules(g.view(), 800, 600, detail::kRuleDarkFull);
+  ASSERT_EQ(r.size(), 2u);
+  const LineBox& across = r[0].x1 - r[0].x0 > r[0].y1 - r[0].y0 ? r[0] : r[1];
+  const LineBox& down = &across == &r[0] ? r[1] : r[0];
+  EXPECT_DOUBLE_EQ(across.x0, 100);
+  EXPECT_DOUBLE_EQ(across.x1, 700);
+  EXPECT_DOUBLE_EQ(across.y0, 200);
+  EXPECT_DOUBLE_EQ(across.y1, 204);
+  EXPECT_DOUBLE_EQ(down.x0, 400);
+  EXPECT_DOUBLE_EQ(down.y0, 40);
+  EXPECT_DOUBLE_EQ(down.y1, 560);
+}
+
+// The false-table check's features: a grid of numbers under a header, its rules across, and the order model's
+// probabilities as given; and a table the check finds none (check_keep over every probability) is written as text,
+// its block relabelled, in the model's order, its cells gone, the lines it took given back.
+TEST(Gate, TablesByGeometryCheckForFalseTables) {
+  const std::vector<std::tuple<double, double, double, const char*, int>> lines = {
+      {100, 0, 180, "Name", 1},  {300, 0, 340, "Age", 1},  {450, 0, 500, "Score", 1},
+      {100, 25, 180, "Ann", 1},  {300, 25, 330, "31", 1},  {450, 25, 480, "12", 1},
+      {100, 50, 180, "Bob", 1},  {300, 50, 330, "40", 1},  {450, 50, 480, "7", 1},
+      {320, 12, 330, "x", 0}};  // a line of another block inside its box: the table takes it
+  OcrPage p;
+  p.width = p.height = 1000;
+  p.blocks = {{"Text", 0.9f, {}, {}}, {"Table", 0.8f, {}, {}}};
+  for (const auto& [x0, y, x1, t, b] : lines) {
+    p.blocks[static_cast<size_t>(b)].lines.push_back(static_cast<int>(p.lines.size()));
+    p.lines.push_back(gate_line({x0, y, x1, y + 20}, t, 1, 1));
+  }
+  p.rules = {{95, -3, 505, -1}, {95, 22, 505, 23}, {95, 72, 505, 74}, {98, -3, 99, 74}};
+  std::vector<int> table = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+  std::vector<float> probs(static_cast<size_t>(kBlockLabels), 0.0f);
+  probs[static_cast<size_t>(block_label("Table"))] = 0.7f;
+  probs[static_cast<size_t>(block_label("Text"))] = 0.2f;
+  const std::vector<OcrCell> none;
+  const std::vector<float> f = detail::table_features(p, table, none, probs, GridRule{});
+  const std::vector<std::string>& names = detail::table_feature_names();
+  ASSERT_EQ(f.size(), names.size());
+  auto at = [&](const char* name) { return f[static_cast<size_t>(std::find(names.begin(), names.end(), name) - names.begin())]; };
+  EXPECT_FLOAT_EQ(at("no_grid"), 1.0f);
+  EXPECT_NEAR(at("numbers"), 4.0 / 9, 1e-6);
+  EXPECT_FLOAT_EQ(at("p_table"), 0.7f);
+  EXPECT_FLOAT_EQ(at("p_text"), 0.2f);
+  EXPECT_FLOAT_EQ(at("h_rules"), 0.75f);  // three rules across over three rows, four row edges
+  EXPECT_NEAR(at("v_rules"), 1.0 / 2, 1e-6);  // one down over one column (no grid)
+  EXPECT_FLOAT_EQ(at("sentences"), 0.0f);
+  OcrPage kept = p, text = p;
+  GridRule on;
+  on.check = true;
+  on.check_keep = 0.0f;  // every probability over it: kept
+  detail::tables_by_geometry(kept, on);
+  EXPECT_EQ(labels_of(kept), (std::vector<std::string>{"Table"}));
+  on.check_keep = 1.01f;
+  detail::tables_by_geometry(text, on);
+  EXPECT_EQ(labels_of(text), (std::vector<std::string>{"Text", "Text"}));
+  EXPECT_TRUE(text.blocks[1].cells.empty());
+  EXPECT_EQ(text.blocks[0].lines, std::vector<int>{9});  // "x" its own block's again
+  EXPECT_EQ(texts_of(text.lines), texts_of(p.lines));
+}
+
+// The false-table check's fitted weights, for pages read by OCR and from their text layer: a ruled grid of numbers
+// under a header, sure the model's Table, is a table; two columns of sentences the model was unsure of, over a
+// picture, are not.
+TEST(Gate, TableCheckWeightsTellTablesFromText) {
+  auto page_of = [](bool table) {
+    OcrPage p;
+    p.width = 1000;
+    p.height = 1400;
+    if (table) {
+      const char* head[] = {"Group", "Mean", "SD", "n"};
+      for (int c = 0; c < 4; ++c) p.lines.push_back(gate_line({100.0 + 200 * c, 100, 160.0 + 200 * c, 120}, head[c], 1, 1));
+      for (int r = 0; r < 8; ++r) {
+        const double y = 130.0 + 25 * r;
+        p.lines.push_back(gate_line({100, y, 170, y + 20}, ("Site " + std::to_string(r + 1)).c_str(), 1, 1));
+        for (int c = 1; c < 4; ++c) {
+          p.lines.push_back(gate_line({100.0 + 200 * c, y, 150.0 + 200 * c, y + 20}, std::to_string(10 + r * c).c_str(), 1, 1));
+        }
+      }
+      p.rules = {{90, 95, 760, 97}, {90, 125, 760, 126}, {90, 330, 760, 332}};
+    } else {
+      for (int r = 0; r < 10; ++r) {
+        const double y = 100.0 + 25 * r;
+        p.lines.push_back(gate_line({100, y, 480, y + 20}, "the results of the trial were read again by two.", 1, 1));
+        p.lines.push_back(gate_line({520, y, 900, y + 20}, "and the samples were kept for a week at four degrees.", 1, 1));
+      }
+      p.pictures = {{80, 80, 920, 360}};
+    }
+    for (int k = 0; k < 30; ++k) {  // the rest of the page
+      p.lines.push_back(gate_line({100, 500.0 + 25 * k, 900, 520.0 + 25 * k}, "A line of the page's text.", 1, 1));
+    }
+    return p;
+  };
+  for (const bool text_layer : {false, true}) {
+    for (const bool table : {true, false}) {
+      OcrPage p = page_of(table);
+      std::vector<int> lines;
+      for (int i = 0; i < (table ? 36 : 20); ++i) lines.push_back(i);
+      p.blocks = {{"Table", 0.9f, lines, {}}};
+      std::vector<float> probs(static_cast<size_t>(kBlockLabels), 0.0f);
+      probs[static_cast<size_t>(block_label("Table"))] = table ? 0.95f : 0.55f;
+      probs[static_cast<size_t>(block_label("Text"))] = table ? 0.03f : 0.4f;
+      const std::vector<OcrCell> grid = detail::table_grid(p, lines, GridRule{});
+      const float prob = detail::table_probability(detail::table_features(p, lines, grid, probs, GridRule{}), text_layer);
+      if (table) {
+        EXPECT_GT(prob, 0.5f) << "text layer " << text_layer;
+      } else {
+        EXPECT_LT(prob, 0.5f) << "text layer " << text_layer;
+      }
+    }
+  }
+}
+
 // The detector alone (a text layer's page) finds the lines the engine reads, where it reads them.
 TEST(Engine, FindsALinesPlacesAlone) {
   const GrayImage page = load_image(kSet / "page.png");
@@ -1034,6 +1472,126 @@ TEST(Engine, TurnsByQuartersOfThreeBins) {
   half[7] = 9.0f;  // 210 degrees: the 180 quarter's
   EXPECT_EQ(detail::rotation_of(half, 0.65f, true), 180);
   EXPECT_EQ(detail::rotation_of(half, 0.65f), 0) << "the bin alone is not a quarter turn's";
+}
+
+// The turn a page's readings bear out, judged only where a reading reaches the floor (no veto without evidence).
+// A half turn stands unless the page reads surer as given; where neither reading is sure (a script the recognizer
+// cannot read either way up), orientation's turn as made without the check stands. A quarter turn goes the other way
+// round on the surer reading; an unsure sideways page turns to its surer side where that is surer than the page as
+// given and reaches the floor.
+TEST(Engine, TurnsTheReadingsBearOut) {
+  const TurnCheck c;  // floor 0.8
+  EXPECT_EQ(detail::settle_turn(180, 0.95, 0.60, c, 180), 180);
+  EXPECT_EQ(detail::settle_turn(180, 0.60, 0.95, c, 180), 0) << "upright text, taken for upside down";
+  EXPECT_EQ(detail::settle_turn(180, 0.85, 0.82, c, 180), 180);
+  EXPECT_EQ(detail::settle_turn(180, 0.82, 0.85, c, 180), 0);
+  EXPECT_EQ(detail::settle_turn(180, 0.90, 0.90, c, 180), 180) << "a tie vetoes nothing";
+  EXPECT_EQ(detail::settle_turn(180, 0.70, 0.50, c, 180), 180) << "no reading sure: orientation's turn";
+  EXPECT_EQ(detail::settle_turn(180, 0.50, 0.70, c, 180), 180) << "no reading sure: orientation's turn";
+  EXPECT_EQ(detail::settle_turn(180, 0.70, 0.50, c, 0), 0) << "the sums' half turn, unread: the bins' turn";
+  EXPECT_EQ(detail::settle_turn(90, 0.55, 0.93, c, 0), 270);
+  EXPECT_EQ(detail::settle_turn(270, 0.55, 0.93, c, 270), 90);
+  EXPECT_EQ(detail::settle_turn(90, 0.93, 0.55, c, 90), 90);
+  EXPECT_EQ(detail::settle_turn(90, 0.90, 0.90, c, 90), 90);
+  EXPECT_EQ(detail::settle_turn(90, 0.40, 0.70, c, 0), 90) << "neither reading sure: orientation's turn";
+  TurnCheck no_quarters = c;
+  no_quarters.quarters = false;
+  EXPECT_EQ(detail::settle_turn(90, 0.55, 0.93, no_quarters, 90), 90);
+  EXPECT_EQ(detail::settle_turn(0, 0.2, 0.99, c, 0), 0);
+  EXPECT_EQ(detail::settle_sideways(90, 0.30, 0.92, 0.50, c), 90);
+  EXPECT_EQ(detail::settle_sideways(90, 0.30, 0.50, 0.92, c), 270);
+  EXPECT_EQ(detail::settle_sideways(270, 0.30, 0.50, 0.92, c), 90);
+  EXPECT_EQ(detail::settle_sideways(90, 0.95, 0.92, 0.50, c), 0) << "the page reads best as given";
+  EXPECT_EQ(detail::settle_sideways(90, 0.30, 0.70, 0.60, c), 0) << "no sideways reading reaches the floor";
+  std::vector<float> z(13, 0.0f);
+  z[2] = z[3] = z[4] = 10.0f;
+  const detail::SidewaysMass right = detail::sideways_mass(z);
+  EXPECT_GT(right.right, 0.99);
+  EXPECT_LT(right.left, 0.01);
+  std::fill(z.begin(), z.end(), 0.0f);
+  z[9] = 10.0f;
+  EXPECT_GT(detail::sideways_mass(z).left, 0.99);
+  EXPECT_NEAR(detail::sideways_mass(std::vector<float>(13, 0.0f)).right, 3.0 / 13, 1e-9);
+}
+
+// The fake set's orientation model with other biases: its 13 logits' constant (`was`; the file's own 10 on upright),
+// found in the file by its bytes and written over.
+void set_orient_bias(const std::filesystem::path& file, const std::array<float, 13>& was,
+                     const std::array<float, 13>& bias) {
+  std::ifstream in(file, std::ios::binary);
+  std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  in.close();
+  const size_t at = bytes.find(std::string(reinterpret_cast<const char*>(was.data()), sizeof was));
+  ASSERT_NE(at, std::string::npos);
+  std::memcpy(bytes.data() + at, bias.data(), sizeof bias);
+  std::ofstream(file, std::ios::binary | std::ios::trunc) << bytes;
+}
+
+// The checks end to end, on the fake set, whose recognizer reads its bars as surely either way up: a half turn the
+// orientation model is sure of is read, both ways, and made, since the page reads no surer as given (a tie vetoes
+// nothing); with the check off, it is made unread. A quarter turn sure by its three bins' sum alone is made where
+// turns are read (and read both ways, and kept), not by a bin's probability. An unsure page whose sideways bins hold its probability is
+// read as given and turned both ways, and stays as given. Nothing is read where nothing may turn (turn_probability 2,
+// --as-given's).
+TEST(Engine, ReadsTurnsBeforeMakingThem) {
+  const std::filesystem::path set = std::filesystem::temp_directory_path() / "carbon-engine-turn-check-set";
+  std::filesystem::remove_all(set);
+  std::filesystem::copy(kSet, set, std::filesystem::copy_options::recursive);
+  const GrayImage page = load_image(set / "page.png");
+  std::array<float, 13> upright{}, half{}, quarter{}, sideways{};
+  upright[0] = 10.0f;
+  half[6] = 10.0f;
+  quarter[2] = quarter[3] = quarter[4] = 10.0f;  // a third on each bin: no bin sure, the quarter all of it
+  sideways = quarter;
+  sideways[8] = sideways[9] = sideways[10] = 10.0f;  // each side half: no quarter sure, the sideways bins all of it
+  set_orient_bias(set / "orient.onnx", upright, half);
+  {
+    const OcrPage p = Engine(set).ocr(page.view());
+    EXPECT_EQ(p.rotation, 180);
+    ASSERT_EQ(p.turn_reads.size(), 2u);
+    EXPECT_EQ(p.turn_reads[0].rotation, 180);
+    EXPECT_EQ(p.turn_reads[1].rotation, 0);
+    EXPECT_GT(p.turn_reads[0].sure, 0.9);
+    EXPECT_NEAR(p.turn_reads[0].sure, p.turn_reads[1].sure, 1e-6);
+    EXPECT_NE(p.json().find("\"turn_reads\": [{\"rotation\": 180, \"sure\": "), std::string::npos);
+    EngineOptions off;
+    off.turn_check.reset();
+    const OcrPage q = Engine(set, off).ocr(page.view());
+    EXPECT_EQ(q.rotation, 180);
+    EXPECT_TRUE(q.turn_reads.empty());
+    EXPECT_EQ(q.json().find("turn_reads"), std::string::npos);
+    EngineOptions never;
+    never.turn_probability = 2.0f;
+    const OcrPage r = Engine(set, never).ocr(page.view());
+    EXPECT_EQ(r.rotation, 0);
+    EXPECT_TRUE(r.turn_reads.empty());
+  }
+  set_orient_bias(set / "orient.onnx", half, quarter);
+  {
+    const OcrPage p = Engine(set).ocr(page.view());
+    EXPECT_EQ(p.rotation, 90);
+    ASSERT_EQ(p.turn_reads.size(), 2u);
+    EXPECT_EQ(p.turn_reads[1].rotation, 270);
+    EngineOptions off;
+    off.turn_check.reset();
+    EXPECT_EQ(Engine(set, off).ocr(page.view()).rotation, 0) << "no bin alone is sure";
+    EngineOptions bins;
+    bins.turn_check->sum_bins = false;
+    const OcrPage b = Engine(set, bins).ocr(page.view());
+    EXPECT_EQ(b.rotation, 0);
+    EXPECT_EQ(b.turn_reads.size(), 3u) << "unsure, and sideways: read three ways";
+  }
+  set_orient_bias(set / "orient.onnx", quarter, sideways);
+  {
+    const OcrPage p = Engine(set).ocr(page.view());
+    EXPECT_EQ(p.rotation, 0);
+    ASSERT_EQ(p.turn_reads.size(), 3u);
+    EXPECT_EQ(p.turn_reads[0].rotation, 0);
+    EXPECT_EQ(p.turn_reads[1].rotation, 90);
+    EXPECT_EQ(p.turn_reads[2].rotation, 270);
+    EXPECT_EQ(p.text(), "aaa\naaaaa\naa\n");
+  }
+  std::filesystem::remove_all(set);
 }
 
 // Five graded options (the characters' confidence on by default, the rest off): a tall page detected by its

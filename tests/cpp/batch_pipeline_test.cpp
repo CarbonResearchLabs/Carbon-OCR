@@ -101,6 +101,78 @@ TEST(BatchPipeline, ReadsPagesAsTheEngineDoes) {
   EXPECT_GT(got[3].ms.second_pass, 0.0);
 }
 
+// A page's tasks as the CPU engine reads them: read as given (the skewed page left as it is, orientation not
+// run), its lines found alone (submit_detect: LineFinder's on the CPU), read from those lines, and a page put in
+// order alone; each among ordinary pages, in the order given.
+TEST(BatchPipeline, ReadsAPagesTaskAsTheEngineDoes) {
+  const GrayImage page = load_image(kSet / "page.png");
+  const GrayImage skewed = rotate_page(page.view(), 2.5);
+  EngineOptions eo;
+  eo.pool.workers = 2;
+  Engine engine(kSet, eo);
+  PageTask as_given;
+  as_given.as_given = true;
+  engine.submit(GrayImage(skewed), as_given);
+  const OcrPage given = *engine.next();
+  const OcrPage found = LineFinder(kSet, eo).detect(page.view());
+  PageTask from;
+  from.found = std::make_shared<const OcrPage>(found);
+  engine.submit(GrayImage(page), from);
+  const OcrPage from_found = *engine.next();
+  OcrPage text_page = found;  // a page read otherwise, its lines given text, then ordered
+  for (size_t i = 0; i < text_page.lines.size(); ++i) text_page.lines[i].text = std::string(i + 1, 'b');
+  std::reverse(text_page.lines.begin(), text_page.lines.end());
+  text_page.source = "text layer";
+  std::vector<OcrPage> ordered = {text_page};
+  engine.order(ordered);
+  const OcrPage plain = engine.ocr(skewed.view());
+
+  Pipeline pipe(kSet, cpu_options());
+  pipe.submit(GrayImage(skewed));
+  pipe.submit(GrayImage(skewed), as_given);
+  pipe.submit_detect(GrayImage(page));
+  pipe.submit(GrayImage(page), from);
+  pipe.submit_order(text_page);
+  pipe.close();
+  expect_same(*pipe.next(), plain, 0);
+  const OcrPage g = *pipe.next();
+  expect_same(g, given, 1);
+  EXPECT_EQ(g.skew, 0.0);
+  const OcrPage d = *pipe.next();
+  ASSERT_EQ(d.lines.size(), found.lines.size());
+  for (size_t i = 0; i < d.lines.size(); ++i) {
+    EXPECT_TRUE(d.lines[i].text.empty());
+    EXPECT_DOUBLE_EQ(d.lines[i].box.x0, found.lines[i].box.x0);
+    EXPECT_DOUBLE_EQ(d.lines[i].box.y1, found.lines[i].box.y1);
+    EXPECT_FLOAT_EQ(d.lines[i].det_score, found.lines[i].det_score);
+  }
+  EXPECT_EQ(d.width, page.width);
+  EXPECT_EQ(d.picture_mask.width, found.picture_mask.width);
+  expect_same(*pipe.next(), from_found, 3);
+  const OcrPage o = *pipe.next();
+  ASSERT_EQ(o.lines.size(), ordered[0].lines.size());
+  for (size_t i = 0; i < o.lines.size(); ++i) EXPECT_EQ(o.lines[i].text, ordered[0].lines[i].text);
+  EXPECT_EQ(o.order, ordered[0].order);
+  EXPECT_FALSE(pipe.next().has_value());
+}
+
+// Orientation is not run where it cannot turn a page (a turn probability over 1): the same pages, no orient runs.
+TEST(BatchPipeline, NoOrientationWhereItCannotTurn) {
+  const GrayImage page = load_image(kSet / "page.png");
+  PipelineOptions o = cpu_options();
+  o.engine.turn_probability = 2.0f;
+  EngineOptions eo;
+  eo.pool.workers = 2;
+  eo.turn_probability = 2.0f;
+  const OcrPage want = Engine(kSet, eo).ocr(page.view());
+  Pipeline pipe(kSet, o);
+  const std::vector<GrayView> pages = {page.view(), page.view()};
+  const std::vector<OcrPage> got = pipe.ocr(pages);
+  expect_same(got[0], want, 0);
+  expect_same(got[1], want, 1);
+  EXPECT_EQ(pipe.stats().orient_runs, 0);
+}
+
 // A language model that dislikes every class but the blank's neighbours alike: each class costs ln 0.2, the line's
 // end ln 0.5. It counts its calls, from any thread.
 class Counting : public LanguageModel {

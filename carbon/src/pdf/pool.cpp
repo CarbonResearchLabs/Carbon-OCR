@@ -412,7 +412,10 @@ struct Call {
       o.lx1 = w.lx1;
       o.ly1 = w.ly1;
       o.size = w.size;
+      o.matrix_scale = w.matrix_scale;
+      o.angle = w.angle;
       o.mcid = w.mcid;
+      o.object = w.object;
       o.generated = w.flags & 1;
       o.bad_map = w.flags & 2;
       o.invisible = w.flags & 4;
@@ -496,7 +499,10 @@ PdfPage PdfPool::page(const std::filesystem::path& file, int page, double scale,
     Call c{h, helper_, file.string() + " page " + std::to_string(page)};
     c.run(page < 0 ? kExit : static_cast<Op>(kPage | (want << 8)), page, scale, key);
     PdfPage out;
+    int32_t turn = 0;
     c.get(&out.scale, 8);
+    c.get(&turn, 4);
+    out.turn = turn;
     if (want & kPdfImage) out.image = c.image(true);
     if (want & kPdfChars) out.chars = c.chars();
     if (want & kPdfPictures) out.pictures = c.pictures();

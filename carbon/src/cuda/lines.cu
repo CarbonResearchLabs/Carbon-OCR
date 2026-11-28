@@ -370,12 +370,11 @@ void crop_lines(std::span<const DevicePage> pages, std::span<const int32_t> page
       Buffer<DevicePage> d_pages(page_list, s);
       const unsigned bx = static_cast<unsigned>((max_w + kThreads - 1) / kThreads);
       crop_fused<<<dim3(bx, n), kThreads, shared, s>>>(d_regions.get(), d_pages.get(), h, out_width, kv, out);
-      check(cudaMemcpyAsync(widths, width_of.data(), n * sizeof(int32_t), cudaMemcpyHostToDevice, s),
-            "copy the widths");
+      mem::Staging::mine().upload(widths, width_of.data(), n * sizeof(int32_t), s);
       finish<<<n, kFinishThreads, 0, s>>>(widths, h, out_width, rule.flip_margin, rule.flip_needs_dark, out);
       check(cudaGetLastError(), "crop kernels");
-      // No sync: the buffers are freed in the stream's order, and the pageable copies were taken before they
-      // returned; the caller's next work on the stream follows the crops.
+      // No sync: the buffers are freed in the stream's order, and the host's tables went up through the staging
+      // ring, each room kept until its copy has run; the caller's next work on the stream follows the crops.
       return;
     }
   }
@@ -435,8 +434,7 @@ void crop_lines(std::span<const DevicePage> pages, std::span<const int32_t> page
                                                              d_tmp.get());
   vertical_pass<<<dim3(bx, h, n), kThreads, 0, s>>>(d_meta.get(), h, out_width, kv, d_vk.get(),
                                                     d_vfirst.get(), d_vcount.get(), d_tmp.get(), out);
-  check(cudaMemcpyAsync(widths, width_of.data(), n * sizeof(int32_t), cudaMemcpyHostToDevice, s),
-        "copy the widths");
+  mem::Staging::mine().upload(widths, width_of.data(), n * sizeof(int32_t), s);
   if (out_width % 4 == 0 && reinterpret_cast<uintptr_t>(out) % 4 == 0) {
     finish<<<n, kFinishThreads, 0, s>>>(widths, h, out_width, rule.flip_margin, rule.flip_needs_dark, out);
   } else {

@@ -155,6 +155,17 @@ class Pipeline {
   // Gives the pipeline a page, its number from 0 in the order given; waits while
   // in_flight pages are in it.  Throws Error after close, or once a stage failed.
   size_t submit(GrayImage page);
+  // A page read by its task (PageTask, carbon/engine.h): as given (no turn, so no orientation run, and no deskew),
+  // or from the lines found on it already (no detection), as the CPU engine reads such a page.
+  size_t submit(GrayImage page, PageTask task);
+  // A page's lines found and not read (a text layer's page, its words put into them: carbon/textlayer.h): the
+  // page as given at the detector's scale, detected in the detect stage's batches, its second pass where it takes
+  // one, as LineFinder::detect finds them on the CPU; its result their boxes and scores, its pictures and picture
+  // mask, no text.
+  size_t submit_detect(GrayImage page);
+  // A page read otherwise (from its text layer) put in reading order on the pipeline's CPU threads, as
+  // Engine::order puts it: its result that page in order.
+  size_t submit_order(OcrPage page);
   // No more pages: next() returns nullopt once every page given is out.
   void close();
   // The next page's result, in the order given; waits for it.  A page that met an

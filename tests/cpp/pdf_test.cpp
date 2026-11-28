@@ -74,6 +74,7 @@ TEST(Pdf, ReadsTheTextLayerOverItsInk) {
       text += c.code;
       EXPECT_FALSE(c.bad_map);
       EXPECT_FALSE(c.invisible);
+      EXPECT_EQ(c.object, 0) << "one show-text run";
       EXPECT_NEAR(c.size, 24.0f, 0.01f);
       // the loose box holds the tight one
       EXPECT_LE(c.lx0, c.x0 + 0.5f);
@@ -110,6 +111,137 @@ TEST(Pdf, FindsPictures) {
   EXPECT_NEAR(pictures[0].y0, 80, 0.5);
   EXPECT_NEAR(pictures[0].x1, 560, 0.5);
   EXPECT_NEAR(pictures[0].y1, 240, 0.5);
+}
+
+// Characters' angles on the page as shown (text.pdf's second page shows its text down the page), and a page
+// whose text runs sideways or upside down read upright (kPdfUpright): turned.pdf's pages, text.pdf's first drawn
+// turned by their content (and once shown upright by /Rotate), each read as text.pdf's first page is, its image
+// and characters turned; an upright page, and one /Rotate shows upright, not turned.
+TEST(Pdf, ReadsASidewaysPageUpright) {
+  PdfDocument text(data("text.pdf")), turned(data("turned.pdf"));
+  const double scale = 2.0;
+  auto angles = [](const std::vector<PdfChar>& chars) {
+    std::vector<float> out;
+    for (const PdfChar& c : chars) {
+      if (!c.generated) out.push_back(c.angle);
+    }
+    return out;
+  };
+  auto off = [](float angle, float want) {  // degrees between two angles, 0 to 180
+    const float d = std::fmod(std::abs(angle - want), 360.0f);
+    return std::min(d, 360.0f - d);
+  };
+  for (float a : angles(text.chars(0, scale))) EXPECT_LT(off(a, 0), 0.01) << a;
+  for (float a : angles(text.chars(1, scale))) EXPECT_LT(off(a, 90), 0.01) << a;  // down the page as shown
+  for (float a : angles(turned.chars(0, scale))) EXPECT_LT(off(a, 270), 0.01) << a;  // up it
+  for (float a : angles(turned.chars(2, scale))) EXPECT_LT(off(a, 180), 0.01) << a;
+  const unsigned want = kPdfImage | kPdfChars | kPdfPictures | kPdfUpright;
+  const PdfPage upright = text.page(0, scale, want);
+  EXPECT_EQ(upright.turn, 0);
+  EXPECT_EQ(upright.image.pixels, text.render(0, scale).pixels) << "an upright page as it is";
+  EXPECT_EQ(text.page(1, scale, want).turn, 3);
+  const std::vector<PdfChar> base = text.chars(0, scale);
+  for (int page : {0, 1, 2}) {
+    SCOPED_TRACE("turned.pdf page " + std::to_string(page));
+    const PdfPage p = turned.page(page, scale, want);
+    EXPECT_EQ(p.turn, page == 0 ? 1 : page == 1 ? 0 : 2);  // page 1: its /Rotate shows it upright already
+    ASSERT_EQ(p.image.width, 600);
+    ASSERT_EQ(p.image.height, 300);
+    EXPECT_LT(darkest(p.image, 410, 50, 510, 90), 10) << "the bar where text.pdf's first page has it";
+    EXPECT_EQ(darkest(p.image, 0, 0, 30, 30), 255);
+    ASSERT_EQ(p.chars.size(), base.size());
+    for (size_t i = 0; i < base.size(); ++i) {
+      const PdfChar &c = p.chars[i], &b = base[i];
+      EXPECT_EQ(c.code, b.code);
+      if (c.generated) continue;
+      EXPECT_LT(off(c.angle, 0), 0.01) << c.angle;
+      EXPECT_NEAR(c.x0, b.x0, 0.5);
+      EXPECT_NEAR(c.y0, b.y0, 0.5);
+      EXPECT_NEAR(c.x1, b.x1, 0.5);
+      EXPECT_NEAR(c.y1, b.y1, 0.5);
+      EXPECT_NEAR(c.lx0, b.lx0, 0.5);
+      EXPECT_NEAR(c.ly1, b.ly1, 0.5);
+      if (c.code != U' ') EXPECT_LT(darkest(p.image, c.x0, c.y0, c.x1, c.y1), 100) << "no ink under it";
+    }
+    EXPECT_EQ(turned.page(page, scale, kPdfImage | kPdfChars).turn, 0) << "turned only when asked";
+  }
+  // a line of three runs shown upside down: PDFium reads a page's runs as shown (upside down, the last first), so
+  // the page is read turned as an upright page is, its runs in their order
+  auto text_of = [](const std::vector<PdfChar>& chars) {
+    std::u32string s;
+    for (const PdfChar& c : chars) s += c.code;
+    return s;
+  };
+  EXPECT_EQ(text_of(turned.chars(3, scale)), U" 12 PDF Hello") << "as shown";
+  const PdfPage runs = turned.page(3, scale, want);
+  EXPECT_EQ(runs.turn, 2);
+  EXPECT_EQ(text_of(runs.chars), U"Hello PDF 12");
+  const PdfPage chars_only = turned.page(0, scale, kPdfUpright);
+  EXPECT_EQ(chars_only.turn, 1);
+  EXPECT_TRUE(chars_only.chars.empty());
+  EXPECT_TRUE(chars_only.image.pixels.empty());
+  // read turned, the document is as it was: the page shown as before, its characters as shown
+  EXPECT_DOUBLE_EQ(turned.page_size(0).width, 150);
+  EXPECT_EQ(turned.render(0, scale).width, 300);
+  for (float a : angles(turned.chars(0, scale))) EXPECT_LT(off(a, 270), 0.01) << a;
+#if defined(CARBON_PDF_HELPER)
+  PdfPool pool(1, CARBON_PDF_HELPER);
+  const PdfPage q = pool.page(data("turned.pdf"), 0, scale, want), d = turned.page(0, scale, want);
+  EXPECT_EQ(q.turn, 1);
+  EXPECT_EQ(q.image.pixels, d.image.pixels);
+  ASSERT_EQ(q.chars.size(), d.chars.size());
+  for (size_t i = 0; i < q.chars.size(); ++i) {
+    EXPECT_EQ(q.chars[i].angle, d.chars[i].angle);
+    EXPECT_EQ(q.chars[i].x0, d.chars[i].x0);
+  }
+#endif
+}
+
+// A PDF's scripts by PDFium's own geometry (scripts.pdf): a subscript set smaller and lowered by its text rise, a
+// superscript on a line whose fonts are set at 1 pt in a text matrix scaled 24 times (its size as drawn, size times
+// matrix_scale), marked in the layer's lines.
+TEST(Pdf, ReadsAPdfsScripts) {
+  PdfDocument doc(data("scripts.pdf"));
+  const std::vector<PdfChar> chars = doc.chars(0, 2.0);
+  const TextLayer t = read_text_layer(chars, GrayView{nullptr, 0, 0, 0});
+  ASSERT_EQ(t.lines.size(), 2u);  // in the order drawn
+  EXPECT_EQ(t.lines[0].text, "H2O is wet");
+  EXPECT_EQ(t.lines[0].scripts, (std::vector<TextScript>{{1, 2, true}}));
+  EXPECT_EQ(t.lines[1].text, "E = mc2");
+  EXPECT_EQ(t.lines[1].scripts, (std::vector<TextScript>{{6, 7, false}}));
+  int last = -1, objects = 0;  // H, 2, "O is wet", "E = mc", 2: five show-text runs
+  for (const PdfChar& c : chars) {
+    if (c.generated) continue;
+    if (c.object != last) ++objects;
+    last = c.object;
+  }
+  EXPECT_EQ(objects, 5);
+  for (const PdfChar& c : chars) {
+    if (c.generated || c.code == U' ') continue;
+    if (c.ly1 < 120) {  // the scaled line, at the top of the page
+      EXPECT_NEAR(c.size, c.code == U'2' ? 0.667f : 1.0f, 0.001f);
+      EXPECT_NEAR(c.matrix_scale, 24.0f, 0.01f);
+    } else {
+      EXPECT_NEAR(c.matrix_scale, 1.0f, 0.001f);
+    }
+  }
+}
+
+// Pages render into one kept buffer: a page after a larger one and a smaller one is the same bytes as at first,
+// and a page too large to keep (over 64 MiB of BGRx) renders into its own, its ink where it is.
+TEST(Pdf, RendersIntoAKeptBuffer) {
+  PdfDocument doc(data("text.pdf")), other(data("figure.pdf"));
+  const GrayImage first = doc.render(0, 2.0);
+  const GrayImage large = other.render(0, 6.0), small = doc.render(1, 0.5);
+  EXPECT_EQ(doc.render(0, 2.0).pixels, first.pixels);
+  EXPECT_EQ(other.render(0, 6.0).pixels, large.pixels);
+  EXPECT_EQ(doc.render(1, 0.5).pixels, small.pixels);
+  const GrayImage huge = doc.render(0, 20.0);  // 6000 x 3000 px: 72 MB of BGRx
+  ASSERT_EQ(huge.width, 6000);
+  ASSERT_EQ(huge.height, 3000);
+  EXPECT_LT(darkest(huge, 4100, 500, 5100, 900), 10) << "the bar";
+  EXPECT_EQ(darkest(huge, 0, 0, 300, 300), 255);
+  EXPECT_EQ(doc.render(0, 2.0).pixels, first.pixels) << "and the kept buffer after it";
 }
 
 TEST(Pdf, RefusesWhatIsNotAPdf) {
@@ -321,7 +453,8 @@ TEST(PdfPool, APagesPartsInOneRequestAreItsOwnCalls) {
     for (size_t i = 0; i < a.size(); ++i) {
       const PdfChar &x = a[i], &y = b[i];
       if (x.code != y.code || x.x0 != y.x0 || x.y0 != y.y0 || x.x1 != y.x1 || x.y1 != y.y1 || x.lx0 != y.lx0 ||
-          x.ly0 != y.ly0 || x.lx1 != y.lx1 || x.ly1 != y.ly1 || x.size != y.size || x.generated != y.generated ||
+          x.ly0 != y.ly0 || x.lx1 != y.lx1 || x.ly1 != y.ly1 || x.size != y.size || x.angle != y.angle ||
+          x.matrix_scale != y.matrix_scale || x.object != y.object || x.generated != y.generated ||
           x.bad_map != y.bad_map || x.invisible != y.invisible || x.mcid != y.mcid) {
         return false;
       }

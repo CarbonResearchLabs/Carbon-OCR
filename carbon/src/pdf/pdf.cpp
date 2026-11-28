@@ -20,10 +20,12 @@
 #include <algorithm>
 #include <cmath>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include "carbon/cpu.h"
 #include "carbon/error.h"
+#include "carbon/textlayer.h"
 
 namespace carbon {
 namespace {
@@ -117,18 +119,64 @@ struct PageRef {  // a loaded page, as Page names it
   FPDF_PAGE p;
 };
 
+// The page as shown at `scale` pixels a point, its size in whole pixels.
+struct Device {
+  int w, h;
+};
+Device device_of(FPDF_PAGE pg, double scale) {
+  return {std::max(1, static_cast<int>(std::lround(FPDF_GetPageWidthF(pg) * scale))),
+          std::max(1, static_cast<int>(std::lround(FPDF_GetPageHeightF(pg) * scale)))};
+}
+
+// A page read turned (kPdfUpright): its /Rotate turned `turn` quarters more while it is read, then put back. PDFium
+// renders a page and reads its text as the page is shown: it orders the characters, and infers its own spaces and
+// line breaks, by the text's way on the page as shown (text upside down reads to it right to left), so a page
+// turned so is rendered and read as an upright page is.
+class Turned {
+ public:
+  Turned(FPDF_PAGE p, int turn) : p_(p), rotate_(std::max(0, FPDFPage_GetRotation(p))), turn_(turn) {
+    if (turn_) FPDFPage_SetRotation(p_, (rotate_ + turn_) % 4);
+  }
+  ~Turned() {
+    if (turn_) FPDFPage_SetRotation(p_, rotate_);  // the document as it was
+  }
+  Turned(const Turned&) = delete;
+  Turned& operator=(const Turned&) = delete;
+
+ private:
+  FPDF_PAGE p_;
+  int rotate_, turn_;
+};
+
+// The BGRx bytes pages render into, one buffer for the process (its calls hold the lock), grown to the largest
+// page and kept, so a helper's pages do not each allocate (and fault in) a bitmap of their own; a page over kKeep
+// bytes renders into a buffer of its own, freed after it.
+std::vector<uint8_t>& canvas() {
+  static std::vector<uint8_t> bytes;
+  return bytes;
+}
+constexpr size_t kKeep = size_t{64} << 20;  // holds a Letter or A4 page's BGRx at 400 dpi
+
 // The page's gray at scale, as render gives it: into `into` when it fits into_bytes (out.pixels then empty).
 void render_page(FPDF_PAGE pg, const std::string& path, int page, double scale, GrayImage& out, uint8_t* into,
                  size_t into_bytes) {
   const PageRef p{pg};
-  const int w = std::max(1, static_cast<int>(std::lround(FPDF_GetPageWidthF(p.p) * scale)));
-  const int h = std::max(1, static_cast<int>(std::lround(FPDF_GetPageHeightF(p.p) * scale)));
+  const auto [w, h] = device_of(p.p, scale);
   if (static_cast<int64_t>(w) * h > (int64_t{1} << 30)) {
     throw Error(path + ": page " + std::to_string(page) + " at this scale is " + std::to_string(w) + " x " +
                 std::to_string(h) + " px");
   }
-  FPDF_BITMAP bmp = FPDFBitmap_Create(w, h, 0);  // BGRx
-  if (!bmp) throw Error("PDFium: no memory for a " + std::to_string(w) + " x " + std::to_string(h) + " page");
+  const int stride = 4 * w;  // BGRx, as FPDFBitmap_Create lays it out
+  const size_t need = static_cast<size_t>(stride) * h;
+  std::vector<uint8_t> own;
+  std::vector<uint8_t>& buf = need <= kKeep ? canvas() : own;
+  try {
+    if (buf.size() < need) buf.resize(need);
+  } catch (const std::bad_alloc&) {
+    throw Error("PDFium: no memory for a " + std::to_string(w) + " x " + std::to_string(h) + " page");
+  }
+  FPDF_BITMAP bmp = FPDFBitmap_CreateEx(w, h, FPDFBitmap_BGRx, buf.data(), stride);
+  if (!bmp) throw Error("PDFium: no bitmap for a " + std::to_string(w) + " x " + std::to_string(h) + " page");
   FPDFBitmap_FillRect(bmp, 0, 0, w, h, 0xFFFFFFFF);
   FPDF_RenderPageBitmap(bmp, p.p, 0, 0, w, h, 0, FPDF_ANNOT | FPDF_PRINTING);
   out.width = w;
@@ -147,8 +195,7 @@ void render_page(FPDF_PAGE pg, const std::string& path, int page, double scale, 
 std::vector<LineBox> page_pictures(FPDF_PAGE pg, double scale) {
   const PageRef p{pg};
   constexpr int kFine = 64;  // as in chars(): FPDF_PageToDevice rounds to whole pixels
-  const int dw = std::max(1, static_cast<int>(std::lround(FPDF_GetPageWidthF(p.p) * scale * kFine)));
-  const int dh = std::max(1, static_cast<int>(std::lround(FPDF_GetPageHeightF(p.p) * scale * kFine)));
+  const auto [dw, dh] = device_of(p.p, scale * kFine);
   std::vector<LineBox> out;
   const int n = FPDFPage_CountObjects(p.p);
   for (int i = 0; i < n; ++i) {
@@ -156,7 +203,7 @@ std::vector<LineBox> page_pictures(FPDF_PAGE pg, double scale) {
     if (!obj || FPDFPageObj_GetType(obj) != FPDF_PAGEOBJ_IMAGE) continue;
     float l = 0, b = 0, r = 0, t = 0;
     if (!FPDFPageObj_GetBounds(obj, &l, &b, &r, &t)) continue;
-    int x0, y0, x1, y1;
+    int x0, y0, x1, y1;  // two opposite corners: any rotation keeps them opposite
     FPDF_PageToDevice(p.p, 0, 0, dw, dh, 0, l, t, &x0, &y0);
     FPDF_PageToDevice(p.p, 0, 0, dw, dh, 0, r, b, &x1, &y1);
     LineBox box{std::min(x0, x1) / static_cast<double>(kFine), std::min(y0, y1) / static_cast<double>(kFine),
@@ -174,27 +221,38 @@ std::vector<PdfChar> page_chars(FPDF_PAGE pg, double scale) {
   // pixels at `scale`: FPDF_PageToDevice, on a device 64 times as large, since it
   // rounds to whole pixels.
   constexpr int kFine = 64;
-  const double fw = FPDF_GetPageWidthF(p.p) * scale * kFine, fh = FPDF_GetPageHeightF(p.p) * scale * kFine;
-  const int dw = std::max(1, static_cast<int>(std::lround(fw))), dh = std::max(1, static_cast<int>(std::lround(fh)));
+  const auto [dw, dh] = device_of(p.p, scale * kFine);
   auto device = [&](double px, double py, float& dx, float& dy) {
     int ix = 0, iy = 0;
     FPDF_PageToDevice(p.p, 0, 0, dw, dh, 0, px, py, &ix, &iy);
     dx = static_cast<float>(ix) / kFine;
     dy = static_cast<float>(iy) / kFine;
   };
+  // PDFium's angle is the page's own space's, clockwise as the page is drawn; as shown, its /Rotate added
+  const double shown = 90.0 * std::max(0, FPDFPage_GetRotation(p.p));
+  constexpr double kPi = 3.14159265358979323846;
   std::vector<PdfChar> out;
   const int n = FPDFText_CountChars(text);
   out.reserve(std::max(0, n));
   int mcid = -1;
+  std::unordered_map<FPDF_PAGEOBJECT, int> objects;  // each text object's number, in the order first read
   for (int i = 0; i < n; ++i) {
     PdfChar c;
     c.code = static_cast<char32_t>(FPDFText_GetUnicode(text, i));
     c.generated = FPDFText_IsGenerated(text, i) == 1;
     c.bad_map = FPDFText_HasUnicodeMapError(text, i) == 1;
     c.size = static_cast<float>(FPDFText_GetFontSize(text, i));
+    FS_MATRIX m{};
+    if (FPDFText_GetMatrix(text, i, &m)) {  // the length the glyph's up unit takes on the page
+      const double up = std::hypot(static_cast<double>(m.c), static_cast<double>(m.d));
+      if (up > 0 && std::isfinite(up)) c.matrix_scale = static_cast<float>(up);
+    }
+    const float angle = FPDFText_GetCharAngle(text, i);  // radians, [0, 2 pi); -1 for none
+    c.angle = angle < 0 ? -1.0f : static_cast<float>(std::fmod(angle * 180.0 / kPi + shown, 360.0));
     if (FPDF_PAGEOBJECT obj = FPDFText_GetTextObject(text, i)) {
       c.invisible = FPDFTextObj_GetTextRenderMode(obj) == FPDF_TEXTRENDERMODE_INVISIBLE;
       mcid = FPDFPageObj_GetMarkedContentID(obj);
+      c.object = objects.emplace(obj, static_cast<int>(objects.size())).first->second;
     } else if (!c.generated) {
       mcid = -1;
     }
@@ -346,8 +404,14 @@ PdfPage PdfDocument::page(int page, double scale, unsigned want, uint8_t* into, 
   PdfPage out;
   if (!(scale > 0)) scale = page_auto_scale(p.p);
   out.scale = scale;
+  std::vector<PdfChar> shown;  // the characters as shown say the turn
+  if (want & kPdfUpright) {
+    shown = page_chars(p.p, scale);
+    out.turn = upright_turn(shown);
+  }
+  const Turned turned(p.p, out.turn);  // the rest read turned, where there is a turn
+  if (want & kPdfChars) out.chars = (want & kPdfUpright) && !out.turn ? std::move(shown) : page_chars(p.p, scale);
   if (want & kPdfImage) render_page(p.p, impl_->path, page, scale, out.image, into, into_bytes);
-  if (want & kPdfChars) out.chars = page_chars(p.p, scale);
   if (want & kPdfPictures) out.pictures = page_pictures(p.p, scale);
   if (want & kPdfStructure) out.structure = page_structure(p.p);
   return out;

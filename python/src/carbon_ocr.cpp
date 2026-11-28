@@ -354,9 +354,34 @@ NB_MODULE(carbon_ocr, m) {
              int beam_topk, float beam_gate, float beam_blank_skip, std::optional<std::filesystem::path> lm,
              std::optional<float> lm_alpha, std::optional<float> lm_beta, std::optional<std::filesystem::path> tlm,
              std::optional<float> tlm_alpha, std::optional<int> tlm_gpu, bool grid, bool blocks_first,
-             bool turn_by_quarters, double max_skew, double wide_skew_gain, double bullet_join, double dash_cell,
-             double sliver_thin, const std::string& lm_mode, std::optional<float> lm_gate) {
+             bool turn_by_quarters, bool turn_check, double max_skew, double wide_skew_gain, double bullet_join,
+             double dash_cell, double sliver_thin, const std::string& lm_mode, std::optional<float> lm_gate,
+             float beam_span, int beam_span_margin, std::optional<nb::dict> lm_kinds) {
             carbon::EngineOptions o;
+            o.beam.span = beam_span;
+            o.beam.span_margin = beam_span_margin;
+            if (lm_kinds) {
+              for (auto [key, value] : *lm_kinds) {
+                const std::string name = nb::cast<std::string>(key);
+                const auto kind = carbon::parse_line_kind(name);
+                if (!kind) throw carbon::Error("lm_kinds: \"" + name + "\" is not a kind (prose, mixed, code)");
+                carbon::EngineOptions::KindWeights& w = o.lm_kinds[static_cast<size_t>(*kind)];
+                const nb::dict d = nb::cast<nb::dict>(value);
+                for (auto [field, v] : d) {
+                  const std::string f = nb::cast<std::string>(field);
+                  const float x = nb::cast<float>(v);
+                  if (f == "alpha") {
+                    w.alpha = x;
+                  } else if (f == "beta") {
+                    w.beta = x;
+                  } else if (f == "gate") {
+                    w.gate = x;
+                  } else {
+                    throw carbon::Error("lm_kinds: \"" + f + "\" is not alpha, beta or gate");
+                  }
+                }
+              }
+            }
             const auto mode = carbon::parse_lm_mode(lm_mode);
             if (!mode) throw carbon::Error("lm_mode \"" + lm_mode + "\": auto, none, ngram, transformer or both");
             o.lm_mode = *mode;
@@ -364,6 +389,7 @@ NB_MODULE(carbon_ocr, m) {
             if (!grid) o.grid.reset();
             o.order.blocks_first = blocks_first;
             o.turn_by_quarters = turn_by_quarters;
+            if (!turn_check) o.turn_check.reset();
             if (!(max_skew >= 0 && max_skew <= 45)) throw carbon::Error("max_skew is in [0, 45]");
             o.max_skew = max_skew;
             o.wide_skew_gain = wide_skew_gain;
@@ -421,10 +447,12 @@ NB_MODULE(carbon_ocr, m) {
           "lm"_a = nb::none(), "lm_alpha"_a = nb::none(), "lm_beta"_a = nb::none(), "tlm"_a = nb::none(),
           "tlm_alpha"_a = nb::none(), "tlm_gpu"_a = nb::none(), "grid"_a = true,
           "blocks_first"_a = carbon::OrderRule{}.blocks_first,
-          "turn_by_quarters"_a = carbon::EngineOptions{}.turn_by_quarters, "max_skew"_a = carbon::EngineOptions{}.max_skew,
+          "turn_by_quarters"_a = carbon::EngineOptions{}.turn_by_quarters, "turn_check"_a = true,
+          "max_skew"_a = carbon::EngineOptions{}.max_skew,
           "wide_skew_gain"_a = carbon::EngineOptions{}.wide_skew_gain, "bullet_join"_a = carbon::GateRule{}.bullet_join,
           "dash_cell"_a = carbon::GateRule{}.dash_cell, "sliver_thin"_a = carbon::GateRule{}.sliver_thin,
-          "lm_mode"_a = "auto", "lm_gate"_a = nb::none(),
+          "lm_mode"_a = "auto", "lm_gate"_a = nb::none(), "beam_span"_a = carbon::BeamRule{}.span,
+          "beam_span_margin"_a = carbon::BeamRule{}.span_margin, "lm_kinds"_a = nb::none(),
           "A Fullerene set's directory (orient.onnx, det.onnx, <rec>.onnx, <rec>.vocab.json, and order.native.bin "
           "or order.onnx where it has one; order_model another); workers 0 is one per physical core. precision: "
           "the models' files, \"auto\" (the fastest the set has), \"fp32\", \"fp16\" or \"int8\" "
@@ -441,8 +469,13 @@ NB_MODULE(carbon_ocr, m) {
           "\"auto\" (the default) leaves the beam and the models as the options above set them. grid: the order model's tables by geometry "
           "(carbon::GridRule; False: the model's cells). blocks_first: blocks as the same-block head's clusters "
           "(carbon::OrderRule). turn_by_quarters, max_skew (0 to 45), wide_skew_gain: orientation by quarter turns "
-          "and deskew past 5 degrees (carbon::EngineOptions). bullet_join, dash_cell, sliver_thin: the gate's marks "
-          "and slivers (carbon::GateRule; 0 turns each off).")
+          "and deskew past 5 degrees (carbon::EngineOptions). turn_check: turns read before they are made, a "
+          "quarter turn's probability then its three bins' sum (carbon::TurnCheck; False: orientation's turn alone, by "
+          "a bin's probability unless turn_by_quarters). bullet_join, dash_cell, sliver_thin: the gate's marks "
+          "and slivers (carbon::GateRule; 0 turns each off). beam_span, beam_span_margin: span-level decoding, the "
+          "sure frames read as greedy reads them (carbon::BeamRule::span; 0: off). lm_kinds: the beam's weights by "
+          "the kind of line (carbon::EngineOptions::lm_kinds), {\"prose\" | \"mixed\" | \"code\": {\"alpha\", "
+          "\"beta\", \"gate\"}}, each kind's own over the beam's.")
       .def_prop_ro("workers", &carbon::Engine::workers)
       .def(
           "ocr",
@@ -622,7 +655,9 @@ NB_MODULE(carbon_ocr, m) {
         const size_t h = static_cast<size_t>(img.height), w = static_cast<size_t>(img.width);
         return owned(std::move(img.pixels), {h, w});  // the decoder's own buffer, not a copy
       },
-      "path"_a, "A PNG, JPEG, BMP or PNM page as grayscale uint8 [h, w], as the engine reads it.");
+      "path"_a,
+      "A PNG, JPEG, BMP, PNM, GIF (its first frame) or WebP page, its format by its first bytes, as grayscale "
+      "uint8 [h, w], as the engine reads it.");
   m.attr("__version__") = std::string(carbon::kVersion);
   const carbon::CropRule d;
   m.attr("HEIGHT") = d.height;
@@ -918,7 +953,8 @@ NB_MODULE(carbon_ocr, m) {
       "ctc_beam",
       [](nb::ndarray<const float, nb::ndim<3>, nb::c_contig, nb::device::cpu> logits,
          nb::ndarray<const int32_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> lengths, int width, int topk,
-         float blank_skip, float alpha, float beta, std::shared_ptr<carbon::NgramModel> lm) {
+         float blank_skip, float alpha, float beta, std::shared_ptr<carbon::NgramModel> lm, float span,
+         int span_margin) {
         const int n = static_cast<int>(logits.shape(0)), c = static_cast<int>(logits.shape(1)),
                   t = static_cast<int>(logits.shape(2));
         if (static_cast<int>(lengths.shape(0)) < n) throw carbon::Error("ctc_beam: lengths is shorter than the batch");
@@ -928,6 +964,8 @@ NB_MODULE(carbon_ocr, m) {
         r.blank_skip = blank_skip;
         r.alpha = alpha;
         r.beta = beta;
+        r.span = span;
+        r.span_margin = span_margin;
         std::vector<carbon::CtcLine> lines(static_cast<size_t>(n));
         std::vector<double> scores(static_cast<size_t>(n));
         {
@@ -943,12 +981,18 @@ NB_MODULE(carbon_ocr, m) {
         return std::make_pair(to_python(std::move(lines)), std::move(scores));
       },
       "logits"_a, "lengths"_a, "width"_a = 8, "topk"_a = 5, "blank_skip"_a = 0.999f, "alpha"_a = 0.0f, "beta"_a = 0.0f,
-      nb::arg("lm").none() = nb::none(),
+      nb::arg("lm").none() = nb::none(), "span"_a = carbon::BeamRule{}.span,
+      "span_margin"_a = carbon::BeamRule{}.span_margin,
       "The engine's CTC prefix beam (carbon/beam.h) over logits [n, classes, frames] (or their log-softmax), line i "
       "its first lengths[i] frames, each frame's topk likeliest classes but the blank (at most classes - 1) and the "
-      "blank, with an NgramModel `lm` weighed by alpha (beta a character's bonus). Width 1 is greedy. Returns "
-      "(lines, scores): per line (ids, start frames, probabilities) as ctc_greedy's, and its ln P over the frames' "
-      "candidates, or with a model its score, that plus alpha times the model's plus beta a character.");
+      "blank, with an NgramModel `lm` weighed by alpha (beta a character's bonus). Width 1 is greedy. span (0: off) "
+      "reads the frames sure to at least that probability, span_margin frames from any less sure, as greedy does "
+      "(BeamRule::span). Returns (lines, scores): per line (ids, start frames, probabilities) as ctc_greedy's, and its "
+      "ln P over the frames' candidates, or with a model its score, that plus alpha times the model's plus beta a "
+      "character.");
+  m.def("line_kind", [](const std::string& text) { return std::string(carbon::line_kind_name(carbon::line_kind(text))); },
+        "text"_a,
+        "A line's kind by its characters (carbon::line_kind): \"code\" (digits and codes), \"prose\" or \"mixed\".");
 
   nb::class_<carbon::NgramModel>(m, "NgramModel",
                                  "An n-gram language model over a recognizer's classes (carbon/lm.h), its file mapped.")

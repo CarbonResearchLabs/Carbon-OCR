@@ -153,6 +153,35 @@ std::shared_ptr<NgramModel> NgramModel::open(const std::filesystem::path& file) 
   m->bits_ = static_cast<int>(h->bits);
   m->max_ctx_ = static_cast<int>(h->order) - 1;
   m->token_mask_ = (uint64_t{1} << h->bits) - 1;
+  if (m->version_ == 2) {
+    // score's value is bo + lp: lp one order's log-probability (a unigram's, or a code of order 2 .. N), bo the
+    // back-off weights it passed through, at most one of each order 1 .. N - 1 (a unigram's for a context of one
+    // token, else a code of that order). A codebook may hold values no n-gram uses; the bound only grows.
+    double lp = -std::numeric_limits<double>::infinity(), bo = 0;
+    bool nan = false;  // a value that is not a number: no bound
+    float uni_bow = 0.0f;
+    for (uint32_t t = 0; t <= h->classes; ++t) {
+      nan = nan || std::isnan(m->uni_[t].logp) || std::isnan(m->uni_[t].bow);
+      lp = std::max(lp, static_cast<double>(m->uni_[t].logp));
+      uni_bow = std::max(uni_bow, m->uni_[t].bow);
+    }
+    bo += uni_bow;
+    for (uint32_t n = 2; n <= h->order; ++n) {
+      const float* cb = m->codes_ + static_cast<size_t>(n) * 2 * kNgramCodes;
+      float bow = 0.0f;
+      for (int i = 0; i < kNgramCodes; ++i) {
+        nan = nan || std::isnan(cb[i]) || std::isnan(cb[kNgramCodes + i]);
+        lp = std::max(lp, static_cast<double>(cb[i]));
+        if (n < h->order) bow = std::max(bow, cb[kNgramCodes + i]);
+      }
+      bo += bow;
+    }
+    // a margin far over the float sums' rounding (bo + lp is summed in float, a term at a time)
+    const double bound = lp + bo + 1e-3 * (1.0 + std::abs(lp) + bo);
+    m->max_score_ = !nan && std::isfinite(bound)
+                        ? std::nextafter(static_cast<float>(bound), std::numeric_limits<float>::infinity())
+                        : std::numeric_limits<float>::infinity();
+  }
   return m;
 }
 

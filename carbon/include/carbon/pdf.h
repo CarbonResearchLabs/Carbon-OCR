@@ -37,11 +37,19 @@ struct PdfChar {
   // made of), in the same pixels.
   float lx0 = 0, ly0 = 0, lx1 = 0, ly1 = 0;
   float size = 0;          // the font size, points
+  // Its matrix's scale up the glyph (FPDFText_GetMatrix): the font drawn at size times this, in the page's points
+  // (a PDF may set every font at 1 and scale its text matrix).
+  float matrix_scale = 1;
+  // The way its text runs, degrees clockwise from the page's x axis (PDFium's character angle), on the page as
+  // read: as shown (its /Rotate in it), then turned as PdfPage::turn says; -1 where PDFium gives none.
+  float angle = 0;
   bool generated = false;  // made by PDFium (a space or a line break it infers), not drawn
   bool bad_map = false;    // the font's Unicode map for it is broken
   bool invisible = false;  // drawn neither filled nor stroked (text render mode 3): an OCR layer
   int mcid = -1;           // its marked content's ID (a tagged PDF's), -1 for none; a generated
                            // space or break takes the character's before it
+  int object = -1;         // its text object on the page (one show-text run of one font), numbered from 0 in the
+                           // order PDFium first reads them; -1 for none
 };
 
 // A tagged page's structure tree, as PDFium reads it for the page (a document whose
@@ -64,10 +72,14 @@ enum PdfWant : unsigned {
   kPdfChars = 2,
   kPdfPictures = 4,
   kPdfStructure = 8,
+  // The page read turned upright where its text layer runs sideways (carbon/textlayer.h, upright_turn): its
+  // characters read first, then its image, characters and pictures read turned by PdfPage::turn.
+  kPdfUpright = 16,
 };
 
 struct PdfPage {
   double scale = 0;               // the scale it was read at: the one asked, or auto's
+  int turn = 0;                   // kPdfUpright: the quarter turns clockwise it was read at, from the page as shown
   GrayImage image;                // kPdfImage: as render gives it
   std::vector<PdfChar> chars;     // kPdfChars: as chars
   std::vector<LineBox> pictures;  // kPdfPictures: as pictures
@@ -86,7 +98,9 @@ class PdfDocument {
   PdfPageSize page_size(int page) const;
 
   // The page as shown, in gray (paper 255), at `scale` pixels a point (dpi / 72):
-  // white paper under it, its annotations drawn, as printed.
+  // white paper under it, its annotations drawn, as printed.  PDFium draws it into
+  // one BGRx buffer the process keeps, grown to the largest page up to 64 MiB
+  // (a helper allocates it once, not a page); a larger page into its own.
   GrayImage render(int page, double scale) const;
 
   // Its text layer: every character, in the order PDFium reads them, boxes at `scale`.
@@ -103,9 +117,10 @@ class PdfDocument {
   // Pixels a point.
   double auto_scale(int page) const;
 
-  // What `want` (PdfWant bits) asks, from one load of the page: each part as its own call gives it.  into: where
-  // the image's gray goes when it fits into_bytes (image.pixels then stays empty, its width and height set).
-  // scale 0 (--dpi auto): the page's own, auto_scale's.
+  // What `want` (PdfWant bits) asks, from one load of the page: each part as its own call gives it, or with
+  // kPdfUpright as the page turned upright gives it.  into: where the image's gray goes when it fits into_bytes
+  // (image.pixels then stays empty, its width and height set).  scale 0 (--dpi auto): the page's own,
+  // auto_scale's.
   PdfPage page(int page, double scale, unsigned want, uint8_t* into = nullptr, size_t into_bytes = 0) const;
 
  private:

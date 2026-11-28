@@ -44,6 +44,7 @@
 #include <bit>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <span>
 #include <string>
@@ -159,6 +160,10 @@ class NgramModel final : public LanguageModel {
   uint64_t start() const override;
   float score(uint64_t state, int32_t c, uint64_t& next) const override;
   float end(uint64_t state) const override;
+  // A version 2 file's bound from its values alone: the largest log-probability any order holds, plus the largest
+  // back-off weight of each order a query can back off through where it is positive (a query adds each order's at
+  // most once), plus a margin for float sums. +inf for version 1 (its values are in its tables, not codebooks).
+  float max_score() const override { return max_score_; }
   // Many queries at once, their tables' slots prefetched a round ahead of the probes that read them: a probe that
   // misses the cache waits beside the others, not before them.
   void score_batch(std::span<const uint64_t> states, std::span<const int32_t> classes, std::span<float> out,
@@ -198,6 +203,7 @@ class NgramModel final : public LanguageModel {
   const float* codes_ = nullptr;                          // version 2: [n][0 logp, 1 bow][256]
   int bits_ = 0, max_ctx_ = 0;
   uint64_t token_mask_ = 0;
+  float max_score_ = std::numeric_limits<float>::infinity();
 };
 
 }  // namespace carbon

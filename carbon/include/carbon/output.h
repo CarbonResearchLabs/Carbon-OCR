@@ -26,7 +26,10 @@
 //             <footer>, kept; footnotes <aside class="footnote">; formulas
 //             <p class="formula">; forms <div class="form">; a contents page
 //             <nav><ul>; a picture's text in a <figure>.  Without blocks, a
-//             paragraph where the gap between lines is wider than a line.
+//             paragraph where the gap between lines is wider than a line.  A
+//             text layer's sub- and superscripts (OcrLine::scripts) <sub> and
+//             <sup>, in paragraphs, lists and tables' cells alike; markdown
+//             writes them as plain text.
 //
 // The blocks are the order model's (OcrPage::blocks); a page without them is one
 // block of all its lines.
@@ -47,6 +50,13 @@ std::string to_markdown(std::span<const OcrPage> pages);
 std::string to_html(std::span<const OcrPage> pages);
 // One page as to_html writes it inside its <section>: its blocks, no document.
 std::string to_html_body(const OcrPage& page);
+// The pieces of to_html and to_markdown, for a writer that writes pages as they come: html_head, then each
+// page's html_page (index from 0), then html_tail is to_html's document; each page's markdown_page is its
+// markdown after the pages before it. Joined, the same bytes.
+std::string html_head();
+std::string html_page(const OcrPage& page, size_t index);
+std::string html_tail();
+std::string markdown_page(const OcrPage& page, size_t index);
 
 // A searchable PDF: each page its image (8-bit gray, deflated) at `dpi`, and over
 // it its words as invisible text (render mode 3), each stretched to its box, in a

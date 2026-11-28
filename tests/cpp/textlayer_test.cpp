@@ -35,6 +35,28 @@ void put_line(std::vector<PdfChar>& out, const std::u32string& text, float x, fl
   }
 }
 
+// Characters set at `scale` of put_line's size (12 pt), their baseline `raise` px above the row's (below where
+// negative): a script, as a PDF sets one.
+void put_script(std::vector<PdfChar>& out, const std::u32string& text, float x, float y, float raise,
+                float scale = 0.7f) {
+  const float base = y - raise, w = 10 * scale;
+  for (char32_t c : text) {
+    PdfChar p;
+    p.code = c;
+    p.lx0 = x;
+    p.lx1 = x + w;
+    p.ly0 = base - 16 * scale;
+    p.ly1 = base + 4 * scale;
+    p.x0 = x + 2 * scale;
+    p.x1 = x + 8 * scale;
+    p.y0 = base - 12 * scale;
+    p.y1 = base;
+    p.size = 12 * scale;
+    out.push_back(p);
+    x += w;
+  }
+}
+
 PdfChar generated(char32_t c) {
   PdfChar p;
   p.code = c;
@@ -88,6 +110,24 @@ TEST(TextLayer, MakesLinesOfItsCharacters) {
   ASSERT_EQ(t.lines[1].words.size(), 2u);
   EXPECT_EQ(t.lines[1].words[1].text, "two");
   EXPECT_DOUBLE_EQ(t.lines[1].words[1].box.x0, 70);
+}
+
+// A usable page's ruled lines, for the false-table check, only where TextLayerRule::rules asks for them; on the
+// page's own pixels, in them.
+TEST(TextLayer, FindsItsRuledLinesWhereAsked) {
+  std::vector<PdfChar> chars;
+  put_line(chars, U"A table under a rule", 10, 40);
+  GrayImage page = inked(chars, 400, 240);
+  for (int x = 10; x < 390; ++x) page.pixels[static_cast<size_t>(60) * page.width + x] = 0;  // a rule, 1 px
+  EXPECT_TRUE(read_text_layer(chars, page.view()).rules.empty());
+  TextLayerRule asked;
+  asked.rules = true;
+  const TextLayer t = read_text_layer(chars, page.view(), asked);
+  ASSERT_EQ(t.rules.size(), 1u);
+  EXPECT_DOUBLE_EQ(t.rules[0].x0, 10);
+  EXPECT_DOUBLE_EQ(t.rules[0].x1, 390);
+  EXPECT_DOUBLE_EQ(t.rules[0].y0, 60);
+  EXPECT_EQ(page_from_text_layer(t, page.width, page.height).rules.size(), 1u);
 }
 
 TEST(TextLayer, ChecksWhatItWouldTrust) {
@@ -237,16 +277,34 @@ TEST(TextLayer, LinesFromTheDetectorsLines) {
   ASSERT_EQ(page.lines.size(), 3u);
   EXPECT_EQ(page.source, "text layer");
 
-  // A superscript out of the detected line's band goes with its line's words, not a line of its own.
+  // A superscript set smaller and raised well off the line (its baseline 10 px up, its centre 8 px over the
+  // line's: the text after it is out of its band) stays in the layer's line with the text after it; as a word of its
+  // own in no detected line (its centre over the detected line's top), it goes with its line's words.
   std::vector<PdfChar> sup;
   put_line(sup, U"area m ", 10, 50);
-  put_line(sup, U"2", 80, 44);  // raised 6 px, past the detected line's end: in no detected line
+  put_script(sup, U"2", 80, 50, 10);
+  put_line(sup, U" is", 87, 50);
   TextLayer s = read_text_layer(sup, GrayView{nullptr, 0, 0, 0});
   ASSERT_EQ(s.lines.size(), 1u);
-  ASSERT_EQ(s.lines[0].words.size(), 3u);
-  EXPECT_TRUE(lines_from_detection(s, std::vector<LineBox>{{5, 36, 80, 56}}));
+  ASSERT_EQ(s.lines[0].words.size(), 4u);
+  EXPECT_EQ(s.lines[0].text, "area m 2 is");
+  EXPECT_EQ(s.lines[0].words[2].scripts, (std::vector<TextScript>{{0, 1, false}}));
+  EXPECT_TRUE(lines_from_detection(s, std::vector<LineBox>{{5, 36, 120, 56}}));
   ASSERT_EQ(s.lines.size(), 1u);
-  EXPECT_EQ(s.lines[0].text, "area m 2");
+  EXPECT_EQ(s.lines[0].text, "area m 2 is");
+  EXPECT_EQ(s.lines[0].scripts, (std::vector<TextScript>{{7, 8, false}}));
+  // the line below (24 px down, its loose boxes 20 high), no break between them, is a line of its own still
+  std::vector<PdfChar> two = sup;
+  put_line(two, U"next", 10, 74);
+  EXPECT_EQ(read_text_layer(two, GrayView{nullptr, 0, 0, 0}).lines.size(), 2u);
+  // a table's cell under the one before, its first character under the line's but not its last (a step down
+  // the page, across the way the line runs: held to the last character's band), its own line
+  std::vector<PdfChar> cells;
+  put_line(cells, U"Nam", 10, 50);
+  put_line(cells, U"Age", 20, 74);  // its A 10 px left of the m and 24 px down: a step down, under the line
+  const TextLayer stacked = read_text_layer(cells, GrayView{nullptr, 0, 0, 0});
+  ASSERT_EQ(stacked.lines.size(), 2u);
+  EXPECT_EQ(stacked.lines[1].text, "Age");
 
   // A page turned upside down (each line's words right to left on the page) keeps the layer's lines.
   TextLayer turned;
@@ -260,6 +318,235 @@ TEST(TextLayer, LinesFromTheDetectorsLines) {
   EXPECT_FALSE(lines_from_detection(turned, std::vector<LineBox>{{5, 25, 125, 55}}));
   ASSERT_EQ(turned.lines.size(), 1u);
   EXPECT_EQ(turned.lines[0].text, "upside down");
+}
+
+// Characters set smaller (at most 0.8 of the line's median size as drawn) and raised or lowered (their centre
+// more than 0.15 of the body's height off the body's) are a line's scripts, marked in its words and the line, a run
+// of them one; one raised but not smaller, smaller but on the baseline, in a line too short to have a body, or in
+// one that runs down the page, is not. The size as drawn: a PDF that sets its fonts at 1 and scales the text matrix
+// marks the same. The marks follow the words into the pieces a line is split into and the detector's lines.
+TEST(TextLayer, MarksScriptsSetSmallerAndRaisedOrLowered) {
+  using S = std::vector<TextScript>;
+  auto one_line = [](const std::vector<PdfChar>& chars) {
+    const TextLayer t = read_text_layer(chars, GrayView{nullptr, 0, 0, 0});
+    EXPECT_EQ(t.lines.size(), 1u);
+    return t.lines.empty() ? OcrLine{} : t.lines[0];
+  };
+  std::vector<PdfChar> water;
+  put_line(water, U"H", 10, 50);
+  put_script(water, U"2", 20, 50, -4);  // lowered 4 px at 0.7 of the size: its centre 5.8 px below the body's
+  put_line(water, U"O is wet", 27, 50);
+  OcrLine l = one_line(water);
+  EXPECT_EQ(l.text, "H2O is wet");
+  ASSERT_EQ(l.words.size(), 3u);
+  EXPECT_EQ(l.words[0].scripts, (S{{1, 2, true}}));
+  EXPECT_TRUE(l.words[1].scripts.empty());
+  EXPECT_EQ(l.scripts, (S{{1, 2, true}}));
+
+  std::vector<PdfChar> area;
+  put_line(area, U"area m", 10, 50);
+  put_script(area, U"2", 70, 50, 5);  // raised 5 px: its centre 3.2 px (0.16 of the body) above the body's
+  put_line(area, U" is", 77, 50);
+  l = one_line(area);
+  EXPECT_EQ(l.text, "area m2 is");
+  EXPECT_EQ(l.words[1].scripts, (S{{1, 2, false}}));
+  EXPECT_EQ(l.scripts, (S{{6, 7, false}}));
+
+  std::vector<PdfChar> ion;
+  put_line(ion, U"[Ca", 10, 50);
+  put_script(ion, U"2+", 40, 50, 5);
+  put_line(ion, U"]", 54, 50);
+  put_script(ion, U"i", 64, 50, -4);
+  put_line(ion, U" (nM)", 71, 50);
+  l = one_line(ion);
+  EXPECT_EQ(l.text, "[Ca2+]i (nM)");
+  EXPECT_EQ(l.words[0].scripts, (S{{3, 5, false}, {6, 7, true}}));  // "2+" one run
+
+  std::vector<PdfChar> unit = area;  // set at 1, scaled by the matrix: the same size as drawn
+  for (PdfChar& c : unit) {
+    c.matrix_scale = c.size;
+    c.size = 1;
+  }
+  EXPECT_EQ(one_line(unit).scripts, (S{{6, 7, false}}));
+
+  std::vector<PdfChar> raised;  // raised 6 px, at the line's own size: no script
+  put_line(raised, U"area m", 10, 50);
+  put_line(raised, U"2", 70, 44);
+  put_line(raised, U" is", 80, 50);
+  EXPECT_TRUE(one_line(raised).scripts.empty());
+  std::vector<PdfChar> small;  // smaller, on the baseline (small capitals): no script
+  put_line(small, U"ab", 10, 50);
+  put_script(small, U"cd", 30, 50, 0);
+  put_line(small, U"ef", 44, 50);
+  EXPECT_TRUE(one_line(small).scripts.empty());
+  std::vector<PdfChar> shrt;  // three characters: no body to measure against
+  put_line(shrt, U"m", 10, 50);
+  put_script(shrt, U"2", 20, 50, 5);
+  put_line(shrt, U"s", 27, 50);
+  EXPECT_TRUE(one_line(shrt).scripts.empty());
+  std::vector<PdfChar> down = area;  // down the page
+  for (PdfChar& c : down) c.angle = 90;
+  EXPECT_TRUE(read_text_layer(down, GrayView{nullptr, 0, 0, 0}).lines[0].scripts.empty());
+
+  // split at a table's gap: each piece its own words' scripts
+  std::vector<PdfChar> row = area;
+  put_line(row, U" 12", 290, 50);
+  const TextLayer layer = read_text_layer(row, GrayView{nullptr, 0, 0, 0});
+  ASSERT_EQ(layer.lines.size(), 1u);
+  const OcrPage page = page_from_text_layer(layer, 400, 100);
+  ASSERT_EQ(page.lines.size(), 2u);
+  EXPECT_EQ(page.lines[0].text, "area m2 is");
+  EXPECT_EQ(page.lines[0].scripts, (S{{6, 7, false}}));
+  EXPECT_EQ(page.lines[1].text, "12");
+  EXPECT_TRUE(page.lines[1].scripts.empty());
+  // the detector's lines: "area" in one, "m2 is" in another
+  TextLayer d = read_text_layer(area, GrayView{nullptr, 0, 0, 0});
+  ASSERT_TRUE(lines_from_detection(d, std::vector<LineBox>{{5, 30, 52, 58}, {55, 30, 120, 58}}));
+  ASSERT_EQ(d.lines.size(), 2u);
+  EXPECT_EQ(d.lines[1].text, "m2 is");
+  EXPECT_EQ(d.lines[1].scripts, (S{{1, 2, false}}));
+  EXPECT_TRUE(d.lines[0].scripts.empty());
+}
+
+// A layer refused for its bad codes, all of them in runs (text objects) of their own that hold no letter (a
+// math extension font's pieces), has those runs set aside when asked: the lines they touch left out, their boxes to
+// read by OCR, the checks on the rest. A bad run that holds a letter (a broken encoding), runs over half the lines,
+// or the rule left off: the page refused as before.
+TEST(TextLayer, BadCodeRunsAreSetAsideOneRunAtATime) {
+  auto page = [](bool letter_in_run, int touched) {
+    std::vector<PdfChar> chars;
+    for (int r = 0; r < 4; ++r) {
+      put_line(chars, U"a line of sound text", 10, 30.0f + 30 * r);
+      for (size_t i = chars.size() - 20; i < chars.size(); ++i) chars[i].object = r;
+      chars.push_back(generated(U'\n'));
+      if (r < touched) {  // a bracket's pieces in a font of their own, mapped to private use, then its closing
+        put_line(chars, letter_in_run ? U"x" : U")", 10, 45.0f + 30 * r);
+        for (size_t i = chars.size() - 3; i < chars.size(); ++i) chars[i].object = 10 + r;
+        chars.push_back(generated(U'\n'));
+      }
+    }
+    return chars;
+  };
+  TextLayerRule rule;
+  rule.set_aside_bad_runs = true;
+  const std::vector<PdfChar> one = page(false, 1);  // 2 bad of 83: 2.4%
+  EXPECT_FALSE(read_text_layer(one, GrayView{nullptr, 0, 0, 0}).check.usable) << "the rule off: refused";
+  const TextLayer t = read_text_layer(one, GrayView{nullptr, 0, 0, 0}, rule);
+  EXPECT_TRUE(t.check.usable) << t.check.reason;
+  EXPECT_EQ(t.check.set_aside, 3);
+  EXPECT_EQ(t.check.bad, 0);
+  EXPECT_EQ(t.check.chars, 80);
+  ASSERT_EQ(t.lines.size(), 4u);
+  EXPECT_EQ(t.mcids.size(), 4u);
+  for (const OcrLine& l : t.lines) EXPECT_EQ(l.text, "a line of sound text");
+  ASSERT_EQ(t.set_aside.size(), 1u);
+  EXPECT_DOUBLE_EQ(t.set_aside[0].x0, 10);
+  EXPECT_DOUBLE_EQ(t.set_aside[0].x1, 40);
+  EXPECT_DOUBLE_EQ(t.set_aside[0].y0, 29);
+  EXPECT_DOUBLE_EQ(t.set_aside[0].y1, 49);
+  const std::vector<LineBox> read = set_aside_to_read(t, 400, 48);  // 2 px larger about it, clipped to the page
+  ASSERT_EQ(read.size(), 1u);
+  EXPECT_DOUBLE_EQ(read[0].x0, 8);
+  EXPECT_DOUBLE_EQ(read[0].y0, 27);
+  EXPECT_DOUBLE_EQ(read[0].y1, 48);
+
+  const TextLayer mixed = read_text_layer(page(true, 1), GrayView{nullptr, 0, 0, 0}, rule);
+  EXPECT_FALSE(mixed.check.usable) << "a letter in a bad run";
+  EXPECT_NE(mixed.check.reason.find("not readable"), std::string::npos);
+  EXPECT_TRUE(mixed.set_aside.empty());
+  const TextLayer most = read_text_layer(page(false, 4), GrayView{nullptr, 0, 0, 0}, rule);
+  EXPECT_TRUE(most.check.usable) << "four of eight lines: half, not over";
+  std::vector<PdfChar> over = page(false, 4);
+  over.erase(over.begin(), over.begin() + 21);  // the first sound line gone: four of seven lines touched
+  const TextLayer refused = read_text_layer(over, GrayView{nullptr, 0, 0, 0}, rule);
+  EXPECT_FALSE(refused.check.usable);
+  EXPECT_EQ(refused.check.reason, read_text_layer(over, GrayView{nullptr, 0, 0, 0}).check.reason);
+  EXPECT_TRUE(refused.set_aside.empty());
+  std::vector<PdfChar> loose = one;  // a bad code in no text object: refused
+  for (PdfChar& c : loose) {
+    if (c.object == 10) c.object = -1;
+  }
+  EXPECT_FALSE(read_text_layer(loose, GrayView{nullptr, 0, 0, 0}, rule).check.usable);
+}
+
+// A page whose text runs sideways or upside down as shown is turned upright when over half the characters it
+// draws run one quarter turn: back by that turn; its generated characters are not counted, a page half turned is
+// not turned, and an upright page never is.
+TEST(TextLayer, APageWhoseTextRunsSidewaysIsTurnedUpright) {
+  auto page = [](int turned, int upright, float other = -2) {
+    std::vector<PdfChar> chars;
+    for (int i = 0; i < turned; ++i) {
+      PdfChar c;
+      c.code = U'a';
+      c.angle = other > -2 ? other : 0;
+      chars.push_back(c);
+    }
+    for (int i = 0; i < upright; ++i) {
+      PdfChar c;
+      c.code = U'b';
+      chars.push_back(c);
+    }
+    return chars;
+  };
+  auto at = [](std::vector<PdfChar> chars, float angle) {
+    for (PdfChar& c : chars) {
+      if (c.code == U'a') c.angle = angle;
+    }
+    return chars;
+  };
+  const std::vector<PdfChar> most = page(6, 4), half = page(5, 5);
+  EXPECT_EQ(upright_turn(at(most, 270)), 1);  // up the page: a quarter clockwise brings it upright
+  EXPECT_EQ(upright_turn(at(most, 90)), 3);   // down the page
+  EXPECT_EQ(upright_turn(at(most, 180)), 2);
+  EXPECT_EQ(upright_turn(at(most, 268)), 1);  // within 4.5 degrees of the turn
+  EXPECT_EQ(upright_turn(at(most, 260)), 0);  // set at a slant: no quarter turn
+  EXPECT_EQ(upright_turn(at(most, 359.5f)), 0);
+  EXPECT_EQ(upright_turn(at(half, 270)), 0);  // half, not over half
+  EXPECT_EQ(upright_turn(at(most, -1)), 0);   // no angle read
+  EXPECT_EQ(upright_turn(page(0, 10)), 0);
+  EXPECT_EQ(upright_turn({}), 0);
+  std::vector<PdfChar> spaced = at(half, 90);
+  for (int i = 0; i < 4; ++i) {  // PDFium's own spaces, down the page too, are not the page's characters
+    PdfChar g;
+    g.code = U' ';
+    g.generated = true;
+    g.angle = 90;
+    spaced.push_back(g);
+  }
+  EXPECT_EQ(upright_turn(spaced), 0);
+
+  // read turned, the page is the page as shown: its rotation the text's turn there, its boxes mapped back
+  OcrPage p;
+  p.width = 400;  // the upright page: 400 x 200
+  p.height = 200;
+  OcrLine l;
+  l.box = {10, 20, 110, 40};
+  l.text = "x";
+  p.lines = {l};
+  read_turned(p, 0);
+  EXPECT_EQ(p.rotation, 0);
+  EXPECT_EQ(p.width, 400);
+  read_turned(p, 1);  // shown 200 x 400, its text up the page: turned 270 degrees clockwise
+  EXPECT_EQ(p.rotation, 270);
+  EXPECT_EQ(p.width, 200);
+  EXPECT_EQ(p.height, 400);
+  const LineBox g = box_as_given(p.lines[0].box, p);  // the upright (x, y) shows at (y, 400 - x)
+  EXPECT_DOUBLE_EQ(g.x0, 20);
+  EXPECT_DOUBLE_EQ(g.x1, 40);
+  EXPECT_DOUBLE_EQ(g.y0, 290);
+  EXPECT_DOUBLE_EQ(g.y1, 390);
+  OcrPage down;
+  down.width = 400;
+  down.height = 200;
+  read_turned(down, 3);
+  EXPECT_EQ(down.rotation, 90);
+  EXPECT_EQ(down.width, 200);
+  OcrPage over;
+  over.width = 400;
+  over.height = 200;
+  read_turned(over, 2);
+  EXPECT_EQ(over.rotation, 180);
+  EXPECT_EQ(over.width, 400);
 }
 
 // A tagged page reads in its structure tree's order, not the page's geometry, its blocks the elements' roles;
@@ -418,6 +705,46 @@ TEST(TextLayer, HybridPagesAddTheirPicturesLines) {
   r.lines = {under};
   add_picture_lines(none, r);
   EXPECT_EQ(none.source, "text layer") << "nothing added";
+}
+
+// Of the lines the detector found on a whole page, its pictures pass reads those at least half inside the
+// regions to read and less than half under the layer's own lines; none such, nothing to read.
+TEST(TextLayer, APicturesPassReadsTheLinesFoundInItsPictures) {
+  OcrPage page;  // read from its layer: one line, across the top
+  page.width = 600;
+  page.height = 800;
+  OcrLine own;
+  own.box = {50, 50, 550, 70};
+  page.lines.push_back(own);
+  OcrPage found;
+  found.width = 600;
+  found.height = 800;
+  found.pictures = {{100, 200, 400, 500}};
+  found.second_pass = true;
+  auto line = [](double x0, double y0, double x1, double y1, float score) {
+    OcrLine l;
+    l.box = {x0, y0, x1, y1};
+    l.det_score = score;
+    return l;
+  };
+  found.lines = {line(50, 50, 550, 70, 0.9f),     // the layer's own line: under it
+                 line(120, 250, 300, 270, 0.8f),  // in the picture
+                 line(300, 300, 500, 320, 0.7f),  // half in it
+                 line(350, 350, 550, 370, 0.6f),  // a quarter in it
+                 line(50, 600, 300, 620, 0.5f),   // in the uncovered ink
+                 line(400, 700, 500, 720, 0.4f)};  // in neither
+  const std::vector<LineBox> to_read = {{100, 200, 400, 500}, {40, 590, 310, 630}};
+  const OcrPage picked = picture_lines(found, page, to_read);
+  ASSERT_EQ(picked.lines.size(), 3u);
+  EXPECT_EQ(picked.lines[0].det_score, 0.8f);
+  EXPECT_EQ(picked.lines[1].det_score, 0.7f);
+  EXPECT_EQ(picked.lines[2].det_score, 0.5f);
+  EXPECT_EQ(picked.width, 600);
+  EXPECT_EQ(picked.pictures.size(), 1u);
+  EXPECT_TRUE(picked.second_pass);
+  // nothing found in the regions: nothing to read
+  EXPECT_TRUE(picture_lines(found, page, std::vector<LineBox>{{0, 750, 50, 800}}).lines.empty());
+  EXPECT_TRUE(picture_lines(found, page, {}).lines.empty());
 }
 
 }  // namespace

@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "carbon/deskew.h"
+#include "carbon/document.h"
 #include "carbon/engine.h"
 #include "carbon/error.h"
 #include "carbon/image.h"
@@ -192,6 +193,93 @@ TEST(CudaPipeline, Fp16NeedsTheTrunkAndFusedHead) {
   if (!cuda_pipeline_available()) GTEST_SKIP() << "no GPU, or no TensorRT in this build";
   EXPECT_THROW(Pipeline(kSet, gpu_options(Precision::kFp16, true)), Error);
 }
+
+// On the GPU: a page's lines found alone, read from them, read as given and ordered alone, as the CPU device
+// does them (in FP32, the same lines); and a text layer's page through the document stream with its steps on the
+// GPU's pipeline, its picture's bar read there.
+TEST(CudaPipeline, ReadsAPagesTasksAsTheCpuDeviceDoes) {
+  if (!cuda_pipeline_available()) GTEST_SKIP() << "no GPU, or no TensorRT in this build";
+  const GrayImage page = load_image(kSet / "page.png");
+  const GrayImage skewed = rotate_page(page.view(), 2.5);
+  PipelineOptions cpu = gpu_options(Precision::kFp32, true);
+  cpu.device = Device::kCpu;
+  std::vector<OcrPage> want, got;
+  for (PipelineOptions po : {cpu, gpu_options(Precision::kFp32, true)}) {
+    Pipeline pipe(kSet, po);
+    pipe.submit_detect(GrayImage(page));
+    PageTask as_given;
+    as_given.as_given = true;
+    pipe.submit(GrayImage(skewed), as_given);
+    pipe.close();
+    std::vector<OcrPage>& out = po.device == Device::kCpu ? want : got;
+    while (auto p = pipe.next()) out.push_back(std::move(*p));
+  }
+  ASSERT_EQ(want.size(), 2u);
+  ASSERT_EQ(got.size(), 2u);
+  ASSERT_EQ(got[0].lines.size(), want[0].lines.size());
+  for (size_t i = 0; i < got[0].lines.size(); ++i) {
+    EXPECT_TRUE(got[0].lines[i].text.empty());
+    EXPECT_NEAR(got[0].lines[i].box.y0, want[0].lines[i].box.y0, 1.0);
+  }
+  ASSERT_EQ(got[1].lines.size(), want[1].lines.size());
+  EXPECT_EQ(got[1].skew, 0.0);
+  for (size_t i = 0; i < got[1].lines.size(); ++i) EXPECT_EQ(got[1].lines[i].text, want[1].lines[i].text);
+  {  // from the lines found, on the GPU
+    Pipeline pipe(kSet, gpu_options(Precision::kFp32, true));
+    PageTask from;
+    from.found = std::make_shared<const OcrPage>(want[0]);
+    pipe.submit(GrayImage(page), from);
+    OcrPage text_page = want[0];
+    text_page.lines[0].text = "first";
+    pipe.submit_order(text_page);
+    pipe.close();
+    const OcrPage read = *pipe.next();
+    EXPECT_EQ(read.text(), "aaa\naaaaa\naa\n");
+    EXPECT_EQ(pipe.next()->lines.size(), text_page.lines.size());
+  }
+}
+
+#if defined(CARBON_PDF_HELPER)
+TEST(CudaPipeline, ReadsATextLayersPageOnTheGpu) {
+  if (!cuda_pipeline_available()) GTEST_SKIP() << "no GPU, or no TensorRT in this build";
+  const std::filesystem::path data = CARBON_TEST_DATA;
+  for (const bool on_gpu : {true, false}) {
+    DocumentOptions d;
+    d.cuda = true;
+    d.pipeline = gpu_options(Precision::kFp32, true);
+    d.text_on_gpu = on_gpu;
+    DocumentStream stream(kSet, d);
+    PdfPool pool(1, CARBON_PDF_HELPER);
+    stream.pdf_page(pool.page(data / "figure.pdf", 0, 200 / 72.0, stream.pdf_want()), 0);
+    stream.pdf_page(pool.page(data / "text.pdf", 0, 200 / 72.0, stream.pdf_want()), 1);
+    stream.close();
+    std::vector<OcrPage> out(2);
+    while (auto done = stream.next()) {
+      ASSERT_FALSE(done->error) << on_gpu;
+      EXPECT_TRUE(done->from_text_layer);
+      out[done->tag] = std::move(done->page);
+    }
+    EXPECT_EQ(out[0].source, "hybrid") << on_gpu;
+    EXPECT_NE(out[0].text().find("aaa"), std::string::npos) << out[0].text();
+    EXPECT_EQ(stream.workers() > 0, !on_gpu) << "a CPU engine only for the text pages off the GPU";
+    EXPECT_EQ(out[1].source, "text layer");
+  }
+  {  // On the GPU: a layer that runs up the page found and read upright, its rotation the turn
+    DocumentOptions d;
+    d.cuda = true;
+    d.pipeline = gpu_options(Precision::kFp32, true);
+    DocumentStream stream(kSet, d);
+    PdfPool pool(1, CARBON_PDF_HELPER);
+    stream.pdf_page(pool.page(data / "turned.pdf", 0, 200 / 72.0, stream.pdf_want()), 0);
+    stream.close();
+    const auto done = stream.next();
+    ASSERT_TRUE(done.has_value());
+    ASSERT_FALSE(done->error);
+    EXPECT_EQ(done->page.rotation, 270);
+    EXPECT_EQ(done->page.source, "text layer");
+  }
+}
+#endif
 
 }  // namespace
 }  // namespace carbon

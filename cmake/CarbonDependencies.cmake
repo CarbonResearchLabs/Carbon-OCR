@@ -128,8 +128,8 @@ endif()
 
 # -------------------------------------------------------------------- stb_image
 #
-# One public-domain header that reads PNG, JPEG, BMP and PNM pages: the
-# pipeline's image input until libpng and libjpeg-turbo come.
+# One public-domain header that reads PNG, JPEG, BMP, PNM and GIF pages (a GIF's
+# first frame): the pipeline's image input until libpng and libjpeg-turbo come.
 # PNG goes to Carbon's own decoder first (carbon/src/png.cpp), which gives
 # stb_image's bytes faster and leaves it the files it does not read itself.
 
@@ -155,6 +155,35 @@ FetchContent_Declare(libdeflate
   URL_HASH SHA256=ad8d3723d0065c4723ab738be9723f2ff1cb0f1571e8bfcf0301ff9661f475e8
   DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
 FetchContent_MakeAvailable(libdeflate)
+
+# ---------------------------------------------------------------------- libwebp
+#
+# libwebp (BSD-3-Clause, with Google's patent grant in its PATENTS): WebP pages,
+# lossy and lossless, with alpha, and an animation's first frame
+# (carbon/src/webp.cpp). Its libraries, static, none of its tools; the engine
+# links its decoder's functions alone (a static library's other objects stay
+# out), and the tests its encoder too, to write the pages they read. Its SIMD
+# (SSE2, SSE4.1 and AVX2 on x86, NEON on Arm) is chosen at run time for the CPU
+# by its own dispatch.
+
+set(_carbon_shared ${BUILD_SHARED_LIBS})
+set(BUILD_SHARED_LIBS OFF)
+foreach(_webp ANIM_UTILS CWEBP DWEBP GIF2WEBP IMG2WEBP VWEBP WEBPINFO LIBWEBPMUX WEBPMUX EXTRAS WEBP_JS FUZZTEST)
+  set(WEBP_BUILD_${_webp} OFF CACHE BOOL "" FORCE)
+endforeach()
+set(WEBP_USE_THREAD OFF CACHE BOOL "" FORCE)  # a page a worker: no decoding threads of its own
+FetchContent_Declare(libwebp
+  URL https://github.com/webmproject/libwebp/archive/refs/tags/v1.6.0.tar.gz
+  URL_HASH SHA256=93a852c2b3efafee3723efd4636de855b46f9fe1efddd607e1f42f60fc8f2136
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(libwebp)
+set(BUILD_SHARED_LIBS ${_carbon_shared})
+foreach(_webp webpdecode webpdspdecode webputilsdecode webpdecoder webpencode webpdsp webputils webp sharpyuv
+              webpdemux)
+  if(TARGET ${_webp})
+    target_compile_options(${_webp} PRIVATE $<IF:$<C_COMPILER_ID:MSVC>,/w,-w>)
+  endif()
+endforeach()
 
 # --------------------------------------------------------------------- TensorRT
 #

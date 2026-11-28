@@ -19,7 +19,8 @@
 //                  its bytes; the pool asks it once, after starting the helper
 //   op 9 page      a page's parts from one load of it: the op's high bits (op >> 8) are
 //                  PdfWant's, `scale` 0 the page's own, and the answer is f64 the scale
-//                  read at, then each part asked in that order: the image as op 7's (into
+//                  read at, i32 the quarter turns it was read at (kPdfUpright; 0 else), then
+//                  each part asked in that order: the image as op 7's (into
 //                  the region when the helper has one and it fits), then the chars as op 4's,
 //                  the pictures as op 5's, the structure as op 6's
 #pragma once
@@ -59,8 +60,8 @@ enum Op : uint32_t {
 #pragma pack(push, 1)
 struct WireChar {  // a PdfChar
   uint32_t code;
-  float x0, y0, x1, y1, lx0, ly0, lx1, ly1, size;
-  int32_t mcid;
+  float x0, y0, x1, y1, lx0, ly0, lx1, ly1, size, matrix_scale, angle;
+  int32_t mcid, object;
   uint8_t flags;  // 1 generated, 2 bad map, 4 invisible
 };
 #pragma pack(pop)

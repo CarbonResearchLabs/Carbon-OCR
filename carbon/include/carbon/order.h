@@ -97,6 +97,7 @@ struct TableCell {
 struct OrderBlock {
   int label = 0;              // block_label_name
   float confidence = 0;       // the mean probability of that label over its lines
+  std::vector<float> probs;   // each label's mean probability over its lines (kBlockLabels)
   std::vector<size_t> lines;  // a run of PageOrder::order
   std::vector<TableCell> cells;  // a table's, by row then column
 };

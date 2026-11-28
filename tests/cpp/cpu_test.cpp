@@ -1138,6 +1138,22 @@ TEST(CpuSkew, Time) {
   }
 }
 
+// Whether an instruction set's int8 kernels widen their products (no dot product): then INT8 runs at FP32's rate an
+// instruction and FP32 is the one-worker latency choice (carbon-ocr cpus). The widening sets read their bytes in pairs
+// or one at a time, a dot product's in fours (k_padded).
+TEST(Cpu, Int8WidensWithoutADotProduct) {
+  EXPECT_TRUE(int8_widens(Isa::kScalar));
+  EXPECT_TRUE(int8_widens(Isa::kAvx2));
+  EXPECT_TRUE(int8_widens(Isa::kNeon));  // plain NEON runs the reference's int8
+  EXPECT_FALSE(int8_widens(Isa::kAvxVnni));
+  EXPECT_FALSE(int8_widens(Isa::kAvx512));
+  EXPECT_FALSE(int8_widens(Isa::kAvx512Fp16));
+  EXPECT_FALSE(int8_widens(Isa::kNeonDot));
+  EXPECT_FALSE(int8_widens(Isa::kNeonFp16));
+  for (Isa isa : isas_available()) EXPECT_EQ(int8_widens(isa), k_padded(1, isa) < 4) << isa_name(isa);
+  EXPECT_EQ(int8_widens(), int8_widens(best_isa()));
+}
+
 TEST(CpuCtc, ATermOfALogitMoreThan17BelowItsBestCannotMoveASumOfOne) {
   // Past a group's highest best class, every frame's sum is at least 1 (its best's term, exp_neg(0), is exactly 1), and
   // the kernels pass over a class whose terms are all of logits more than 17 below their bests: such a term must be

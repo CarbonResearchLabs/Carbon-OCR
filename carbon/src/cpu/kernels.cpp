@@ -118,6 +118,12 @@ int k_group(Isa isa) {
   isa = int8_kernel(isa);
   return isa == Isa::kScalar ? 1 : isa == Isa::kAvx2 ? 2 : 4;
 }
+
+}  // namespace
+
+bool int8_widens(Isa isa) { return k_group(isa) < 4; }  // pairs (vpmaddwd) or single products: no dot product
+
+namespace {
 int panel(Isa isa) {
   return isa == Isa::kScalar ? 1 : isa == Isa::kAvx512 || isa == Isa::kAvx512Fp16 ? 32 : 16;
 }
@@ -628,24 +634,22 @@ void ctc_topk(const float* logits, int classes, int frames, int t_n, int k, int3
     return;
   }
 #endif
-  // The reference.
+  // The reference. Class by class, along the frames (the layout's fast axis), as ctc_argmax reads them: first the top
+  // k but the blank (a later class must beat a kept one, so ties keep the lower), whose first and the blank give each
+  // frame's best, the first class in class order at the largest logit (a NaN never best; with k 0, a pass for it);
+  // then the sums' terms in ctc_argmax's order, a term passed over where it cannot move its sum: past the frame's
+  // best class the sum is at least 1 (the best's term, exp_neg(0), is exactly 1), and a logit more than 17 below
+  // the best adds under 2^-24 (cpu_test's CpuCtc check), so the same bits as every term summed.
   const float neg = -std::numeric_limits<float>::infinity();
   thread_local std::vector<float> best, sum;
+  thread_local std::vector<int32_t> arg;
   best.assign(static_cast<size_t>(t_n), neg);
   sum.assign(static_cast<size_t>(t_n), 0.0f);
-  // Class by class, along the frames (the layout's fast axis), as ctc_argmax reads them: its sums' terms in its order.
-  for (int c = 0; c < classes; ++c) {
-    const float* row = logits + static_cast<size_t>(c) * frames;
-    for (int t = 0; t < t_n; ++t) best[t] = row[t] > best[t] ? row[t] : best[t];
-  }
-  for (int c = 0; c < classes; ++c) {
-    const float* row = logits + static_cast<size_t>(c) * frames;
-    for (int t = 0; t < t_n; ++t) sum[t] = sum[t] + detail::exp_neg(row[t] - best[t]);
-  }
+  arg.assign(static_cast<size_t>(t_n), classes);  // no class passed over
   std::fill(logp, logp + static_cast<size_t>(t_n) * k, neg);
   std::fill(ids, ids + static_cast<size_t>(t_n) * k, 0);
   if (k > 0) {
-    for (int c = 1; c < classes; ++c) {  // the blank apart; a later class must beat a kept one, so ties keep the lower
+    for (int c = 1; c < classes; ++c) {
       const float* row = logits + static_cast<size_t>(c) * frames;
       for (int t = 0; t < t_n; ++t) {
         const float v = row[t];
@@ -660,6 +664,29 @@ void ctc_topk(const float* logits, int classes, int frames, int t_n, int k, int3
         lt[j] = v;
         it[j] = c;
       }
+    }
+    for (int t = 0; t < t_n; ++t) {
+      const float b0 = logits[t] > neg ? logits[t] : neg, top = logp[static_cast<size_t>(t) * k];
+      if (top > b0) {
+        best[t] = top;
+        arg[t] = ids[static_cast<size_t>(t) * k];
+      } else {
+        best[t] = b0;
+        arg[t] = 0;
+      }
+    }
+  } else {
+    for (int c = 0; c < classes; ++c) {
+      const float* row = logits + static_cast<size_t>(c) * frames;
+      for (int t = 0; t < t_n; ++t) best[t] = row[t] > best[t] ? row[t] : best[t];
+    }
+  }
+  for (int c = 0; c < classes; ++c) {
+    const float* row = logits + static_cast<size_t>(c) * frames;
+    for (int t = 0; t < t_n; ++t) {
+      const float d = row[t] - best[t];
+      if (c > arg[t] && d < -17.0f) continue;
+      sum[t] = sum[t] + detail::exp_neg(d);
     }
   }
   for (int t = 0; t < t_n; ++t) {

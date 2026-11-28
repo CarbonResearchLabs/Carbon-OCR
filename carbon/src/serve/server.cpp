@@ -30,6 +30,8 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -39,12 +41,15 @@
 #include <tuple>
 #include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 
+#include "carbon/document.h"
 #include "carbon/error.h"
 #include "carbon/http.h"
 #include "carbon/image.h"
 #include "carbon/output.h"
+#include "carbon/pdf.h"
 #include "carbon/version.h"
 
 namespace carbon {
@@ -197,14 +202,11 @@ const std::map<std::string, std::string, std::less<>>& formats() {
   return f;
 }
 
-// What the body's first bytes say it is: an image decode_image reads, a PDF, or neither.
+// What the body's first bytes say it is (carbon::file_kind): an image decode_image reads, a PDF, or neither.
 enum class Kind { kImage, kPdf, kOther };
 Kind sniff(std::string_view b) {
-  auto starts = [&](std::string_view m) { return b.substr(0, m.size()) == m; };
-  if (starts("\x89PNG\r\n\x1a\n") || starts("\xff\xd8\xff") || starts("BM")) return Kind::kImage;
-  if (b.size() >= 2 && b[0] == 'P' && b[1] >= '1' && b[1] <= '6') return Kind::kImage;  // PNM
-  if (starts("%PDF-")) return Kind::kPdf;
-  return Kind::kOther;
+  const FileKind k = file_kind(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(b.data()), b.size()));
+  return k == FileKind::kPdf ? Kind::kPdf : k == FileKind::kUnknown ? Kind::kOther : Kind::kImage;
 }
 
 std::string json_string(std::string_view s) {
@@ -225,6 +227,251 @@ std::string json_string(std::string_view s) {
   return q + "\"";
 }
 
+// A JSON value (RFC 8259), as a /parse body holds them: objects, arrays, strings, numbers, booleans and null.
+struct Json {
+  enum Kind { kNull, kBool, kNumber, kString, kArray, kObject } kind = kNull;
+  bool b = false;
+  double n = 0;
+  std::string s;
+  std::vector<Json> items;
+  std::vector<std::pair<std::string, Json>> fields;
+  const Json* get(std::string_view key) const {
+    for (const auto& [k, v] : fields) {
+      if (k == key) return &v;
+    }
+    return nullptr;
+  }
+};
+
+// Reads one JSON value, the whole text; throws http::BadRequest (400) where it is not JSON.
+class JsonReader {
+ public:
+  explicit JsonReader(std::string_view t) : t_(t) {}
+  Json document() {
+    Json v = value(0);
+    space();
+    if (i_ != t_.size()) bad("text after the value");
+    return v;
+  }
+
+ private:
+  [[noreturn]] void bad(const std::string& why) const {
+    throw http::BadRequest(400, "the body is not JSON: " + why + " at byte " + std::to_string(i_));
+  }
+  void space() {
+    while (i_ < t_.size() && (t_[i_] == ' ' || t_[i_] == '\t' || t_[i_] == '\n' || t_[i_] == '\r')) ++i_;
+  }
+  bool word(std::string_view w) {
+    if (t_.substr(i_, w.size()) != w) return false;
+    i_ += w.size();
+    return true;
+  }
+  static void put_utf8(std::string& out, uint32_t c) {
+    if (c < 0x80) {
+      out += static_cast<char>(c);
+    } else if (c < 0x800) {
+      out += static_cast<char>(0xC0 | (c >> 6));
+      out += static_cast<char>(0x80 | (c & 0x3F));
+    } else if (c < 0x10000) {
+      out += static_cast<char>(0xE0 | (c >> 12));
+      out += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
+      out += static_cast<char>(0x80 | (c & 0x3F));
+    } else {
+      out += static_cast<char>(0xF0 | (c >> 18));
+      out += static_cast<char>(0x80 | ((c >> 12) & 0x3F));
+      out += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
+      out += static_cast<char>(0x80 | (c & 0x3F));
+    }
+  }
+  uint32_t hex4() {
+    if (i_ + 4 > t_.size()) bad("a short \\u escape");
+    uint32_t v = 0;
+    for (int k = 0; k < 4; ++k) {
+      const char c = t_[i_++];
+      v = v * 16 + (c >= '0' && c <= '9'   ? c - '0'
+                    : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                    : c >= 'A' && c <= 'F' ? c - 'A' + 10
+                                           : (bad("a bad \\u escape"), 0));
+    }
+    return v;
+  }
+  std::string string() {
+    ++i_;  // the opening quote
+    std::string out;
+    for (;;) {
+      const size_t run = i_;
+      while (i_ < t_.size() && t_[i_] != '"' && t_[i_] != '\\' && static_cast<unsigned char>(t_[i_]) >= 0x20) ++i_;
+      out.append(t_.substr(run, i_ - run));
+      if (i_ >= t_.size()) bad("an unterminated string");
+      const char c = t_[i_++];
+      if (c == '"') return out;
+      if (c != '\\') bad("a control character in a string");
+      if (i_ >= t_.size()) bad("an unterminated escape");
+      const char e = t_[i_++];
+      switch (e) {
+        case '"': out += '"'; break;
+        case '\\': out += '\\'; break;
+        case '/': out += '/'; break;
+        case 'b': out += '\b'; break;
+        case 'f': out += '\f'; break;
+        case 'n': out += '\n'; break;
+        case 'r': out += '\r'; break;
+        case 't': out += '\t'; break;
+        case 'u': {
+          uint32_t u = hex4();
+          if (u >= 0xD800 && u <= 0xDBFF && t_.substr(i_, 2) == "\\u") {  // a surrogate pair
+            i_ += 2;
+            const uint32_t lo = hex4();
+            if (lo < 0xDC00 || lo > 0xDFFF) bad("a lone surrogate");
+            u = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00);
+          }
+          put_utf8(out, u);
+          break;
+        }
+        default:
+          bad("a bad escape");
+      }
+    }
+  }
+  Json value(int depth) {
+    if (depth > 64) bad("nesting too deep");
+    space();
+    if (i_ >= t_.size()) bad("no value");
+    Json v;
+    const char c = t_[i_];
+    if (c == '{') {
+      v.kind = Json::kObject;
+      ++i_;
+      space();
+      if (i_ < t_.size() && t_[i_] == '}') {
+        ++i_;
+        return v;
+      }
+      for (;;) {
+        space();
+        if (i_ >= t_.size() || t_[i_] != '"') bad("an object's key is not a string");
+        std::string key = string();
+        space();
+        if (i_ >= t_.size() || t_[i_] != ':') bad("no ':' after a key");
+        ++i_;
+        v.fields.emplace_back(std::move(key), value(depth + 1));
+        space();
+        if (i_ < t_.size() && t_[i_] == ',') {
+          ++i_;
+          continue;
+        }
+        if (i_ < t_.size() && t_[i_] == '}') {
+          ++i_;
+          return v;
+        }
+        bad("no ',' or '}' in an object");
+      }
+    }
+    if (c == '[') {
+      v.kind = Json::kArray;
+      ++i_;
+      space();
+      if (i_ < t_.size() && t_[i_] == ']') {
+        ++i_;
+        return v;
+      }
+      for (;;) {
+        v.items.push_back(value(depth + 1));
+        space();
+        if (i_ < t_.size() && t_[i_] == ',') {
+          ++i_;
+          continue;
+        }
+        if (i_ < t_.size() && t_[i_] == ']') {
+          ++i_;
+          return v;
+        }
+        bad("no ',' or ']' in an array");
+      }
+    }
+    if (c == '"') {
+      v.kind = Json::kString;
+      v.s = string();
+      return v;
+    }
+    if (word("true") || word("false")) {
+      v.kind = Json::kBool;
+      v.b = t_[i_ - 1] == 'e' && t_[i_ - 2] == 'u';
+      return v;
+    }
+    if (word("null")) return v;
+    const std::string num(t_.substr(i_, std::min<size_t>(64, t_.size() - i_)));
+    char* end = nullptr;
+    v.n = std::strtod(num.c_str(), &end);
+    if (end == num.c_str() || !(c == '-' || (c >= '0' && c <= '9'))) bad("no value");
+    v.kind = Json::kNumber;
+    i_ += static_cast<size_t>(end - num.c_str());
+    return v;
+  }
+  std::string_view t_;
+  size_t i_ = 0;
+};
+
+// Base64 (RFC 4648, its standard alphabet; whitespace skipped, the padding optional); throws http::BadRequest.
+std::string from_base64(std::string_view s) {
+  auto at = [](char c) -> int {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+  };
+  std::string out;
+  out.reserve(s.size() / 4 * 3);
+  uint32_t acc = 0;
+  int bits = 0;
+  bool ended = false;
+  for (const char c : s) {
+    if (c == ' ' || c == '\n' || c == '\r' || c == '\t') continue;
+    if (c == '=') {
+      ended = true;
+      continue;
+    }
+    const int v = at(c);
+    if (v < 0 || ended) throw http::BadRequest(400, "the page is not base64");
+    acc = (acc << 6) | static_cast<uint32_t>(v);
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out += static_cast<char>((acc >> bits) & 0xFF);
+    }
+  }
+  return out;
+}
+
+// The bytes of a model set's files (its .onnx, .bin and .json, by name), as one FNV-1a hash: what a /parse
+// answer's "served" names as its revision, so a run records which weights answered.
+std::string set_revision(const std::filesystem::path& set) {
+  std::vector<std::filesystem::path> files;
+  std::error_code ec;
+  for (const auto& e : std::filesystem::directory_iterator(set, ec)) {
+    const std::string x = e.path().extension().string();
+    if (e.is_regular_file() && (x == ".onnx" || x == ".bin" || x == ".json")) files.push_back(e.path());
+  }
+  std::sort(files.begin(), files.end());
+  uint64_t h = 1469598103934665603ull;
+  std::vector<char> buf(size_t{1} << 20);
+  for (const auto& f : files) {
+    for (const char c : f.filename().string()) h = (h ^ static_cast<unsigned char>(c)) * 1099511628211ull;
+    std::ifstream in(f, std::ios::binary);
+    while (in) {
+      in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+      for (std::streamsize k = 0; k < in.gcount(); ++k) {
+        h = (h ^ static_cast<unsigned char>(buf[static_cast<size_t>(k)])) * 1099511628211ull;
+      }
+    }
+  }
+  char hex[32];
+  std::snprintf(hex, sizeof hex, "fnv1a64:%016llx", static_cast<unsigned long long>(h));
+  return hex;
+}
+
 using Clock = std::chrono::steady_clock;
 
 }  // namespace
@@ -232,14 +479,30 @@ using Clock = std::chrono::steady_clock;
 // ---------------------------------------------------------------- the server
 
 struct Server::Impl {
-  // A page asked for, from the network thread to the engine and back.
+  // A request that needs the engine, from the network thread to the document stream and back: an image (one page),
+  // a PDF (each of its pages), or a /parse body holding either.
   struct Work {
     uint64_t conn = 0;
-    std::shared_ptr<const std::string> body;
+    std::shared_ptr<const std::string> body;  // the page's file: the image's or the PDF's bytes
+    bool pdf = false;
+    bool parse = false;  // /parse: its JSON answer, every page with its html and markdown, and what answers
     std::string format, name;
     bool text_only = false, html = false, keep_alive = true;
+    double dpi = 200;  // a PDF's pages
     Clock::time_point t0;
-    std::shared_ptr<GrayImage> image;  // on a GPU with format=pdf: the decoded page, for the PDF's image
+    // its pages, once the PDF is counted: their results as they finish, and how many are left
+    std::vector<OcrPage> pages;
+    std::vector<std::shared_ptr<const GrayImage>> images;  // format=pdf of a PDF: each page as rendered
+    size_t left = 0;
+    std::filesystem::path file;  // a PDF's bytes on disk, for the helpers, until its pages are rendered
+    size_t rendered = 0;
+    std::exception_ptr error;    // the first page's that met one
+    bool unreadable = false;
+  };
+  // A PDF page to render, by the feeders, between requests.
+  struct Render {
+    uint64_t work = 0;
+    size_t page = 0;
   };
   // An answer, from the threads that write them to the network thread.
   struct Answer {
@@ -260,39 +523,45 @@ struct Server::Impl {
   std::filesystem::path set;
   ServerOptions o;
   Net net;
-  std::unique_ptr<Engine> engine;
-  std::unique_ptr<Pipeline> pipe;
+  std::unique_ptr<DocumentStream> stream;
+  std::string revision;  // the set's files' hash, for /parse's and /served's "served"
   int in_flight = 0;
   Sock listener = kNoSock, wake_r = kNoSock, wake_w = kNoSock;
   int bound_port = 0;
   std::atomic<bool> stopping{false};
 
-  // the requests waiting for the engine
+  // the requests waiting for the engine, and the PDF pages to render
   std::mutex q_m;
   std::condition_variable q_cv;
   std::deque<Work> queue;
-  // the pages given to the engine, by number
+  std::deque<Render> renders;
+  // the requests given to the stream, by number; a page's tag is its request's number and its page
+  static constexpr int kPageBits = 24;
   std::mutex given_m;
   std::condition_variable given_cv;
-  std::unordered_map<size_t, Work> given;
-  size_t next_number = 0, submitted = 0, taken = 0;
+  std::unordered_map<uint64_t, Work> given;
+  uint64_t next_work = 0;
+  size_t pages_given = 0, pages_taken = 0;
   int feeders_left = 0;  // the threads still giving pages
-  std::mutex submit_m;   // on a GPU: a page's number and its place in the pipeline, together
+#if defined(CARBON_WITH_PDFIUM)
+  std::mutex pdf_m;
+  std::unique_ptr<PdfPool> pdf_pool;  // made at the first PDF
+#endif
   // the answers for the network thread
   std::mutex out_m;
   std::vector<Answer> outbox;
 
   Impl(const std::filesystem::path& s, ServerOptions opts) : set(s), o(std::move(opts)) {
-    if (o.cuda) {
-      PipelineOptions po = o.pipeline;
-      po.engine = o.engine;
-      po.device = Device::kCuda;
-      pipe = std::make_unique<Pipeline>(set, po);
-      in_flight = po.in_flight;
-    } else {
-      engine = std::make_unique<Engine>(set, o.engine);
-      in_flight = o.engine.in_flight > 0 ? o.engine.in_flight : 2 * engine->workers();
-    }
+    DocumentOptions d;
+    d.engine = o.engine;
+    d.cuda = o.cuda;
+    d.pipeline = o.pipeline;
+    d.text_layer = o.text_layer;
+    d.pictures = o.pictures;
+    d.layer_lines = o.layer_lines;
+    stream = std::make_unique<DocumentStream>(set, d);
+    in_flight = stream->in_flight();
+    revision = set_revision(set);
     listener = listen_on(o.host, o.port);
     bound_port = port_of(listener);
     try {
@@ -330,6 +599,7 @@ struct Server::Impl {
   // The GPU pipeline's runs so far: how full its batches are, so a load test can see whether its pages in
   // flight fill them. Empty for the CPU engine.
   std::string pipeline_stats() const {
+    const Pipeline* pipe = stream->pipeline();
     if (!pipe) return "";
     const PipelineStats st = pipe->stats();
     char buf[256];
@@ -342,62 +612,122 @@ struct Server::Impl {
     return buf;
   }
 
-  std::string info() const {
-    const int workers = engine ? engine->workers() : 0;
-    return "{\"version\": " + json_string(kVersion) + ", \"set\": " + json_string(set.generic_string()) +
-           ", \"device\": " + (o.cuda ? "\"cuda\"" : "\"cpu\"") + ", \"precision\": " +
-           json_string(precision_name(o.engine.precision)) + ", \"workers\": " + std::to_string(workers) +
-           ", \"in_flight\": " + std::to_string(in_flight) + ", \"queue\": " + std::to_string(o.queue) +
-           pipeline_stats() + "}\n";
+  std::string served() const {
+    return "{\"weights\": " + json_string(set.filename().empty() ? set.parent_path().filename().generic_string()
+                                                                 : set.filename().generic_string()) +
+           ", \"revision\": " + json_string(revision) + "}";
   }
 
-  // A page's answer, in its format, as carbon-ocr ocr writes the page.
-  void answer(Work& w, OcrPage* page, std::exception_ptr error, bool unreadable) {
+  std::string info() const {
+    return "{\"version\": " + json_string(kVersion) + ", \"set\": " + json_string(set.generic_string()) +
+           ", \"device\": " + (o.cuda ? "\"cuda\"" : "\"cpu\"") + ", \"precision\": " +
+           json_string(precision_name(o.engine.precision)) + ", \"workers\": " + std::to_string(stream->workers()) +
+           ", \"in_flight\": " + std::to_string(in_flight) + ", \"queue\": " + std::to_string(o.queue) +
+           ", \"pdf\": " + (pdf_supported() ? "true" : "false") + ", \"served\": " + served() + pipeline_stats() +
+           "}\n";
+  }
+
+  // A page's JSON object as carbon-ocr ocr writes it: OcrPage::json, its page in a PDF first where it has one, and
+  // its html body (to_html_body) and markdown where asked.
+  static std::string page_json(const OcrPage& page, int number, bool html, bool markdown) {
+    std::string s = page.json();
+    if (html) s.insert(s.size() - 1, ", \"html\": " + json_string(to_html_body(page)));
+    if (markdown) s.insert(s.size() - 1, ", \"markdown\": " + json_string(to_markdown(std::span(&page, 1))));
+    if (number > 0) s = "{\"page\": " + std::to_string(number) + ", " + s.substr(1);
+    return s;
+  }
+
+  // A request's answer, in its format, as carbon-ocr ocr writes its pages: an image's page alone (json: the
+  // page's object), a PDF's pages together (json: {"pages": [...]}, each with its page number), /parse's JSON.
+  void answer(Work& w) {
     int status = 200;
     std::string type, body;
     std::vector<std::pair<std::string, std::string>> extra;
-    if (error) {
+    if (w.error) {
       try {
-        std::rethrow_exception(error);
+        std::rethrow_exception(w.error);
+      } catch (const http::BadRequest& e) {
+        status = e.status;
+        body = std::string(e.what()) + "\n";
       } catch (const std::exception& e) {
+        status = w.unreadable ? 422 : 500;
         body = std::string(e.what()) + "\n";
       } catch (...) {
+        status = 500;
         body = "unknown error\n";
       }
-      status = unreadable ? 422 : 500;
       type = "text/plain; charset=utf-8";
     } else {
       try {
-        const std::span<const OcrPage> pages(page, 1);
-        const std::vector<std::string> names = {w.name};
-        type = formats().find(w.format)->second;
-        if (w.format == "json") {  // html=1: the page's html body inside it, as carbon_ocr's html=True gives it
-          body = page->json();
-          if (w.html) body.insert(body.size() - 1, ", \"html\": " + json_string(to_html_body(*page)));
-          body += "\n";
+        const std::span<const OcrPage> pages(w.pages);
+        std::vector<std::string> names;
+        for (size_t i = 0; i < w.pages.size(); ++i) {
+          names.push_back(w.pdf ? w.name + "#page=" + std::to_string(i + 1) : w.name);
+        }
+        type = w.parse ? "application/json" : formats().find(w.format)->second;
+        if (w.parse) {  // every page with its html and markdown, and what answered
+          body = "{\"pages\": [";
+          for (size_t i = 0; i < w.pages.size(); ++i) {
+            body += (i ? ", " : "") + page_json(w.pages[i], w.pdf ? static_cast<int>(i) + 1 : 0, true, true);
+          }
+          body += "], \"served\": " + served() + ", \"vendor\": {\"carbon-ocr\": " + json_string(kVersion) + "}}\n";
+        } else if (w.format == "json") {  // html=1: the page's html body inside it, as carbon_ocr's html=True
+          if (!w.pdf) {
+            body = page_json(w.pages[0], 0, w.html, false) + "\n";
+          } else {
+            body = "{\"pages\": [";
+            for (size_t i = 0; i < w.pages.size(); ++i) {
+              body += (i ? ", " : "") + page_json(w.pages[i], static_cast<int>(i) + 1, w.html, false);
+            }
+            body += "]}\n";
+          }
         } else if (w.format == "text") {
-          body = page->text();
+          for (size_t i = 0; i < w.pages.size(); ++i) body += (i ? "\f\n" : "") + w.pages[i].text();
         } else if (w.format == "hocr") {
           body = to_hocr(pages, names);
         } else if (w.format == "alto") {
           body = to_alto(pages, names);
         } else if (w.format == "page") {
-          body = to_page_xml(*page, w.name);
+          if (w.pages.size() != 1) {
+            throw http::BadRequest(400, "format page is one page's PAGE XML; this PDF has " +
+                                            std::to_string(w.pages.size()));
+          }
+          body = to_page_xml(w.pages[0], w.name);
         } else if (w.format == "markdown") {
           body = to_markdown(pages);
         } else if (w.format == "html") {
           body = to_html(pages);
-        } else {  // pdf: the page's image under its words
-          const GrayImage img = w.image ? std::move(*w.image)
-                                        : decode_image(std::span<const uint8_t>(
-                                              reinterpret_cast<const uint8_t*>(w.body->data()), w.body->size()));
-          const GrayView view = img.view();
-          body = to_pdf(pages, std::span<const GrayView>(&view, 1), o.image_dpi, w.text_only);
+        } else {  // pdf: the pages' images under their words
+          std::vector<GrayImage> decoded;
+          std::vector<GrayView> views;
+          std::vector<double> dpis;
+          if (w.pdf) {
+            for (const auto& img : w.images) views.push_back(img->view());
+            dpis.assign(w.pages.size(), w.dpi);
+          } else {
+            decoded.push_back(decode_image(
+                std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(w.body->data()), w.body->size())));
+            views.push_back(decoded[0].view());
+            dpis.push_back(o.image_dpi);
+          }
+          body = to_pdf(pages, views, dpis, w.text_only);
         }
-        char ms[32];
-        std::snprintf(ms, sizeof ms, "%.1f", page->ms.total);
-        extra.emplace_back("X-Carbon-Ms", ms);
-        extra.emplace_back("X-Carbon-Lines", std::to_string(page->lines.size()));
+        double ms = 0;
+        size_t lines = 0;
+        for (const OcrPage& p : w.pages) {
+          ms += p.ms.total;
+          lines += p.lines.size();
+        }
+        char t[32];
+        std::snprintf(t, sizeof t, "%.1f", ms);
+        extra.emplace_back("X-Carbon-Ms", t);
+        extra.emplace_back("X-Carbon-Lines", std::to_string(lines));
+        if (w.pdf) extra.emplace_back("X-Carbon-Pages", std::to_string(w.pages.size()));
+      } catch (const http::BadRequest& e) {
+        status = e.status;
+        type = "text/plain; charset=utf-8";
+        body = std::string(e.what()) + "\n";
+        extra.clear();
       } catch (const std::exception& e) {
         status = 500;
         type = "text/plain; charset=utf-8";
@@ -406,29 +736,38 @@ struct Server::Impl {
       }
     }
     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - w.t0).count();
-    char line[160];
-    std::snprintf(line, sizeof line, "POST /ocr %d %s %zu bytes in, %zu out, %.1f ms", status, w.format.c_str(),
-                  w.body ? w.body->size() : size_t{0}, body.size(), ms);
+    char line[200];
+    std::snprintf(line, sizeof line, "POST %s %d %s %zu bytes in, %zu page%s, %zu out, %.1f ms",
+                  w.parse ? "/parse" : "/ocr", status, w.parse ? "json" : w.format.c_str(),
+                  w.body ? w.body->size() : size_t{0}, w.pages.size(), w.pages.size() == 1 ? "" : "s", body.size(),
+                  ms);
     log(line);
     post({w.conn, http::response(status, type, body, w.keep_alive, extra), !w.keep_alive});
   }
 
-  // The next request waiting, or nullopt once stopping.
-  std::optional<Work> take_waiting() {
+  // A request's pages all in (or its first error): its answer, by the writers.
+  void hand_on(Work w) {
+    if (!w.file.empty()) {  // a PDF failed before every page was rendered
+      std::error_code ec;
+      std::filesystem::remove(w.file, ec);
+    }
+    hand_to_writers(std::move(w));
+  }
+
+  // The next request waiting or PDF page to render (the pages first: a PDF's pages keep the stream fed), or
+  // nullopt once stopping.
+  std::optional<std::variant<Work, Render>> take_waiting() {
     std::unique_lock lk(q_m);
-    q_cv.wait(lk, [&] { return stopping || !queue.empty(); });
+    q_cv.wait(lk, [&] { return stopping || !queue.empty() || !renders.empty(); });
     if (stopping) return std::nullopt;
+    if (!renders.empty()) {
+      Render r = renders.front();
+      renders.pop_front();
+      return r;
+    }
     Work w = std::move(queue.front());
     queue.pop_front();
     return w;
-  }
-
-  void given_one() {
-    {
-      std::lock_guard lk(given_m);
-      ++submitted;
-    }
-    given_cv.notify_all();
   }
 
   void feeder_done() {
@@ -439,108 +778,185 @@ struct Server::Impl {
     given_cv.notify_all();
   }
 
-  // The CPU: each page to the engine's stream as its bytes, decoded by the worker that takes it.
-  void feed_engine() {
-    while (auto w = take_waiting()) {
-      const size_t n = next_number++;  // this thread alone gives pages, so they are numbered as given
-      const std::shared_ptr<const std::string> body = w->body;
+  // A request's page `p` given to the stream, counted first (the collector waits for pages given).
+  template <class Give>
+  void give_page(uint64_t id, size_t p, Give&& give) {
+    {
+      std::lock_guard lk(given_m);
+      ++pages_given;
+    }
+    given_cv.notify_all();
+    give((id << kPageBits) | p);
+  }
+
+  // The feeders: each request's pages to the stream (an image's bytes, decoded by the worker that takes the
+  // page, on a GPU here; a PDF's pages counted, then rendered by the feeders one at a time).
+  void feed() {
+    while (auto item = take_waiting()) {
+      if (Render* r = std::get_if<Render>(&*item)) {
+        render(*r);
+        continue;
+      }
+      Work& w = std::get<Work>(*item);
+      uint64_t id = 0;
+      if (!w.pdf) {
+        w.pages.resize(1);
+        w.left = 1;
+        const std::shared_ptr<const std::string> body = w.body;
+        {
+          std::lock_guard lk(given_m);
+          id = next_work++;
+          given.emplace(id, std::move(w));
+        }
+        give_page(id, 0, [&](uint64_t tag) { stream->encoded(body, tag); });
+        continue;
+      }
+      start_pdf(std::move(w));
+    }
+    feeder_done();
+  }
+
+  // A PDF's bytes on disk for the helpers, its pages counted, and a render task for each.
+  void start_pdf(Work w) {
+#if defined(CARBON_WITH_PDFIUM)
+    try {
+      static std::atomic<uint64_t> files{0};
+      w.file = std::filesystem::temp_directory_path() /
+               ("carbon-serve-" + std::to_string(bound_port) + "-" + std::to_string(files++) + ".pdf");
+      {
+        std::ofstream f(w.file, std::ios::binary);
+        f.write(w.body->data(), static_cast<std::streamsize>(w.body->size()));
+        if (!f) throw Error("serve: cannot write the PDF to " + w.file.string());
+      }
+      int n = 0;
+      {
+        std::lock_guard lk(pdf_m);
+        if (!pdf_pool) pdf_pool = std::make_unique<PdfPool>(o.engine.pool.workers, o.pdf_helper);
+      }
+      try {
+        n = pdf_pool->pages(w.file);
+      } catch (...) {
+        w.unreadable = true;
+        throw;
+      }
+      if (n <= 0) throw http::BadRequest(422, "the PDF has no pages");
+      if (n >= (1 << kPageBits)) throw http::BadRequest(413, "the PDF has " + std::to_string(n) + " pages");
+      w.pages.resize(static_cast<size_t>(n));
+      if (w.format == "pdf" && !w.parse) w.images.resize(static_cast<size_t>(n));
+      w.left = static_cast<size_t>(n);
+      uint64_t id = 0;
       {
         std::lock_guard lk(given_m);
-        given.emplace(n, std::move(*w));
+        id = next_work++;
+        given.emplace(id, std::move(w));
       }
-      try {
-        const size_t got = engine->submit_encoded(
-            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(body->data()), body->size()), body);
-        if (got != n) throw Error("serve: the engine numbered a page " + std::to_string(got) + ", not " +
-                                  std::to_string(n));
-      } catch (...) {
-        Work lost;
-        {
-          std::lock_guard lk(given_m);
-          lost = std::move(given.at(n));
-          given.erase(n);
-        }
-        --next_number;
-        answer(lost, nullptr, std::current_exception(), false);
-        continue;
-      }
-      given_one();
-    }
-    feeder_done();
-  }
-
-  // On a GPU: decoded on these threads, then given to the pipeline, a page's number and its place in it
-  // taken together.
-  void feed_pipeline() {
-    while (auto w = take_waiting()) {
-      GrayImage img;
-      try {
-        img = decode_image(
-            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(w->body->data()), w->body->size()));
-      } catch (...) {
-        answer(*w, nullptr, std::current_exception(), true);
-        continue;
-      }
-      if (w->format == "pdf") w->image = std::make_shared<GrayImage>(img);
-      std::exception_ptr failed;
       {
-        std::lock_guard sub(submit_m);  // submit waits while the pipeline is full: the other decoders here
-        const size_t n = next_number;
-        {
-          std::lock_guard lk(given_m);
-          given.emplace(n, std::move(*w));
-        }
-        try {
-          pipe->submit(std::move(img));
-          ++next_number;
-        } catch (...) {
-          failed = std::current_exception();
-          std::lock_guard lk(given_m);
-          *w = std::move(given.at(n));
-          given.erase(n);
-        }
+        std::lock_guard lk(q_m);
+        for (int p = 0; p < n; ++p) renders.push_back({id, static_cast<size_t>(p)});
       }
-      if (failed) {
-        answer(*w, nullptr, failed, false);
-        continue;
-      }
-      given_one();
+      q_cv.notify_all();
+    } catch (...) {
+      w.error = std::current_exception();
+      hand_on(std::move(w));
     }
-    feeder_done();
+#else
+    w.error = std::make_exception_ptr(http::BadRequest(415, "this build reads no PDFs"));
+    hand_on(std::move(w));
+#endif
   }
 
-  // ------------------------------------------------ the writers: each finished page's answer written in its
-  // format (a PDF's deflate, an hOCR's XML) on a thread of their own, so the collect thread only takes pages.
-  struct Done {
-    Work w;
-    OcrPage page;
-    std::exception_ptr error;
-    bool unreadable = false;
-  };
+  // One page of a PDF rendered and given to the stream; its error, its request's.
+  void render(const Render& r) {
+#if defined(CARBON_WITH_PDFIUM)
+    std::filesystem::path file;
+    double dpi = 200;
+    bool keep = false;
+    {
+      std::lock_guard lk(given_m);
+      auto it = given.find(r.work);
+      if (it == given.end()) return;
+      file = it->second.file;
+      dpi = it->second.dpi;
+      keep = !it->second.images.empty();
+    }
+    bool last = false;
+    try {
+      PdfPage pg = pdf_pool->page(file, static_cast<int>(r.page), dpi / 72.0, stream->pdf_want());
+      // format=pdf: each page's image as shown (one read turned upright, turned back; one turned that goes to
+      // OCR rendered again as shown, below)
+      const auto keep_image = [&](GrayImage image) {
+        std::lock_guard lk(given_m);
+        auto it = given.find(r.work);
+        if (it != given.end()) it->second.images[r.page] = std::make_shared<const GrayImage>(std::move(image));
+      };
+      if (keep) keep_image(pg.turn ? rotate_quarter(pg.image.view(), 4 - pg.turn) : GrayImage(pg.image));
+      const double scale = pg.scale;
+      give_page(r.work, r.page, [&](uint64_t tag) {
+        stream->pdf_page(std::move(pg), tag, [&] {
+          GrayImage shown = pdf_pool->page(file, static_cast<int>(r.page), scale, kPdfImage).image;
+          if (keep) keep_image(shown);
+          return shown;
+        });
+      });
+      {  // rendered once the stream has it: its file no more read for it
+        std::lock_guard lk(given_m);
+        auto it = given.find(r.work);
+        if (it != given.end()) last = ++it->second.rendered == it->second.pages.size();
+      }
+    } catch (...) {  // not rendered: the page is taken as failed with it
+      Done d;
+      d.tag = (r.work << kPageBits) | r.page;
+      d.error = std::current_exception();
+      {
+        std::lock_guard lk(given_m);
+        ++pages_given;
+        ++pages_taken;
+        auto it = given.find(r.work);
+        if (it != given.end()) last = ++it->second.rendered == it->second.pages.size();
+      }
+      page_done(d);
+    }
+    if (last) {
+      std::lock_guard lk(given_m);
+      auto it = given.find(r.work);
+      if (it != given.end()) {
+        std::error_code ec;
+        std::filesystem::remove(it->second.file, ec);  // every page rendered: its file no more needed
+        it->second.file.clear();
+      }
+    }
+#else
+    (void)r;
+#endif
+  }
+
+  // ------------------------------------------------ the writers: each finished request's answer written in
+  // its format (a PDF's deflate, an hOCR's XML) on a thread of their own, so the collect thread only takes pages.
+  using Done = DocumentStream::Done;
   std::mutex w_m;
   std::condition_variable w_cv;
-  std::deque<Done> to_write;
+  std::deque<Work> to_write;
   bool writing_done = false;
 
-  void hand_to_writers(Done d) {
+  void hand_to_writers(Work w) {
     {
       std::lock_guard lk(w_m);
-      to_write.push_back(std::move(d));
+      to_write.push_back(std::move(w));
     }
     w_cv.notify_one();
   }
 
   void write_answers() {
     for (;;) {
-      Done d;
+      Work w;
       {
         std::unique_lock lk(w_m);
         w_cv.wait(lk, [&] { return writing_done || !to_write.empty(); });
         if (to_write.empty()) return;  // collect is done and every answer written
-        d = std::move(to_write.front());
+        w = std::move(to_write.front());
         to_write.pop_front();
       }
-      answer(d.w, d.error ? nullptr : &d.page, d.error, d.unreadable);
+      answer(w);
     }
   }
 
@@ -554,55 +970,44 @@ struct Server::Impl {
     w_cv.notify_all();
   }
 
-  // The pages as they finish, each handed to the writers as soon as it is: the CPU engine's next_finished, and the
-  // GPU pipeline's (a slow page holds back no other).
+  // A page out: into its request, which goes to the writers once its last page is in.
+  void page_done(Done& d) {
+    const uint64_t id = d.tag >> kPageBits;
+    const size_t p = static_cast<size_t>(d.tag & ((uint64_t{1} << kPageBits) - 1));
+    std::optional<Work> ready;
+    {
+      std::lock_guard lk(given_m);
+      auto it = given.find(id);
+      if (it == given.end()) return;
+      Work& w = it->second;
+      if (d.error && !w.error) {
+        w.error = d.error;
+        w.unreadable = d.unreadable;
+      }
+      if (!d.error && p < w.pages.size()) w.pages[p] = std::move(d.page);
+      if (--w.left == 0) {
+        ready = std::move(w);
+        given.erase(it);
+      }
+    }
+    if (ready) hand_on(std::move(*ready));
+  }
+
+  // The pages as they finish (a slow page holds back no other), each into its request.
   void collect() {
     for (;;) {
       {
         std::unique_lock lk(given_m);
-        given_cv.wait(lk, [&] { return submitted > taken || feeders_left == 0; });
-        if (submitted == taken) return;  // every feeder gone, every page answered
+        given_cv.wait(lk, [&] { return pages_given > pages_taken || feeders_left == 0; });
+        if (pages_given == pages_taken) return;  // every feeder gone, every page answered
       }
-      size_t n = 0;
-      OcrPage page;
-      std::exception_ptr error;
-      bool unreadable = false;
-      if (engine) {
-        std::optional<Engine::Finished> f = engine->next_finished();
-        if (!f) continue;
-        n = f->number;
-        page = std::move(f->page);
-        error = f->error;
-        unreadable = f->unreadable;
-      } else {
-        std::optional<Pipeline::Finished> f;
-        try {
-          f = pipe->next_finished();
-        } catch (...) {  // the pipeline stopped (a broken device): the oldest page waiting takes its error
-          error = std::current_exception();
-          std::lock_guard lk(given_m);
-          if (given.empty()) continue;
-          n = std::min_element(given.begin(), given.end(),
-                               [](const auto& a, const auto& b) { return a.first < b.first; })->first;
-        }
-        if (f) {
-          n = f->number;
-          page = std::move(f->page);
-          error = f->error;
-        } else if (!error) {
-          continue;
-        }
-      }
-      Work w;
+      std::optional<Done> d = stream->next();
+      if (!d) return;
       {
         std::lock_guard lk(given_m);
-        auto it = given.find(n);
-        if (it == given.end()) continue;
-        w = std::move(it->second);
-        given.erase(it);
-        ++taken;
+        ++pages_taken;
       }
-      hand_to_writers({std::move(w), std::move(page), error, unreadable});
+      page_done(*d);
     }
   }
 
@@ -656,7 +1061,8 @@ struct Server::Impl {
 
   void route(uint64_t id, Conn& c, const http::Request& req, std::string body) {
     const bool keep = req.keep_alive;
-    if (req.path == "/health" || req.path == "/info") {
+    if (req.path == "/health" || req.path == "/info" || req.path == "/served") {
+      const Pipeline* pipe = stream->pipeline();
       if (req.method != "GET") {
         error_reply(c, 405, req.path + " takes GET", keep, {{"Allow", "GET"}});
       } else if (req.path == "/health") {
@@ -665,43 +1071,84 @@ struct Server::Impl {
         } else {
           reply(c, 200, "text/plain; charset=utf-8", "ok\n", keep);
         }
+      } else if (req.path == "/served") {
+        reply(c, 200, "application/json", served() + "\n", keep);
       } else {
         reply(c, 200, "application/json", info(), keep);
       }
       return;
     }
-    if (req.path != "/ocr") {
-      error_reply(c, 404, "no " + req.path + ": POST /ocr, GET /health, GET /info", keep);
+    if (req.path != "/ocr" && req.path != "/parse") {
+      error_reply(c, 404, "no " + req.path + ": POST /ocr, POST /parse, GET /health, GET /info, GET /served", keep);
       return;
     }
     if (req.method != "POST") {
-      error_reply(c, 405, "/ocr takes POST, the page's image as its body", keep, {{"Allow", "POST"}});
+      error_reply(c, 405,
+                  req.path == "/ocr" ? "/ocr takes POST, the page's image or PDF as its body"
+                                     : "/parse takes POST, a JSON object of the page and its settings",
+                  keep, {{"Allow", "POST"}});
       return;
     }
     if (!req.has_length) {
-      error_reply(c, 411, "/ocr needs a Content-Length", false);
+      error_reply(c, 411, req.path + " needs a Content-Length", false);
       return;
     }
     Work w;
-    w.format = std::string(req.param("format").value_or("json"));
-    if (!formats().count(w.format)) {
-      error_reply(c, 400, "format " + w.format + ": json, text, hocr, alto, page, markdown, html or pdf", keep);
-      return;
+    if (req.path == "/parse") {  // {"page": base64 file, "suffix": ".pdf" or the image's, "settings": {"dpi": N}}
+      w.parse = true;
+      w.format = "json";
+      w.name = "page";
+      try {
+        const Json doc = JsonReader(body).document();
+        const Json* page = doc.get("page");
+        if (doc.kind != Json::kObject || !page || page->kind != Json::kString) {
+          throw http::BadRequest(400, "/parse takes {\"page\": the file in base64, \"suffix\", \"settings\"}");
+        }
+        if (const Json* s = doc.get("settings"); s && s->kind != Json::kNull) {
+          if (s->kind != Json::kObject) throw http::BadRequest(400, "settings is an object");
+          for (const auto& [k, v] : s->fields) {
+            if (k != "dpi") throw http::BadRequest(400, "setting " + k + ": the settings are dpi");
+            if (v.kind != Json::kNumber || !(v.n >= 36 && v.n <= 1200)) {
+              throw http::BadRequest(400, "dpi takes a number from 36 to 1200");
+            }
+            w.dpi = v.n;
+          }
+        }
+        body = from_base64(page->s);
+      } catch (const http::BadRequest& e) {
+        error_reply(c, e.status, e.what(), keep);
+        return;
+      }
+    } else {
+      w.format = std::string(req.param("format").value_or("json"));
+      if (!formats().count(w.format)) {
+        error_reply(c, 400, "format " + w.format + ": json, text, hocr, alto, page, markdown, html or pdf", keep);
+        return;
+      }
+      w.name = std::string(req.param("name").value_or("page"));
+      const std::string_view to = req.param("text_only").value_or("0");
+      w.text_only = to == "1" || to == "true";
+      const std::string_view html = req.param("html").value_or("0");
+      w.html = html == "1" || html == "true";
+      if (const auto dpi = req.param("dpi")) {
+        const std::string v(*dpi);
+        char* end = nullptr;
+        w.dpi = std::strtod(v.c_str(), &end);
+        if (end == v.c_str() || *end || !(w.dpi >= 36 && w.dpi <= 1200)) {
+          error_reply(c, 400, "dpi takes a number from 36 to 1200", keep);
+          return;
+        }
+      }
     }
-    w.name = std::string(req.param("name").value_or("page"));
-    const std::string_view to = req.param("text_only").value_or("0");
-    w.text_only = to == "1" || to == "true";
-    const std::string_view html = req.param("html").value_or("0");
-    w.html = html == "1" || html == "true";
     const Kind kind = sniff(body);
-    if (body.empty() || kind != Kind::kImage) {
+    if (body.empty() || kind == Kind::kOther || (kind == Kind::kPdf && !pdf_supported())) {
       error_reply(c, 415,
-                  kind == Kind::kPdf ? "a PDF: the server reads page images (PNG, JPEG, BMP, PNM); carbon-ocr ocr "
-                                       "reads PDFs"
-                                     : "the body is no image the server reads: PNG, JPEG, BMP or PNM",
+                  kind == Kind::kPdf ? "a PDF, which this build does not read (CMake option CARBON_WITH_PDFIUM)"
+                                     : "the body is no page the server reads: PNG, JPEG, BMP, PNM, GIF, WebP or PDF",
                   keep);
       return;
     }
+    w.pdf = kind == Kind::kPdf;
     w.conn = id;
     w.keep_alive = keep;
     w.t0 = Clock::now();
@@ -755,14 +1202,13 @@ struct Server::Impl {
   void run() {
     std::vector<std::thread> threads;
     // On the GPU, PNG decoding (about 10 ms a page a core) is the CPU's share of a page: half the physical cores
-    // by default, at least 4, where 4 alone capped a server near 370 pages a second.
-    const int feeders = o.cuda ? std::max(1, o.decoders > 0 ? o.decoders
-                                                            : std::max(4, cpu_topology().default_workers() / 2))
-                               : 1;
+    // by default, at least 4, where 4 alone capped a server near 370 pages a second. On the
+    // CPU an image's bytes are only handed to the engine, whose workers decode them; a PDF's pages are rendered by
+    // the feeders (a helper process each at a time): half the physical cores, at least 2.
+    const int cores = cpu_topology().default_workers();
+    const int feeders = o.decoders > 0 ? o.decoders : o.cuda ? std::max(4, cores / 2) : std::max(2, cores / 2);
     feeders_left = feeders;
-    for (int i = 0; i < feeders; ++i) {
-      threads.emplace_back([this] { o.cuda ? feed_pipeline() : feed_engine(); });
-    }
+    for (int i = 0; i < feeders; ++i) threads.emplace_back([this] { feed(); });
     threads.emplace_back([this] { collect_then_done(); });
     const int writers = o.writers > 0 ? o.writers : (o.cuda ? std::max(2, feeders / 2) : 2);
     for (int i = 0; i < writers; ++i) threads.emplace_back([this] { write_answers(); });
@@ -838,11 +1284,16 @@ struct Server::Impl {
     {
       std::lock_guard lk(q_m);
       queue.clear();
+      renders.clear();
     }
     for (std::thread& t : threads) t.join();
     for (auto& [id, c] : conns) close_sock(c.fd);
     conns.clear();
-    if (pipe) pipe->close();
+    std::lock_guard lk(given_m);  // the PDFs whose pages were left unrendered: their files
+    for (auto& [n, w] : given) {
+      std::error_code ec;
+      if (!w.file.empty()) std::filesystem::remove(w.file, ec);
+    }
   }
 };
 

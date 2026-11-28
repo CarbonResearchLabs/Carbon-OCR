@@ -12,8 +12,10 @@ add_library(carbon
   src/det_head.cpp
   src/engine.cpp
   src/pipeline.cpp
+  src/document.cpp
   src/image.cpp
   src/png.cpp
+  src/webp.cpp
   src/parallel.cpp
   src/strips.cpp
   src/cpu/features.cpp
@@ -38,9 +40,9 @@ target_include_directories(carbon
 target_compile_features(carbon PUBLIC cxx_std_20)
 find_package(Threads REQUIRED)
 # stb_image's header, compiled into src/image.cpp only; libdeflate for the searchable PDF's
-# images and the PNG pages (src/png.cpp)
+# images and the PNG pages (src/png.cpp); libwebp's decoder for the WebP pages (src/webp.cpp)
 target_include_directories(carbon SYSTEM PRIVATE ${CARBON_STB_INCLUDE_DIR})
-target_link_libraries(carbon PUBLIC Threads::Threads PRIVATE libdeflate::libdeflate_static)
+target_link_libraries(carbon PUBLIC Threads::Threads PRIVATE libdeflate::libdeflate_static webp)
 # MSVC builds libdeflate's BMI2 decoder without AVX2's code generation (no per-function target): a second
 # copy of the decoder in a file compiled with /arch:AVX2, which png.cpp calls where the CPU has AVX2 and BMI2
 # (x64 only: MSVC for Arm64 has no /arch:AVX2).

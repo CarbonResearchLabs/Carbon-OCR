@@ -45,6 +45,7 @@
 #include <utility>
 #include <vector>
 
+#include "buffer.h"
 #include "carbon/cuda.h"
 #include "carbon/engine.h"
 #include "carbon/error.h"
@@ -87,14 +88,17 @@ float half_to_float(uint16_t h) {
   return negative ? -v : v;
 }
 
-// Device memory, allocated once at its largest.
+// Device memory, allocated once at its largest; a buffer that must grow later grows by half again at least, so a
+// run of slightly larger calls does not reallocate each time.
 struct DeviceMem {
   void* p = nullptr;
   size_t bytes = 0;
   void reserve(size_t n) {
     if (n <= bytes) return;
+    n = std::max(n, bytes + bytes / 2);
     if (p) cudaFree(p);
     p = nullptr;
+    bytes = 0;
     check(cudaMalloc(&p, n), "cudaMalloc");
     bytes = n;
   }
@@ -107,14 +111,16 @@ struct DeviceMem {
   }
 };
 
-// Pinned host memory, for copies the stream does not wait for.
+// Pinned host memory, for copies the stream does not wait for; grown as DeviceMem.
 struct Pinned {
   void* p = nullptr;
   size_t bytes = 0;
   void reserve(size_t n) {
     if (n <= bytes) return;
+    n = std::max(n, bytes + bytes / 2);
     if (p) cudaFreeHost(p);
     p = nullptr;
+    bytes = 0;
     check(cudaHostAlloc(&p, n, cudaHostAllocDefault), "cudaHostAlloc");
     bytes = n;
   }
@@ -186,6 +192,7 @@ class CudaModels final : public PipelineModels {
       det2_half_in_ = is_half(det2_->inputs().at(0), det_file);
       det2_half_out_ = is_half(det2_->outputs().at(0), det_file);
       const size_t px = static_cast<size_t>(second_side_) * second_side_;
+      det2_up_.reserve(px * sizeof(float));  // its input staged in pinned memory, sized once
       det2_f32_.reserve(px * sizeof(float));
       if (det2_half_in_) det2_in_.reserve(px * sizeof(uint16_t));
       det2_maps_.reserve(px / 4 * 4 * (det2_half_out_ ? 2 : 4));  // [1][4][h/2][w/2]
@@ -254,6 +261,7 @@ class CudaModels final : public PipelineModels {
     det_u8_.reserve(maxb * page_px);
     det_in_.reserve(maxb * page_px * (det_half_in_ ? 2 : 4));
     det_maps_.reserve(maxb * page_px / 4 * 4 * (det_half_out_ ? 2 : 4));  // [b][4][h/2][w/2]
+    for (const auto& [ph, pw] : sizes_) det_scratch_.reserve(maxb, ph / 2, pw / 2, det_half_out_);
     const size_t widest = static_cast<size_t>(widths_.back()), frames = widest / crop_.frame_px;
     crops_.reserve(static_cast<size_t>(lines_max_) * h * widest);
     rec_in_.reserve(static_cast<size_t>(lines_max_) * h * widest * (rec_half_in_ ? 2 : 4));
@@ -268,6 +276,17 @@ class CudaModels final : public PipelineModels {
       logits_.reserve(static_cast<size_t>(lines_max_) * classes_ * frames * sizeof(float));
     }
     widths_host_.reserve(crop_widths_.bytes);
+    if (o.beam.on()) {  // the beam's candidates' buffers at a run's most lines and frames, k at most 16
+      const size_t rows = static_cast<size_t>(lines_max_), cells = rows * frames * 16;
+      beam_up_.reserve(3 * rows * sizeof(int32_t));
+      beam_idx_.reserve(3 * rows * sizeof(int32_t));
+      beam_ids_.reserve(cells * sizeof(int32_t));
+      beam_logp_.reserve(cells * sizeof(float));
+      beam_blank_.reserve(rows * frames * sizeof(float));
+      beam_ids_host_.reserve(beam_ids_.bytes);
+      beam_logp_host_.reserve(beam_logp_.bytes);
+      beam_blank_host_.reserve(beam_blank_.bytes);
+    }
     uploader_ = std::thread([this] { uploader(); });
   }
 
@@ -333,7 +352,7 @@ class CudaModels final : public PipelineModels {
     det_->enqueue(x, y, s);
     const std::vector<DetMasks> masks = cuda::threshold_det(det_maps_.p, det_half_out_, n,
                                                             static_cast<int>(out_shape[2]),
-                                                            static_cast<int>(out_shape[3]), rule, s);
+                                                            static_cast<int>(out_shape[3]), rule, s, &det_scratch_);
     std::vector<Detection> found;
     for (const DetMasks& m : masks) found.push_back(decode_det(m, 1.0, rule));
     return found;
@@ -376,7 +395,9 @@ class CudaModels final : public PipelineModels {
     }
     const size_t px = static_cast<size_t>(s[2]) * s[3];
     const cudaStream_t st = det_s_.s;
-    check(cudaMemcpyAsync(det2_f32_.p, input.data<float>().data(), px * sizeof(float), cudaMemcpyHostToDevice, st),
+    // through pinned memory: the copy engine's, not the driver's staging on this thread; free again at the sync
+    std::memcpy(det2_up_.p, input.data<float>().data(), px * sizeof(float));
+    check(cudaMemcpyAsync(det2_f32_.p, det2_up_.p, px * sizeof(float), cudaMemcpyHostToDevice, st),
           "second pass input");
     void* x_in = det2_f32_.p;
     if (det2_half_in_) {
@@ -571,12 +592,10 @@ class CudaModels final : public PipelineModels {
     for (int i = 0; i < m; ++i) lengths[i] = std::min<int32_t>(frames, w[i] / crop.frame_px);
   }
 
-  // A group's pages on the device: two of them, the current group's and the next's, each its
-  // pages' bytes in pinned memory (copied at memory speed, then sent by the copy engine while the recognize stream
-  // reads the other slot's) and an event its upload records.
+  // A group's pages on the device: two of them, the current group's and the next's, each
+  // sent by the copy engine while the recognize stream reads the other slot's, and an event its upload records.
   struct PageSlot {
     DeviceMem dev;
-    Pinned host;
     std::vector<GrayView> views;
     std::vector<cuda::DevicePage> device;
     cudaEvent_t done = nullptr;
@@ -599,27 +618,26 @@ class CudaModels final : public PipelineModels {
   }
 
   // The slot was last read two groups ago (every run of it synchronized since) or by a prefetch not taken: its
-  // last upload is waited for before its pinned bytes are written again. Each page keeps its whole layout on the
-  // device, but only the rows its crops read (rows[i], where given) are copied and sent, in chunks of kChunk,
-  // each sent (asynchronously, from pinned memory) as soon as it is copied, so the copy engine sends one chunk while
-  // the host copies the next, as CUDA's own staging of pageable memory overlaps them.
+  // last upload is waited for before its device bytes are written again. Each page keeps its whole layout on the
+  // device, but only the rows its crops read (rows[i], where given) are sent, through the staging ring:
+  // copied into a room of up to kChunk, each room sent (asynchronously, from pinned memory) as soon as it is full,
+  // so the copy engine sends one while the host fills the next, and the host's pinned memory is the ring's alone,
+  // the same few MB whatever the groups hold.
   void upload(PageSlot& slot, std::span<const GrayView> pages, std::span<const RowRuns> rows) {
-    constexpr size_t kChunk = size_t{1} << 20;
     check(cudaEventSynchronize(slot.done), "cudaEventSynchronize");
     size_t total = 0;
     for (const GrayView& g : pages) total += static_cast<size_t>(g.width) * g.height;
     if (total > slot.dev.bytes) {  // grown by half again, so a few larger groups do not each reallocate
-      const size_t grown = std::max(total, slot.dev.bytes + slot.dev.bytes / 2);
-      slot.dev.reserve(grown);
-      slot.host.reserve(grown);
+      slot.dev.reserve(std::max(total + total / 2, slot.dev.bytes + slot.dev.bytes / 2));
     }
     slot.views.assign(pages.begin(), pages.end());
     slot.device.clear();
-    uint8_t* h = slot.host.as<uint8_t>();
     uint8_t* d = slot.dev.as<uint8_t>();
-    size_t from = 0, to = 0;  // the bytes copied and not yet sent, [from, to)
+    uint8_t* room = nullptr;  // the ring's room being filled: bytes for [from, to) on the device
+    size_t from = 0, to = 0;
     auto flush = [&] {
-      if (to > from) check(cudaMemcpyAsync(d + from, h + from, to - from, cudaMemcpyHostToDevice, copy_s_.s), "pages");
+      if (room && to > from) page_ring_.send(d + from, to - from, copy_s_.s);
+      room = nullptr;
       from = to;
     };
     size_t base = 0;
@@ -631,9 +649,10 @@ class CudaModels final : public PipelineModels {
         from = to = at;
       }
       for (int y = y0; y < y1; ++y) {
-        std::memcpy(h + to, g.data + static_cast<int64_t>(y) * g.stride, w);
+        if (room && to - from + w > kChunk) flush();
+        if (!room) room = page_ring_.take(std::max(kChunk, w));
+        std::memcpy(room + (to - from), g.data + static_cast<int64_t>(y) * g.stride, w);
         to += w;
-        if (to - from >= kChunk) flush();
       }
     };
     for (size_t i = 0; i < pages.size(); ++i) {
@@ -689,7 +708,7 @@ class CudaModels final : public PipelineModels {
   int second_side_ = 0;            // its input's largest side
   bool det2_half_in_ = true, det2_half_out_ = true;
   DeviceMem det2_f32_, det2_in_, det2_maps_;
-  Pinned det2_host_;
+  Pinned det2_up_, det2_host_;
   bool fused_ = false;
   bool head_half_ = false;  // the fused head's products summed in FP16
   // each model's input and output: float16, else float32
@@ -702,6 +721,7 @@ class CudaModels final : public PipelineModels {
   Pinned orient_host_, orient_logits_;
   Pinned det_host_;
   DeviceMem det_u8_, det_in_, det_maps_;
+  cuda::DetScratch det_scratch_;  // threshold_det's buffers, at the largest batch from the start
   DeviceMem crops_, rec_in_, crop_widths_, features_, ids_, probs_, logits_;
   Stream copy_s_;          // the pages' uploads
   PageSlot slots_[2];
@@ -711,6 +731,10 @@ class CudaModels final : public PipelineModels {
     std::vector<GrayView> pages;
     std::vector<RowRuns> rows;
   };
+  static constexpr size_t kChunk = size_t{1} << 20;  // a room of the pages' staging ring
+  // The pages' uploads' pinned memory: used by set_pages and the uploader thread, one at a time (set_pages
+  // waits for the uploader first), sized once.
+  cuda::mem::Staging page_ring_{8 * kChunk};
   std::mutex up_m_;
   std::condition_variable up_cv_;
   UpJob up_job_;

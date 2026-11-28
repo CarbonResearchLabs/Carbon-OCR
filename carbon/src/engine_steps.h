@@ -52,6 +52,23 @@ void thumbnail_input(const GrayView& small, int page_w, int page_h, int side, fl
 // the sum of its three bins (for 90: 60, 90 and 120 degrees).
 int rotation_of(std::span<const float> logits, float turn_probability, bool quarters = false);
 
+// A turn read before it is made (TurnCheck): the orientation logits' softmax over the sideways bins: right the mass
+// of 60, 90 and 120 degrees (text turned clockwise a quarter: rotation 90), left of 240, 270 and 300 (rotation 270).
+struct SidewaysMass {
+  double right = 0, left = 0;
+};
+SidewaysMass sideways_mass(std::span<const float> logits);
+// The turn a page's readings bear out (TurnCheck), from orientation's turn and the reading of the page so turned as
+// it stands (as_turned) and turned half round (half_round). Where one of them reaches the floor, the surer: 180 kept
+// unless half_round is surer than as_turned (then 0); 90 or 270 (where check.quarters) the other way round where
+// half_round is the surer. Where neither does: a half turn `unread` (orientation's turn as it is made without the
+// check), a quarter turn as it was. 0 stays 0.
+int settle_turn(int rotation, double as_turned, double half_round, const TurnCheck& check, int unread);
+// An unsure sideways page's turn: `side` its likelier side (90 or 270), as_given its reading as given, at_side and
+// opposite its reading turned to that side, as it stands and turned half round. The surer of the two sideways turns
+// where it is surer than the page as given and reaches the floor, else 0.
+int settle_sideways(int side, double as_given, double at_side, double opposite, const TurnCheck& check);
+
 // A page turned upright and levelled: the full page (view) and its copy at the
 // detector's scale (small), each turned back by `rotation` and levelled when
 // deskew finds a skew that clearly wins (EngineOptions' rule).
@@ -83,8 +100,10 @@ Detection on_page(const Detection& d, int vw, int vh, int dw, int dh);
 // (its long side at most o.second_pass_long_side), as an ink map padded to a
 // multiple of 32, run by `run` in strips of about a first pass's pixels (the
 // detector's long side squared) where it has more (run_in_strips: a whole run's
-// maps) and decoded; its boxes in the upright page's pixels.  Nothing where that
-// scale is no larger than dw x dh.
+// maps) and decoded; its boxes in the upright page's pixels.  With
+// det.second_pass_bands (the default) only the bands of rows its first pass's tiny
+// lines hold are resampled and run.  Nothing where that scale is no larger
+// than dw x dh.
 std::optional<Detection> second_pass(const GrayView& upright, int dw, int dh, const EngineOptions& o,
                                      const DetectRun& run, const Detection& first);
 
@@ -121,15 +140,23 @@ struct UnsureLine {
 // Whether gated lines wait for a rescorer (EngineOptions::rescorer, with a weight) before they are read.
 inline bool rescoring(const EngineOptions& o) { return o.beam.on() && o.rescorer && o.beam.rescore != 0.0f; }
 
-// A gated line read by the beam alone (EngineOptions::beam, language_model).
-inline CtcLine beam_read(const FrameCandidates& f, const EngineOptions& o) {
-  return ctc_beam(f, o.beam, o.language_model.get()).line;
+// A decoding's text: its classes' strings in order (what line_kind reads of a greedy reading).
+std::string decoded_text(const CtcLine& d, const std::vector<std::string>& vocab);
+
+// The beam's rule for a line, by the kind of its greedy reading where EngineOptions::lm_kinds sets any kind's
+// weights (o.beam with that kind's alpha, beta and gate over it); o.beam itself where none is set.
+BeamRule beam_rule(const EngineOptions& o, const CtcLine& greedy, const std::vector<std::string>& vocab);
+
+// A gated line read by the beam alone (the line's rule, EngineOptions::language_model).
+inline CtcLine beam_read(const FrameCandidates& f, const BeamRule& rule, const EngineOptions& o) {
+  return ctc_beam(f, rule, o.language_model.get()).line;
 }
 
-// The lines of a recognition run under the beam's gate (EngineOptions::beam) read again: for each line i of the
-// run whose decoded[i] is under it, logits_of(i, scratch) its logits [classes][frames] (null: not read again), and
-// decoded[i] the beam's; where the page's lines wait for a rescorer (rescoring) and `waiting` is given, the beam's
-// n best go there with i instead, decoded[i] left as it was. Nothing where the beam is off.
+// The lines of a recognition run under the beam's gate (EngineOptions::beam; a line's rule by its kind, beam_rule)
+// read again: for each line i of the run whose decoded[i] is under it, logits_of(i, scratch) its logits
+// [classes][frames] (null: not read again), and decoded[i] the beam's; where the page's lines wait for a rescorer
+// (rescoring) and `waiting` is given, the beam's n best go there with i instead, decoded[i] left as it was. Nothing
+// where the beam is off.
 template <class LogitsOf>
 void beam_lines(std::vector<CtcLine>& decoded, std::span<const int32_t> lengths, int classes, int frames,
                 const EngineOptions& o, const std::vector<std::string>& vocab, LogitsOf&& logits_of,
@@ -137,15 +164,16 @@ void beam_lines(std::vector<CtcLine>& decoded, std::span<const int32_t> lengths,
   if (!o.beam.on() || classes < 2) return;
   std::vector<float> scratch;
   for (size_t i = 0; i < decoded.size(); ++i) {
-    if (decoded_confidence(decoded[i], vocab, o.char_confidence) >= o.beam.gate) continue;
+    const BeamRule rule = beam_rule(o, decoded[i], vocab);
+    if (decoded_confidence(decoded[i], vocab, o.char_confidence) >= rule.gate) continue;
     const float* logits = logits_of(i, scratch);
     if (!logits) continue;
-    const FrameCandidates f = frame_candidates(logits, classes, frames, lengths[i], std::min(o.beam.topk, classes - 1));
+    const FrameCandidates f = frame_candidates(logits, classes, frames, lengths[i], std::min(rule.topk, classes - 1));
     if (waiting && rescoring(o)) {
-      waiting->emplace_back(i, ctc_beam_nbest(f, o.beam, o.language_model.get(), o.beam.width));
+      waiting->emplace_back(i, ctc_beam_nbest(f, rule, o.language_model.get(), rule.width));
       continue;
     }
-    decoded[i] = beam_read(f, o);
+    decoded[i] = beam_read(f, rule, o);
   }
 }
 
@@ -200,8 +228,31 @@ void table_spans(OcrPage& page);
 // The order model's tables by geometry (GridRule, EngineOptions::grid; carbon/tables.cpp): Table blocks that
 // are one table joined into one, at the first's place, each grown by the lines inside its box and the rows beside
 // it, its cells by its rows and columns, its lines cell by cell; a table with no two columns keeps the model's cells
-// and blocks. The page's lines follow the blocks' order again (each block's lines one run of them).
-void tables_by_geometry(OcrPage& page, const GridRule& rule);
+// and blocks. The page's lines follow the blocks' order again (each block's lines one run of them). With
+// GridRule::check, a table the false-table check finds no table (table_probability under check_keep) is written as
+// text: its blocks relabelled Text, the model's line order in them, the lines it took given back. block_probs: each
+// block's label probabilities, the order model's (OrderBlock::probs), parallel to page.blocks; empty where none.
+void tables_by_geometry(OcrPage& page, const GridRule& rule, std::span<const std::vector<float>> block_probs = {});
+
+// The false-table check's features of a table (GridRule::check): `lines` its lines (indices into page.lines), `cells`
+// its grid (empty where it has none: the model's cells kept), `probs` its lines' mean label probabilities (the
+// order model's; empty where none), page.rules its ruled lines. kTableFeatures of them, named by table_feature_names.
+std::vector<float> table_features(const OcrPage& page, const std::vector<int>& lines, const std::vector<OcrCell>& cells,
+                                  std::span<const float> probs, const GridRule& rule);
+const std::vector<std::string>& table_feature_names();
+// The grid tables_by_geometry lays a table's lines out in (GridRule 3-9); empty where they make no two columns.
+std::vector<OcrCell> table_grid(const OcrPage& page, const std::vector<int>& lines, const GridRule& rule);
+// The logistic over those, by the weights for the page's source (OCR, or its text layer: carbon/src/
+// table_check_weights.h): the probability that the block is a table.
+float table_probability(std::span<const float> features, bool text_layer);
+
+// A page image's ruled lines (OcrPage::rules): runs of pixels of `dark` or darker, across at least 1/30 of its width
+// (24 px at least) and at most 1/200 of its smaller side thick (3 px at least), or down at least 1/30 of its height
+// as thin; their boxes scaled to a page of page_width x page_height pixels.
+std::vector<LineBox> find_rules(const GrayView& image, int page_width, int page_height, int dark);
+// `dark` for a page at its own pixels (a PDF's render: a rule's pixels as drawn), and for its copy at the detector's
+// scale (a thin rule greyed by the resampling).
+inline constexpr int kRuleDarkFull = 160, kRuleDarkScaled = 200;
 
 // A page's last steps, the CPU's and the GPU's alike: the gate, the split at wide gaps, the reading order (and
 // tables), the picture mask let go.

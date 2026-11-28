@@ -21,6 +21,7 @@
 #include "carbon/error.h"
 #include "cpu/kernels.h"
 #include "resample_math.h"
+#include "resample_rows.h"
 
 namespace carbon {
 
@@ -158,9 +159,12 @@ void resample_scalar(const GrayView& im, const Axis& ax, const Axis& ay, int ow,
 // outside the image.  A row wholly outside the image is the same paper row each time,
 // made once.  Vertical: an output row at a time, from the rows of its taps, which
 // the horizontal pass keeps in a ring as tall as the tallest window: the windows only
-// move down, so each row goes through the horizontal pass once, in order.
-void resample_vector(const GrayView& im, const Axis& ax, const Axis& ay, int ow, int row0, int row1, uint8_t* out,
-                     int64_t os, const ResampleKernels& kern) {
+// move down, so each row goes through the horizontal pass once, in order.  The image's
+// rows come from row_of(y), asked for in that order: a view's, or a decoder's as it
+// unfilters them (resample_gray_from).
+template <class RowOfY>
+void resample_vector(int width, int height, RowOfY&& row_of, const Axis& ax, const Axis& ay, int ow, int row0,
+                     int row1, uint8_t* out, int64_t os, const ResampleKernels& kern) {
   const int chunks = (ax.most_taps() + 7) / 8, reach = 8 * chunks, groups = (ow + 7) / 8;
   std::vector<int32_t> first(static_cast<size_t>(groups) * 8);
   for (size_t i = 0; i < first.size(); ++i) first[i] = ax.first[std::min(i, static_cast<size_t>(ow - 1))];
@@ -172,7 +176,7 @@ void resample_vector(const GrayView& im, const Axis& ax, const Axis& ay, int ow,
   const int span0 = first.front(), span1 = first.back() + reach;
   int ga = 0, gb = 0;
   while (ga < groups && first[8 * ga] < 0) ++ga;
-  for (gb = ga; gb < groups && first[8 * gb + 7] + reach <= im.width;) ++gb;
+  for (gb = ga; gb < groups && first[8 * gb + 7] + reach <= width;) ++gb;
   const int left1 = ga > 0 ? first[8 * ga - 1] + reach : span0;
   const int right0 = gb < groups ? first[8 * gb] : span1;
   std::vector<uint8_t> edge(static_cast<size_t>(span1 - span0));  // column c at edge[c - span0]
@@ -183,7 +187,7 @@ void resample_vector(const GrayView& im, const Axis& ax, const Axis& ay, int ow,
   const size_t stride = static_cast<size_t>((groups * 8 + 31) / 32 * 32);
   std::vector<uint8_t> ring(static_cast<size_t>(tall + 1) * stride);
   uint8_t* const paper = ring.data() + static_cast<size_t>(tall) * stride;
-  auto inside = [&](int y) { return y >= 0 && y < im.height; };
+  auto inside = [&](int y) { return y >= 0 && y < height; };
   auto slot = [&](int y) { return inside(y) ? ring.data() + static_cast<size_t>((y - top) % tall) * stride : paper; };
   auto horizontal = [&](const uint8_t* row, uint8_t* t) {
     if (!row) {
@@ -192,12 +196,12 @@ void resample_vector(const GrayView& im, const Axis& ax, const Axis& ay, int ow,
       return;
     }
     if (ga > 0) {
-      paper_copy(row, im.width, span0, left1, edge.data());
+      paper_copy(row, width, span0, left1, edge.data());
       kern.h(edge.data(), span0, first.data(), k.data(), chunks, 0, ga, t);
     }
     if (gb > ga) kern.h(row, 0, first.data(), k.data(), chunks, ga, gb, t);
     if (gb < groups) {
-      paper_copy(row, im.width, right0, span1, edge.data() + (right0 - span0));
+      paper_copy(row, width, right0, span1, edge.data() + (right0 - span0));
       kern.h(edge.data(), span0, first.data(), k.data(), chunks, gb, groups, t);
     }
   };
@@ -209,7 +213,7 @@ void resample_vector(const GrayView& im, const Axis& ax, const Axis& ay, int ow,
     const int f = ay.first[yy], n = ay.count[yy];
     for (int y = std::max(next, f); y < f + n; ++y) {
       if (inside(y)) {
-        horizontal(im.data + y * im.stride, slot(y));
+        horizontal(row_of(y), slot(y));
       } else if (!have_paper) {
         horizontal(nullptr, paper);
         have_paper = true;
@@ -233,10 +237,24 @@ void resample_gray_rows(const GrayView& im, double x0, double y0, double x1, dou
   const Axis ax(x0, x1, ow), ay(y0, y1, oh);
   const ResampleKernels kern = resample_kernels(isa);
   if (kern.h && ax.forward() && ay.forward()) {
-    resample_vector(im, ax, ay, ow, row0, row1, out, os, kern);
+    resample_vector(im.width, im.height, [&](int y) { return im.data + y * im.stride; }, ax, ay, ow, row0, row1, out,
+                    os, kern);
   } else {
     resample_scalar(im, ax, ay, ow, row0, row1, out, os);
   }
+}
+
+bool detail::resample_gray_from(int width, int height, RowOf row, void* ctx, int ow, int oh, uint8_t* out, int64_t os,
+                                cpu::Isa isa) {
+  if (width <= 0 || height <= 0 || ow <= 0 || oh <= 0) throw Error("resample_gray: an empty image or output");
+  if (!cpu::isa_available(isa)) {
+    throw Error(std::string("resample_gray: ") + cpu::isa_name(isa) + " is not available on this CPU");
+  }
+  const ResampleKernels kern = resample_kernels(isa);
+  if (!kern.h) return false;
+  const Axis ax(0.0, width, ow), ay(0.0, height, oh);  // a whole image's axes only move forward
+  resample_vector(width, height, [&](int y) { return row(ctx, y); }, ax, ay, ow, 0, oh, out, os, kern);
+  return true;
 }
 
 void resample_gray(const GrayView& im, double x0, double y0, double x1, double y1, int ow, int oh,

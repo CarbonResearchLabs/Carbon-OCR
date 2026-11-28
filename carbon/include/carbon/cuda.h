@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -43,10 +44,31 @@ void crop_lines(std::span<const DevicePage> pages, std::span<const int32_t> page
 void finish_crops(uint8_t* out, int n, int out_width, std::span<const int32_t> widths, const CropRule& rule = {},
                   void* stream = nullptr);
 
+// The buffers threshold_det works in, on the device and pinned on the host, each grown to the largest call it has
+// held: a caller that thresholds batch after batch (the GPU pipeline's detect stage) keeps one and reserves its
+// largest batch at once, so no call allocates. Use from one thread at a time.
+class DetScratch {
+ public:
+  DetScratch();
+  ~DetScratch();
+  DetScratch(const DetScratch&) = delete;
+  DetScratch& operator=(const DetScratch&) = delete;
+  // Room for n pages of map_h x map_w maps, float16 (fp16) or float32.
+  void reserve(int n, int map_h, int map_w, bool fp16);
+  struct Impl;
+  Impl& impl() { return *impl_; }
+
+ private:
+  std::unique_ptr<Impl> impl_;
+};
+
 // The detector's maps for n pages in device memory, [n][4][map_h][map_w], float32
 // or float16 (TensorRT's det.fp16.onnx), thresholded as carbon::threshold_det
 // does: the same masks, but only the bits and the set pixels' values cross to the
-// host.  Waits for the stream.
+// host, in two bulk copies (the bits, then as many values as are set).  Waits for
+// the stream.  In `scratch`'s buffers where given, else the thread's own.
+std::vector<DetMasks> threshold_det(const void* maps, bool fp16, int n, int map_h, int map_w, const DetRule& rule,
+                                    void* stream, DetScratch* scratch);
 std::vector<DetMasks> threshold_det(const void* maps, bool fp16, int n, int map_h, int map_w, const DetRule& rule = {},
                                     void* stream = nullptr);
 

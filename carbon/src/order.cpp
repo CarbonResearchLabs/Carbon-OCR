@@ -323,6 +323,7 @@ PageOrder decode_order(const OrderOutputs& out, std::span<const LineBox> boxes, 
     }
     b.label = static_cast<int>(std::max_element(mean.begin(), mean.end()) - mean.begin());
     b.confidence = static_cast<float>(mean[b.label]);
+    b.probs.assign(mean.begin(), mean.end());
     if (b.label != block_label("Table")) continue;
     // cells, then rows and columns of cells
     // a head's clusters of these items: from its matrix, or its logits among them

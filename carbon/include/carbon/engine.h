@@ -85,15 +85,31 @@ struct TableRule {
 //      a cell's long line), and those whose centres are inside it of at most inside_chars characters (a paragraph's
 //      line that runs past the table's edge is not); then
 //      the rows next to it, above and below, within grow_gap, whose lines are two or more each in a column of its
-//      own, their median at most grow_chars characters (a cell's, not two columns of text), while there are such.
+//      own, their median at most grow_chars characters (a cell's, not two columns of text), while there are such;
+//      then, with heading_up, the row just above it within head_gap, nothing between, where it heads the columns:
+//      each of its lines inside the table across, with a letter, no number alone or caption, a phrase (not begun as
+//      a continuation, a lowercase letter first, nor ended with a sentence's full stop), the whole of its block (a
+//      heading of one line, not a paragraph's last), each in a column of its own, and one of them over two columns
+//      or more (by header_cover, 4), not over the first, its middle over them (a heading over the values, not the
+//      stub).
+//      With caption_out a caption line ("Table 3", "TABLE II.", "Tab. 2:") is never taken, and the table's own
+//      caption lines above or below all its others leave it, a Caption block before or after it.
 //   3. Rows: its lines by their centres down the page, a line joining the row whose mean centre is within row_tol.
 //   4. Columns: from its fullest rows (the most lines), each column the median of their k-th lines' edges, columns
-//      that overlap joined; a line covering more than `cover` of a column's width is in it, from the first such
-//      column to the last (a column span), else in the column its centre is in or nearest.
+//      that overlap joined; with label_band, before them a column of the lines wholly left of the first, where
+//      there are two or more (group labels set apart from the rows they head). A line covering more than `cover`
+//      of a column's width is in it, from the first such column to the last (a column span), else in the column
+//      its centre is in or nearest; a header line (in the rows above the first that holds a number) by
+//      header_cover instead (0: by `cover`), so a heading spans each column it lies over in part.
 //   5. A cell's next lines: a row whose lines each overlap a different line of the row above across, no more of
 //      them, and none of them a number alone (digits, no letter: a value, in a row of its own), joins that row,
 //      cell by cell: in a header of at most header_rows rows (the rows down to the first full row), or nearer the
-//      row above than wrap_pitch of the table's median row pitch.
+//      row above than wrap_pitch of the table's median row pitch. With body_wrap, a body row that does not join so
+//      goes on the cells of the row above it where it reads as their next lines: fewer lines than that row, under
+//      half the columns, none a number alone, each under a different line of it within wrap_gap line heights of
+//      white, and each starting on a lowercase letter, a closing bracket, a percent sign or a bracket opening on a
+//      lowercase letter (a unit), or under a line that ends open (a bracket left open, a hyphen, a comma, a slash,
+//      a joining word such as "and" or "of").
 //   6. Row labels: in the rows from the first that holds a number (a value: the rows above are the header's), a
 //      first-column label over the rows next to it whose first cells are empty and which hold a number spans them,
 //      set at the top of its group where the first label has none above it, else in the middle (each row the
@@ -101,6 +117,27 @@ struct TableRule {
 //   7. Header cells between two header rows: a header row each of whose cells takes only columns that neither the
 //      row above nor the row below has, its lines' middle between theirs (a "Route" and a "Year" beside a heading
 //      that spans the quarters, level with neither it nor the quarters), joins the row above, each cell two rows tall.
+//   8. Section rows (section_rows): in a table of three columns or more, a body row of a single cell, not in the
+//      first column and under no cell that spans rows, whose text holds a letter, is centred in the table (its
+//      middle within section_centre of the table's width of the table's) and does not begin as a cell's next line
+//      (5), heads the rows below it and spans every column.
+//   9. A title row (title_out): where the grid's first row is one cell, from the first column over two or more,
+//      its text with a letter and no line a number alone, over a row of two cells or more and another row, it is
+//      the table's title, not a row: the lines the table took from other blocks go back to them, its own lines are
+//      a Caption block before it, and the grid is laid out again without them.
+//  10. The false-table check (check; an option, off: at the cut its weights carry it takes false tables out but
+//      writes too many real ones as text on pages unlike those it was fitted on): a logistic over the table's grid
+//      (its columns, rows, how full), its text
+//      (characters a cell, numbers, digits, sentences, words a line, mathematical signs, lowercase starts), its
+//      lines' geometry (how many, its width on the page, their heights' spread, the gutters between cells, the rows'
+//      pitch), the order model's label probabilities over its lines (Table, Text, Formula, Picture, List-Group),
+//      the page's ruled lines over its rows and columns (OcrPage::rules) and the detector's pictures over it,
+//      with weights fitted on labelled pages in no benchmark (one set for pages read by OCR, one for pages read
+//      from their text layer: carbon/src/table_check_weights.h), the cut at check_keep
+//      moved into the weights so that each set's held-out folds keep all but 2% of its true tables. A table whose
+//      probability is under check_keep is written as text: its blocks Text, in the model's line order. The engine
+//      finds an OCR page's ruled lines while the check is on; a text layer's are found where TextLayerRule::rules
+//      asks (read_text_layer), as the weights for those pages were fitted with them.
 // Each cell's lines are a line each in the writers' tables.
 struct GridRule {
   double merge_gap = 1.5;
@@ -108,10 +145,22 @@ struct GridRule {
   int inside_chars = 40;
   double grow_gap = 1.5;
   int grow_chars = 30;
+  bool heading_up = true;
+  double head_gap = 2.5;
+  bool caption_out = true;
+  bool title_out = true;
   double row_tol = 0.6;
   double cover = 0.5;
+  double header_cover = 0.15;
+  bool label_band = true;
   double wrap_pitch = 0.75;
   int header_rows = 4;
+  bool body_wrap = true;
+  double wrap_gap = 0.6;
+  bool section_rows = true;
+  double section_centre = 0.15;
+  bool check = false;
+  float check_keep = 0.5f;
 };
 
 // Lines that are not text, dropped before they are ordered and written: what the recognizer
@@ -161,6 +210,32 @@ struct SpaceRule {
   double min_gap = 0.08;
 };
 
+// Turns read before they are made: the recognizer reads a page's `lines` longest lines (its widest boxes, found
+// on the page as orientation would turn it) as they stand and turned half round, and a reading's sureness is the mean
+// probability of its characters, spaces aside (0 for none). The readings judge a turn only where one of them reaches
+// `floor`: rec-latin reads a script it was not trained on unsurely either way up, so there they are no evidence
+// either way, and orientation's turn stands (no veto without evidence).
+//   - A half turn orientation is sure of: where a reading reaches the floor, made where the turned reading is at least
+//     as sure as the page's as given, else the page is read as given; where none does, orientation's turn as it
+//     makes it without the check (by a bin's probability unless turn_by_quarters, below).
+//   - A quarter turn it is sure of (with `quarters`) goes the other way round where that reading is the surer and
+//     reaches the floor.
+//   - A page it is not sure enough to turn whose sideways bins (60 to 120 and 240 to 300 degrees) hold `sideways` of
+//     its probability is read as given and turned to its likelier side (both ways), and turned where a sideways
+//     reading is the surest of the three and reaches the floor.
+// With `sum_bins` a turn's probability is its quarter's three bins' sum (EngineOptions::turn_by_quarters) wherever
+// turns are read: the readings bear out what the sums risk (upright pages in scripts orientation never saw taken for
+// upside down), and a half turn no reading can judge is the bins' (the sums' half turns are uncalibrated). Nothing is
+// read where nothing can turn (a turn_probability over 1). The CPU engine's: the batched pipeline turns by
+// orientation alone, by a bin's probability unless turn_by_quarters.
+struct TurnCheck {
+  int lines = 8;
+  float floor = 0.8f;
+  double sideways = 0.8;
+  bool quarters = true;
+  bool sum_bins = true;
+};
+
 // The precision a set's models run in on the CPU: which of each model's files
 // (choose_set_model).  auto: the fastest the set has.
 enum class Precision : uint8_t { kAuto, kFp32, kFp16, kInt8 };
@@ -178,6 +253,16 @@ enum class LmMode : uint8_t { kAuto, kNone, kNgram, kTransformer, kBoth };
 constexpr int kLmBeamWidth = 8;  // the beam's width under a mode where none is set: the width the models were tuned at
 std::string_view lm_mode_name(LmMode mode);  // "auto", "none", "ngram", "transformer", "both"
 std::optional<LmMode> parse_lm_mode(std::string_view name);  // those, or "off"/"greedy" for none, "tlm" for transformer
+
+// A line's kind by its characters, spaces aside: digits and codes (a digit among them and at most half of them
+// letters: amounts, dates, phone numbers, IDs, part numbers), prose (at least 60% letters and at most 10% digits),
+// else mixed; a line of none is mixed. The beam may weigh and gate each kind apart (EngineOptions::lm_kinds), from its
+// greedy reading.
+enum class LineKind : uint8_t { kProse, kMixed, kCode };
+constexpr int kLineKinds = 3;
+LineKind line_kind(std::string_view utf8);
+std::string_view line_kind_name(LineKind kind);  // "prose", "mixed", "code"
+std::optional<LineKind> parse_line_kind(std::string_view name);
 
 struct EngineOptions {
   PoolOptions pool;               // the workers: one per physical core by default
@@ -200,10 +285,13 @@ struct EngineOptions {
   std::optional<float> turn_probability;
   // A quarter turn's probability the sum of its three bins' (for 90 degrees: 60, 90 and 120), the turn the
   // likeliest quarter, where it reaches turn_probability; what is left of the angle, up to 45 degrees, is deskew's
-  // (max_skew). False: a quarter turn's own bin, the likeliest of the 12 (the default). Off until a threshold is
-  // calibrated for the sums (they run higher than a bin's: at a bin's 0.65, pages in scripts the model was not
-  // trained on, upright, were turned 180 degrees).
+  // (max_skew). False: a quarter turn's own bin, the likeliest of the 12 (the default), unless the turn is read
+  // (turn_check's sum_bins). The sums run higher than a bin's, and no threshold is calibrated for them: at a bin's
+  // 0.65, pages in scripts the model was not trained on, upright, were turned 180 degrees, which the turn check reads
+  // and undoes.
   bool turn_by_quarters = false;
+  // Turns read before they are made (TurnCheck). None: orientation's turn alone.
+  std::optional<TurnCheck> turn_check = TurnCheck{};
   // Deskew (carbon/deskew.h): a page skewed by at least min_skew degrees (and at
   // most max_skew), whose level angle clearly beats level (its projection score
   // min_skew_gain times the level page's), is levelled before detection; past 5 degrees (a page photographed or
@@ -258,7 +346,9 @@ struct EngineOptions {
   bool word_boxes_at_ink = false;
   // The recognizer's head (its last 1x1 convolution) and CTC's argmax fused on the CPU's vectors, the logits
   // never written; each line's own frames, not its bucket's padding. An FP32 file on a CPU with AVX2; else the
-  // file whole. The logits are the engine's sums, not ONNX Runtime's. False: the file whole (the default).
+  // file whole. The logits are the engine's sums, not ONNX Runtime's. False: the file whole (the default). Its one
+  // kernel, AVX2's tile, runs at the engine's FP32 GEMM's rate, under ONNX Runtime's, so it is slower on every CPU
+  // it runs on that was timed (AMD Zen 2 and Intel Raptor Lake, both one worker): an option for experiments.
   bool fused_rec_head = false;
   // The detector's stem and first downsampling run by the engine in row bands (cpu::det_stem, the stride-2
   // tensor never whole) and ONNX Runtime fed the stride-4 tensor: an FP32 detector whose head the engine fuses.
@@ -304,9 +394,24 @@ struct EngineOptions {
   // neither given nor in the set is refused (Error). kNone: greedy, the beam off.
   LmMode lm_mode = LmMode::kAuto;
   std::optional<float> lm_gate;
+  // The beam's alpha, beta and gate by the kind of line its greedy reading is (line_kind; [LineKind]): each one
+  // set replaces the beam's own (beam.alpha, beta and gate, as the mode and the files set them) for lines of that
+  // kind. None set (the default): every line by the beam's own.
+  struct KindWeights {
+    std::optional<float> alpha, beta, gate;
+  };
+  std::array<KindWeights, kLineKinds> lm_kinds{};
   // The crop rule the recognizer reads lines by. A recognizer that carries its own (its ONNX
   // file's carbon.crop.height, pad_v and pad_h, written at export) sets those three.
   CropRule crop;
+};
+
+// A run of a word's or a line's text set as a superscript or a subscript: a text layer's characters set smaller
+// and raised or lowered (carbon/textlayer.h). Its bytes of the text, [begin, end).
+struct TextScript {
+  uint32_t begin = 0, end = 0;
+  bool sub = false;  // a subscript; else a superscript
+  bool operator==(const TextScript&) const = default;
 };
 
 // A word of a line: its characters between spaces.  By OCR, its box spans the CTC
@@ -316,6 +421,7 @@ struct OcrWord {
   LineBox box;
   std::string text;      // UTF-8
   float confidence = 0;  // the mean probability of its characters
+  std::vector<TextScript> scripts = {};  // a text layer's: its runs set as scripts, in order
 };
 
 struct OcrLine {
@@ -325,7 +431,12 @@ struct OcrLine {
   float det_score = 0;   // the detector's mean core probability
   std::vector<OcrWord> words;
   float least = 0;       // the least probability of its characters, spaces aside (0 for none)
+  std::vector<TextScript> scripts = {};  // its words' (scripts_of_words), where its text is theirs
 };
+
+// A line's scripts made of its words' (OcrWord::scripts), the line's text its words' joined by single spaces (a
+// text layer's lines, and the pieces split_lines cuts).
+std::vector<TextScript> scripts_of_words(std::span<const OcrWord> words);
 
 struct OcrCell {
   int row = 0, col = 0;
@@ -348,6 +459,8 @@ struct OcrPage {
                               // levelled page's
   std::vector<OcrLine> lines; // in reading order
   std::vector<LineBox> pictures;
+  std::vector<LineBox> rules;  // its ruled lines (long thin runs of ink, across or down), for the false-table check
+                               // (GridRule::check): found where its image is read; not written
   struct Dropped {            // a line the gate took for something other than text (GateRule)
     OcrLine line;
     std::string why;          // "empty", "rules", "sliver", "picture", "lone", "overlap"
@@ -361,6 +474,11 @@ struct OcrPage {
   std::string source = "ocr";  // or "text layer": a born-digital page read from its own text (carbon/textlayer.h);
                                // "hybrid": from its text, and its pictures' text by OCR
   std::string text_layer;      // a PDF page read by OCR: why its text layer was not used
+  struct TurnRead {            // a reading the turn check made (TurnCheck): the page read turned so, and how surely
+    int rotation = 0;
+    double sure = 0;
+  };
+  std::vector<TurnRead> turn_reads;  // in the order read; none where no turn was checked
   struct Timings {
     // ms; second_pass the second detection pass's, all of it (its page, detection, decoding and the merge);
     // load the page's file read and decoded, where the engine was given a file (Engine::submit), outside total
@@ -397,9 +515,15 @@ LineBox box_as_given(const LineBox& box, const OcrPage& page);
 //   int8  <name>.int8.onnx, on the backend given, else native
 //
 // A precision given (not auto) throws Error when the set has no file for it.  On
-// one core the native int8 recognizer runs 2.5 times as fast as ONNX Runtime in
-// FP32; the native backend in FP32 is slower than ONNX Runtime's,
-// and in FP16 about as fast as in FP32 on a CPU without FP16 arithmetic (net.cpp).
+// a CPU with an int8 dot product (AVX-VNNI, AVX-512 VNNI, Arm's sdot) the native
+// int8 recognizer runs about 2.5 times as fast as ONNX Runtime in FP32 on one core.
+// Where the int8 products widen to 16 bits (AVX2 without VNNI: cpu::int8_widens)
+// INT8 is no faster than FP32 an instruction and wins by its memory traffic alone:
+// one worker reads a page sooner in fp32, many workers more pages in int8, so auto
+// stays int8 everywhere and fp32 is the one-worker latency choice there (carbon-ocr
+// cpus says which a CPU is).  The native backend in FP32 is slower than ONNX
+// Runtime's, and in FP16 about as fast as in FP32 on a CPU without
+// FP16 arithmetic (net.cpp).
 struct SetModel {
   Backend backend;
   std::filesystem::path file;
@@ -409,6 +533,19 @@ SetModel choose_set_model(const std::filesystem::path& set, const std::string& n
 std::unique_ptr<Session> open_set_model(const std::filesystem::path& set, const std::string& name,
                                         std::optional<Backend> backend, const SessionOptions& options = {},
                                         Precision precision = Precision::kAuto);
+
+// How the engine reads one page of its stream where not as its options say (Engine::submit's task; the batched
+// pipeline's too, carbon/pipeline.h).
+struct PageTask {
+  // The page read as it stands: no quarter turn and no deskew, as EngineOptions' turn_probability over 1 and deskew
+  // false read it (a page's pictures read on their own, carbon/textlayer.h). Orientation is not run, as it is not
+  // for any page where turn_probability is over 1: it could not turn it.
+  bool as_given = false;
+  // The page's lines found already, on the page as given (LineFinder::detect: their boxes and detector scores, the
+  // pictures and the picture mask): detection skipped, these lines read from the page, then gated, split and ordered
+  // as found lines are. The page is read as given.
+  std::shared_ptr<const OcrPage> found;
+};
 
 // The Fullerene set in `set` (a directory: orient.onnx, det.onnx, <rec>.onnx,
 // <rec>.vocab.json, and .int8.onnx and .fp16.onnx files where it has them), each
@@ -436,10 +573,16 @@ class Engine {
   // same bytes as ocr(). One thread may submit while another takes; not from inside the engine's workers.
   size_t submit(const GrayView& page, std::shared_ptr<const void> keep = {});
   size_t submit(GrayImage page);
+  // A page read by its task (PageTask) rather than as the options say.
+  size_t submit(const GrayView& page, std::shared_ptr<const void> keep, PageTask task);
+  size_t submit(GrayImage page, PageTask task);
+  // A page read otherwise (from its text layer) put in reading order, as order() puts it, by a worker of the
+  // stream: its result that page in order.
+  size_t submit_order(OcrPage page);
   // A page's image file (as load_image reads it), read and decoded by the worker that takes the page, so the
   // decode runs beside the other pages' work; a file that cannot be read is that page's error, from next.
   size_t submit(const std::filesystem::path& file);
-  // A page's encoded image (PNG, JPEG, BMP or PNM, as decode_image reads it), decoded by the worker that
+  // A page's encoded image (PNG, JPEG, BMP, PNM, GIF or WebP, as decode_image reads it), decoded by the worker that
   // takes the page, as a file is; `keep` holds the bytes until they are decoded. Bytes that do not decode are
   // that page's error (Finished::unreadable).
   size_t submit_encoded(std::span<const uint8_t> bytes, std::shared_ptr<const void> keep);
@@ -487,6 +630,10 @@ class LineFinder {
   LineFinder(const LineFinder&) = delete;
   LineFinder& operator=(const LineFinder&) = delete;
   std::vector<LineBox> find(const GrayView& page);
+  // The whole detection: the lines (boxes and detector scores, no text), the pictures and the picture mask, on the
+  // page as given, as an OcrPage (its size the page's, source "ocr"); find's boxes are its lines'. What a page's
+  // own pictures pass reads its lines from (PageTask::found).
+  OcrPage detect(const GrayView& page);
 
  private:
   std::unique_ptr<Session> det_;

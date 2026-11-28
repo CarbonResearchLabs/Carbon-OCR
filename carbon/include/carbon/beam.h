@@ -19,6 +19,10 @@
 // A repeated class extends a prefix only across a blank (1 _ 1 is "11", 1 1 is
 // "1").  Width 1 is greedy: the argmax path, collapsed.
 //
+// The search keeps its working memory on the thread from line to line, and asks a
+// language model that bounds its scores (LanguageModel::max_score) only for the
+// prefixes that could be kept; neither changes a bit of what it reads.
+//
 // What the beam cannot do: write a class that is not among a frame's candidates
 // (the top `topk` classes and the blank).  It chooses among what the pixels
 // allow.  The exact scores are over the candidates too, so the classes past
@@ -26,6 +30,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -58,8 +63,21 @@ struct BeamRule {
   float alpha = 0.0f;         // the language model's weight
   float beta = 0.0f;          // a bonus a character (it offsets the language model's cost of each)
   float rescore = 0.0f;       // the rescorer's weight (EngineOptions::rescorer) on its ln P of each of the n best
+  // Span-level decoding: a frame whose likeliest class (a character, or the blank) has a probability of at least
+  // `span`, with no frame under it within span_margin frames, is read as greedy reads it (sure_spans: that class
+  // alone). The beam then searches the unsure spans and their margins alone, and the sure characters keep their
+  // greedy reading. Off (every frame's candidates) at 0, the default, or over 1.
+  float span = 0.0f;
+  int span_margin = 2;
   bool on() const { return width >= 2; }
+  bool spans() const { return span > 0.0f && span <= 1.0f; }
 };
+
+// The candidates with every sure frame cut to its likeliest class (BeamRule::span): a frame whose best (its first
+// candidate or the blank, the likelier; ties to the blank, as greedy reads it) has a probability of at least `span`,
+// and no frame within `margin` of it less, keeps that one: a character's frame its character (its blank and other
+// candidates -inf), a blank's frame its blank (its candidates -inf). Every other frame as it was.
+FrameCandidates sure_spans(const FrameCandidates& f, float span, int margin);
 
 // The beam's view of a language model: states are the model's own (an n-gram's
 // last classes packed, say).  Each prefix asks it once, when the prefix is
@@ -77,6 +95,11 @@ class LanguageModel {
     (void)state;
     return 0.0f;
   }
+  // An upper bound on score() at every state and class, or +inf where the model knows none. With a bound (and a
+  // positive alpha) the beam asks only for the prefixes it could keep: a frame's new prefix whose score at the bound
+  // is under the width's best exact scores is pruned unasked, so the beam reads every line as it would asking for
+  // them all, with fewer queries.
+  virtual float max_score() const { return std::numeric_limits<float>::infinity(); }
   // Many queries at once: out[i] = score(states[i], classes[i], next[i]). The beam asks a frame's new prefixes
   // together, so a model may overlap their memory reads (NgramModel prefetches).
   virtual void score_batch(std::span<const uint64_t> states, std::span<const int32_t> classes, std::span<float> out,

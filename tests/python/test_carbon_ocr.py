@@ -388,7 +388,7 @@ def test_the_engines_table_gate_and_deskew_options():
     assert abs(narrow["skew"]) <= 5.0
     assert wide["text"] == "aaa\naaaaa\naa\n"
     e = carbon_ocr.Engine(str(DATA / "fake-set"), workers=1, grid=False, blocks_first=True, turn_by_quarters=True,
-                          wide_skew_gain=1.5, bullet_join=0.0, dash_cell=0.0, sliver_thin=0.0)
+                          turn_check=False, wide_skew_gain=1.5, bullet_join=0.0, dash_cell=0.0, sliver_thin=0.0)
     assert e.ocr([turned])[0]["text"] == "aaa\naaaaa\naa\n"
     with pytest.raises(Exception, match="max_skew"):
         carbon_ocr.Engine(str(DATA / "fake-set"), workers=1, max_skew=60.0)

@@ -21,6 +21,11 @@ namespace carbon::detail {
 // kernels are those of `isa` (carbon/cpu.h), which must be available.
 bool png_to_gray(std::span<const uint8_t> png, cpu::Isa isa, GrayImage& out);
 
+// png_to_gray, then the whole image resampled to the size fit gives for its width and height (resize_gray): the same
+// bytes, each row resampled as it is unfiltered, so the image is never whole in memory. False where png_to_gray is,
+// out unspecified.
+bool png_to_gray_resized(std::span<const uint8_t> png, cpu::Isa isa, const ImageFit& fit, GrayImage& out);
+
 // A zlib stream inflated into out (out_n bytes, its whole size), by libdeflate's decoder, or (avx2, where the build
 // has it: zlib_inflate_avx2_built) by its copy compiled with /arch:AVX2 (MSVC), the same bytes. False where
 // the stream is bad or does not fill out_n exactly.

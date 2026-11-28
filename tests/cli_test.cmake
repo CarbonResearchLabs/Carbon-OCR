@@ -59,3 +59,16 @@ string(REPLACE "</p>;<p>" " " paras "${paras}")
 if(NOT doctype EQUAL 0 OR section LESS 0 OR NOT paras STREQUAL "<p>aaa aaaaa aa</p>")
   message(FATAL_ERROR "--format html wrote: ${html}")
 endif()
+
+# --turn-check: on or off (the fake set's orientation never asks for a turn, so the page reads the same), nothing else
+execute_process(COMMAND "${CLI}" ocr "${page}" --set "${DATA}/fake-set" --format text --workers 1 --turn-check off
+                RESULT_VARIABLE code OUTPUT_VARIABLE text ERROR_VARIABLE err ENCODING UTF-8)
+if(NOT code EQUAL 0 OR NOT text STREQUAL "aaa\naaaaa\naa\n")
+  message(FATAL_ERROR "--turn-check off (${code}): '${text}' ${err}")
+endif()
+execute_process(COMMAND "${CLI}" ocr "${page}" --set "${DATA}/fake-set" --turn-check maybe
+                RESULT_VARIABLE code OUTPUT_QUIET ERROR_VARIABLE err)
+string(FIND "${err}" "--turn-check takes on or off" said)
+if(code EQUAL 0 OR said EQUAL -1)
+  message(FATAL_ERROR "--turn-check maybe (${code}): ${err}")
+endif()
