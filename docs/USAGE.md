@@ -22,11 +22,15 @@ carbon-ocr ocr scans/*.png --set models/fullerene-3M --device cuda --engine-cach
 carbon-ocr ocr scans/*.png --set models/fullerene-3M --device cuda --precision fp32
 ```
 
-`ocr` reads PNG, JPEG, BMP and PNM pages, and PDFs. A PDF's pages are rendered by PDFium in `carbon-pdf` helper processes. If a document crashes PDFium, only a helper dies, and your program keeps running.
+`ocr` reads PNG, JPEG, BMP, PNM, GIF (its first frame) and WebP pages, and PDFs, each file's format told by its first bytes, not its name. A PDF's pages are rendered by PDFium in `carbon-pdf` helper processes. If a document crashes PDFium, only a helper dies, and your program keeps running.
 
-A born-digital PDF page whose text layer passes the engine's checks is read from that layer instead of by OCR. Its words are put into the lines the detector finds on the page, so its tables and reading order come out as a scanned page's would (`--layer-lines layer` keeps PDFium's own lines). Its pictures (the page's image objects) are still read by OCR, and their lines join the layer's. The JSON output gives each page's source (`ocr`, `text layer` or `hybrid`). For a PDF page read by OCR, it also says why the page's text layer was not used.
+A born-digital PDF page whose text layer passes the engine's checks is read from that layer instead of by OCR. Its words are put into the lines the detector finds on the page, so its tables and reading order come out as a scanned page's would (`--layer-lines layer` keeps PDFium's own lines). Its pictures (the page's image objects) are still read by OCR, from the lines the detector found on the page where it ran for the layer, and their lines join the layer's. The JSON output gives each page's source (`ocr`, `text layer` or `hybrid`). For a PDF page read by OCR, it also says why the page's text layer was not used.
 
-By default the pages run in parallel on the CPU, one worker per physical core. `--device cuda` reads them through the batched pipeline on the GPU instead: TensorRT runs the set's files at `--precision` (the FP16 files by default), and each model is batched across the pages in flight. This needs a build with TensorRT and CUDA ([BUILD.md](BUILD.md)).
+A page whose text layer runs sideways or upside down is read turned upright: its `rotation` is the turn and its boxes are the upright page's, as for a page `orient` turned. A layer's sub- and superscripts come out as `<sup>` and `<sub>` in the HTML. A layer refused for its unreadable codes, where every one sits in a run of its own that holds no letter (a math font's pieces), keeps the rest: the lines those runs touch are read by OCR with the page's pictures.
+
+Each page is written as soon as it and the pages before it are done, so only the pages in flight are held. hOCR, ALTO and `pdf`, documents written whole, keep the pages.
+
+By default the pages run in parallel on the CPU, one worker per physical core. `--device cuda` reads them through the batched pipeline on the GPU instead: TensorRT runs the set's files at `--precision` (the FP16 files by default), and each model is batched across the pages in flight. A text layer's page's steps run in the pipeline too (`--text-pages cpu` gives them to a CPU engine). This needs a build with TensorRT and CUDA ([BUILD.md](BUILD.md)).
 
 | option | default | what |
 |---|---|---|
@@ -40,7 +44,7 @@ By default the pages run in parallel on the CPU, one worker per physical core. `
 | `--image-dpi N` | 300 | `pdf`: the dpi an image page is placed at |
 | `--dpi N\|auto` | 200 | the dpi a PDF's pages are rendered at; `auto`: each page at the dpi its small print or its scan needs, from 200 to 400 |
 | `--text-layer auto\|off` | `auto` | read a PDF page from its own text layer where it passes the checks; a tagged page in its structure tree's order |
-| `--hybrid auto\|off` | `auto` | read the pictures of a page that was read from its text layer by OCR |
+| `--hybrid auto\|detect\|off` | `auto` | read the pictures of a page that was read from its text layer by OCR, from the lines the detector found there where it ran for the layer; `detect`: the pictures' page detected again; `off`: pictures left unread, and a page whose layer was refused for its unreadable codes read by OCR |
 | `--layer-lines detected\|layer` | `detected` | a text layer's words in the lines the detector finds on the page (an upright page's); `layer`: PDFium's lines, about 10% faster on text pages |
 | `--second-pass auto\|off` | `auto` | detect a page of tiny text (its median line under 9 px at the detector's scale) again at twice the scale, and merge the two passes |
 | `--second-pass-share F` | 0 | also take the second pass where at least this share of the lines (and 8 of them) are tiny; 0: by the median alone |
@@ -54,6 +58,7 @@ By default the pages run in parallel on the CPU, one worker per physical core. `
 | `--beam N` | 0 | read the lines the recognizer is unsure of again by a CTC prefix beam of N prefixes (8 is the width to ask for), with the set's n-gram where it ships one (the transformer only with `--tlm` or an `--lm-mode` that names it); under 2: off, every line greedy |
 | `--beam-gate F` | 0.9 | the confidence under which a line goes to the beam; 0: none, 2: every line |
 | `--beam-topk N` | 5 | the classes each frame offers the beam besides the blank |
+| `--beam-span P` | 0 | span-level decoding: a frame at least P sure, with no less sure frame within 2 frames, read as greedy reads it, so the beam searches the unsure spans alone; 0: off |
 | `--lm-mode auto\|none\|ngram\|transformer\|both` | `auto` | the language models as one switch. `ngram`: the lines under the gate read again by a beam of 8 with the set's n-gram (`lm-<group>.bin`); `transformer`: the beam's best readings rescored by the set's transformer (`tlm-<group>.bin`), each after the line above it; `both`: the two. Each model at the weights and gate tuned into its file; a mode whose model the set lacks is an error. `none`: greedy; `auto`: as `--beam`, `--lm` and `--tlm` set it (`--beam` alone: the set's n-gram; the transformer only from `--tlm`) |
 | `--lm-gate F` | the file's | under a mode, the confidence under which a line goes to the beam, 0 to 2 |
 | `--lm FILE\|off` | the set's | the n-gram the beam reads with; `off`: none |
@@ -61,10 +66,12 @@ By default the pages run in parallel on the CPU, one worker per physical core. `
 | `--tlm FILE\|off` | the set's | the transformer that rescores the beam's readings (an FP32, FP16 or INT8 file); `off`: none |
 | `--tlm-alpha F` | the file's | the transformer's weight |
 | `--tlm-gpu N\|cpu` | the pipeline's GPU, else the CPU | the GPU the transformer runs on; `cpu`: the CPU's kernels |
+| `--lm-kind KIND=ALPHA,BETA,GATE` | none | the beam's weights and gate for one kind of line, by its greedy reading: `prose`, `mixed` or `code` (digits and codes: amounts, dates, IDs); an empty field keeps the beam's own; once a kind |
 | `--as-given` | off | no quarter turns and no deskew: the page as given |
 | `--max-skew D` | 45 | deskew's range in degrees; 5: the narrow search alone |
 | `--wide-skew-gain F` | 1.25 | how much better than level a skew past 5 degrees must score to be levelled |
-| `--turn bin\|quarters` | `bin` | `quarters`: a quarter turn read by the sum of its three 30-degree bins (needs a threshold calibrated for the sums) |
+| `--turn auto\|bin\|quarters` | `auto` | a quarter turn's probability: `auto` the sum of its three 30-degree bins where the turn is read (the CPU), a bin's alone elsewhere (the GPU); `bin` a bin's everywhere; `quarters` the sums everywhere (no threshold is calibrated for them) |
+| `--turn-check on\|off` | `on` | read the page's 8 widest lines both ways before a turn is made, and keep or turn the page as the surer reading says (the CPU engine; each reading in the JSON's `turn_reads`); `off`: orientation's turn alone |
 | `--precision auto\|fp32\|fp16\|int8` | `auto` | the files the models run. On the CPU: `fp16` the set's `.fp16.onnx` on the engine's own kernels, `int8` its `.int8.onnx`, `fp32` its `.onnx`; `auto` as below. On the GPU: `fp16` the `.fp16.onnx` files and the recognizer's trunk and fused CTC head, `fp32` the `.onnx` files, `int8` the `.int8-sym.onnx` files; `auto` the FP16 files, the FP32 one where a set lacks one |
 | `--backend ort\|native` | per model | run every model on one backend; by default a model runs on the native int8 backend where the set has its `.int8.onnx`, else on ONNX Runtime |
 | `--workers N` | one per physical core | CPU workers |
@@ -74,6 +81,7 @@ By default the pages run in parallel on the CPU, one worker per physical core. `
 | `--in-flight N` | 32 | `cuda`: pages in the pipeline at once |
 | `--engine-cache DIR` | | keep TensorRT's built engines here, for later runs |
 | `--head-accumulate fp32\|fp16` | `fp32` | `cuda`: the fused CTC head's sums; `fp16` runs at twice the rate on GeForce cards, the logits within about 1e-3 |
+| `--text-pages gpu\|cpu` | `gpu` | `cuda`: a text layer's pages' steps (their lines found, their pictures read, their order) on the GPU's pipeline, or on a CPU engine |
 | `--json-html`, `--json-markdown` | off | `json`: each page's HTML body, or its markdown, in it as well |
 
 The reading order comes from the set's `order.onnx` when the set has one; otherwise the engine orders lines by the XY-cut. The order model is also used only where it is sure of its result, and the XY-cut takes over elsewhere. The model's blocks are then put in order by their geometry, a page's columns first. The JSON output records which of the two ordered each page.
@@ -87,26 +95,29 @@ carbon-ocr serve --set models/fullerene-3M --device cuda --engine-cache .engines
 curl --data-binary @page.png http://127.0.0.1:8080/ocr                  # the page as JSON
 curl --data-binary @page.png "http://127.0.0.1:8080/ocr?format=text"
 curl --data-binary @scan.jpg "http://127.0.0.1:8080/ocr?format=pdf" -o searchable.pdf
+curl --data-binary @report.pdf "http://127.0.0.1:8080/ocr?format=markdown"   # a PDF's pages
 curl http://127.0.0.1:8080/info
 ```
 
-`serve` loads a set's models once and reads the pages clients send over HTTP/1.1, until Ctrl+C. Every client's pages share the engine. On the CPU each page goes to the next free worker, is decoded there and is answered as soon as it is read, so a slow page holds back no other. On the GPU (`--device cuda`) the batched pipeline puts every client's pages in its batches. `serve` takes `ocr`'s model, worker, device and page options (`--rec`, `--backend`, `--precision`, `--second-pass`, `--as-given`, `--gate`, `--block-order`, `--table-spans`, `--workers`, `--no-pin`, `--device`, `--batch`, `--in-flight`, `--engine-cache`, and the beam's and the language models': `--beam`, `--lm-mode` and the rest), so it runs every model file the engine does. On the GPU, `--prefetch off` uploads each group's pages only when their turn comes. Connections are kept alive, and a client may send `Expect: 100-continue`.
+`serve` loads a set's models once and reads the pages clients send over HTTP/1.1, until Ctrl+C, through the same document stream as `ocr`. Every client's pages share the engine. On the CPU each page goes to the next free worker, is decoded there and is answered as soon as it is read, so a slow page holds back no other. On the GPU (`--device cuda`) the batched pipeline puts every client's pages in its batches. `serve` takes `ocr`'s model, worker, device and page options (`--rec`, `--backend`, `--precision`, `--second-pass`, `--as-given`, `--gate`, `--block-order`, `--table-spans`, `--workers`, `--no-pin`, `--device`, `--batch`, `--in-flight`, `--engine-cache`, the beam's and the language models': `--beam`, `--lm-mode` and the rest, and for PDFs `--text-layer`, `--hybrid` and `--layer-lines`), so it runs every model file the engine does and reads a PDF as `ocr` does. On the GPU, `--prefetch off` uploads each group's pages only when their turn comes. Connections are kept alive, and a client may send `Expect: 100-continue`.
 
 | request | answer |
 |---|---|
-| `POST /ocr` | the body is a page's image (PNG, JPEG, BMP or PNM), and the answer that page as `ocr` writes it, in `?format=`: `json` (the default: the page's object), `text`, `hocr`, `alto`, `page`, `markdown`, `html` or `pdf`. `?name=` names the image in hOCR, ALTO and PAGE XML (`page` by default), and `?text_only=1` makes the `pdf` its invisible text alone. `?html=1` adds `html` to the `json` object: the page's body as `html` writes it. The headers `X-Carbon-Ms` and `X-Carbon-Lines` give the page's time in the engine and its number of lines |
+| `POST /ocr` | the body is a page's image (PNG, JPEG, BMP, PNM, GIF or WebP) or a PDF, each told by its first bytes, and the answer that page as `ocr` writes it, in `?format=`: `json` (the default: the page's object), `text`, `hocr`, `alto`, `page`, `markdown`, `html` or `pdf`. `?name=` names the image in hOCR, ALTO and PAGE XML (`page` by default), and `?text_only=1` makes the `pdf` its invisible text alone. `?html=1` adds `html` to the `json` object: the page's body as `html` writes it. The headers `X-Carbon-Ms` and `X-Carbon-Lines` give the page's time in the engine and its number of lines. A PDF's pages are rendered at `?dpi=` (200), read as `ocr` reads them, and answered together: `json` is `{"pages": [...]}`, each page's object with its `page` number; the other formats as `ocr` writes the document's pages (`page`, PAGE XML, for a PDF of one page alone) |
+| `POST /parse` | a route for document-parsing benchmark clients: the body a JSON object, `{"page": the file in base64 (an image or a PDF), "suffix": its extension, "settings": {"dpi": N}}` (`settings` optional); the answer `{"pages": [each page's object with its "html" and "markdown"], "served": ..., "vendor": {"carbon-ocr": its version}}` |
+| `GET /served` | JSON: `{"weights": the set's name, "revision": a hash of its model files}`, as `/parse`'s `served` |
 | `GET /health` | `ok`; 503 once a GPU error has stopped the pipeline |
-| `GET /info` | JSON: the version, the set, the device, the precision, the workers, the pages in flight and the queue |
+| `GET /info` | JSON: the version, the set, the device, the precision, the workers, the pages in flight, the queue, whether it reads PDFs, and what it serves |
 
 | status | when |
 |---|---|
-| 400 | a request it cannot read, or an unknown format |
+| 400 | a request it cannot read, an unknown format or setting, or `format=page` for a PDF of more than a page |
 | 404, 405 | an unknown path, or a method the path does not take |
 | 411 | a body without a `Content-Length` (chunked bodies are not taken) |
 | 413 | a body past `--max-body-mb` |
-| 415 | a body that is no image it reads; a PDF among them, since PDFs go through `ocr` |
+| 415 | a body that is no image or PDF it reads (a PDF where the build reads none) |
 | 417, 505 | an `Expect` other than `100-continue`; an HTTP version other than 1.0 and 1.1 |
-| 422 | an image that does not decode |
+| 422 | an image that does not decode, or a PDF that does not open or has no pages |
 | 431 | a request's head past 16 KB |
 | 500 | the engine's error for that page; the pages after it are read as ever |
 | 503 | the queue full, with `Retry-After: 1` |
@@ -119,7 +130,7 @@ An error's body is its reason, as text.
 | `--port N` | 8080 | the port; 0 picks a free one, which the first line printed gives |
 | `--queue N` | 64 | requests that wait past the pages in flight; more are answered 503 |
 | `--max-body-mb N` | 64 | the largest page a request may send |
-| `--decoders N` | 4, at most the cores | `--device cuda`: the threads that decode the pages |
+| `--decoders N` | half the physical cores, at least 4 on a GPU and 2 on the CPU | the threads that give the pages to the engine: on a GPU they decode the images; a PDF's pages are rendered on them |
 | `--image-dpi N` | 300 | `format=pdf`: the dpi the page's image is placed at |
 | `--quiet` | off | no line on standard error for each request |
 
@@ -130,15 +141,15 @@ The server has no TLS and no authentication. To serve beyond the machine, put it
 | format | what |
 |---|---|
 | `text` | each page's lines in reading order, one per line, with a form feed between pages |
-| `json` | one object with every page: its size, rotation and source, each line's box, text, confidence and words, the pictures, the order model's blocks with their labels and table cells, and timings |
+| `json` | one object with every page: its size, rotation and source, each line's box, text, confidence and words, the pictures, the order model's blocks with their labels and table cells, the turn check's readings (`turn_reads`), and timings |
 | `hocr` | hOCR 1.2 (XHTML), the format Tesseract writes and OCRmyPDF reads: blocks, lines (headings and captions marked) and words with their boxes and confidences |
 | `alto` | ALTO XML 4.4: text blocks with their labels, lines, words with their confidences |
 | `page` | PAGE XML (2019-07-15), one file per page in `--out-dir`: regions typed by their labels, lines, words |
-| `markdown` | headings, paragraphs, lists, tables (as HTML, from their cells) and captions, from the order model's blocks; running headers and footers are left out |
-| `html` | an HTML5 document, a `<section>` per page: the order model's blocks as headings, paragraphs (a word broken by a hyphen at a line's end joined again), lists, tables from their cells, figures with their captions, running headers and footers (kept), footnotes and formulas |
+| `markdown` | headings, paragraphs, lists, tables (as HTML, from their cells) and captions, from the order model's blocks; running headers and footers are left out; a text layer's sub- and superscripts as plain text |
+| `html` | an HTML5 document, a `<section>` per page: the order model's blocks as headings, paragraphs (a word broken by a hyphen at a line's end joined again), lists, tables from their cells, figures with their captions, running headers and footers (kept), footnotes and formulas; a text layer's sub- and superscripts as `<sup>` and `<sub>` |
 | `pdf` | a searchable PDF: each page's image with its words as invisible text above it; `--text-only` writes the text layer alone |
 
-Boxes are in the page image's pixels. For a PDF page they are in the pixels of the page as rendered at `--dpi`.
+Boxes are in the page image's pixels. For a PDF page they are in the pixels of the page as rendered at `--dpi`; for a page read turned upright, in the upright page's, its `rotation` the turn.
 
 ## <img src="assets/chip-04.svg" height="22" alt=""> Timing and inspecting
 
@@ -156,7 +167,7 @@ carbon-ocr bench model.onnx --workers 1,2,4,all                  # a pinned work
 carbon-ocr compare model.onnx --shape x=8x1x32x512               # native against ONNX Runtime
 ```
 
-- **`cpus`** prints the instruction sets the kernels use and the cores the workers run on. `--gemm` times the int8 GEMM on one thread with each instruction set, at the shapes of the models' convolutions.
+- **`cpus`** prints the instruction sets the kernels use, whether their int8 products widen to 16 bits (AVX2 without VNNI: there one worker reads a page sooner with `--precision fp32`, and many workers more pages in INT8, the default), and the cores the workers run on. `--gemm` times the int8 GEMM on one thread with each instruction set, at the shapes of the models' convolutions.
 - **`pages`** times a set the way the CPU pipeline runs a page: orientation beside detection, the line decoder, the lines in tasks any idle worker can take, then the order model. Its inputs are fixed at the models' design sizes. `--in-flight 1` measures one page at a time on every core (latency). By default every page is queued at once (throughput). `--det auto|one|wide|strips` picks how detection uses the cores.
 - **`bench`** times one model with fixed inputs and reports the median, p90 and fastest run. On TensorRT it times two runs: from host memory with the copies included, and on device buffers, the way the GPU pipeline runs a model. `--opt-level 0-5` sets TensorRT's builder optimization level (default 3), and `--no-graphs` turns off CUDA graphs. `--isa NAME` holds the native backend to one instruction set. `--workers` runs a pool of pinned workers, each with its own session, and reports their scaling.
 - **`compare`** runs a model on the native backend and on ONNX Runtime and reports how far apart their outputs are. `--against FILE` gives ONNX Runtime a different file, such as the FP32 model for an int8 one.
@@ -193,7 +204,7 @@ session = carbon_ocr.Session("models/fullerene-3M/rec-latin.onnx", backend="ort"
 logits, = session.run([np.zeros((1, 1, 32, 512), np.float32)])     # [1, 800, 128]
 ```
 
-The module also exposes the engine's building blocks: the crop rule (`crop`, `crop_lines`, `crop_region`), the CTC decoders (`ctc_greedy`, `ctc_collapse`, `ctc_beam`, `ctc_beam_nbest`), the language models (`NgramModel`, `TransformerLM`, `cuda_transformer_lm`), the detector's decoder and the merge of its two passes (`decode_det`, `takes_second_pass`, `merge_passes`), the order model's features and decoder (`order_features`, `decode_order`, `reading_order`), and text scoring (`text_errors`, `char_confusions`). [python/README.md](../python/README.md) lists all of them.
+The module also exposes the engine's building blocks: the crop rule (`crop`, `crop_lines`, `crop_region`), the CTC decoders (`ctc_greedy`, `ctc_collapse`, `ctc_beam`, `ctc_beam_nbest`) and a line's kind (`line_kind`), the language models (`NgramModel`, `TransformerLM`, `cuda_transformer_lm`), the detector's decoder and the merge of its two passes (`decode_det`, `takes_second_pass`, `merge_passes`), the order model's features and decoder (`order_features`, `decode_order`, `reading_order`), and text scoring (`text_errors`, `char_confusions`). [python/README.md](../python/README.md) lists all of them.
 
 ## <img src="assets/chip-06.svg" height="22" alt=""> OCRmyPDF
 

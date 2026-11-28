@@ -23,13 +23,14 @@ Carbon-OCR builds with CMake on Windows, Linux and macOS. The CPU build needs on
 
 CMake downloads these and checks each one's SHA-256:
 
-| dependency | pinned | used for |
-|---|---|---|
-| ONNX Runtime | 1.31.0 | the CPU backend that runs any ONNX model |
-| PDFium | chromium/8076 | reading PDFs, in the `carbon-pdf` helper processes |
-| libdeflate | 1.24 | the searchable PDF's images |
-| stb_image | 2.30 | reading PNG, JPEG, BMP and PNM pages |
-| GoogleTest | 1.18.0 | the C++ tests |
+| dependency | pinned | license | used for |
+|---|---|---|---|
+| ONNX Runtime | 1.31.0 | MIT | the CPU backend that runs any ONNX model |
+| PDFium | chromium/8076 | BSD-3-Clause; the libraries its build carries come with their licenses, in its archive's `licenses/` | reading PDFs, in the `carbon-pdf` helper processes |
+| libdeflate | 1.24 | MIT | the searchable PDF's images and the PNG pages |
+| libwebp | 1.6.0 | BSD-3-Clause, with Google's patent grant (its `PATENTS`) | reading WebP pages, lossy and lossless |
+| stb_image | 2.30 | public domain or MIT | reading JPEG, BMP, PNM and GIF pages, and the PNGs the engine's own decoder leaves to it |
+| GoogleTest | 1.18.0 | BSD-3-Clause | the C++ tests |
 
 ONNX Runtime downloads exist for Windows x64, Linux x64 and macOS arm64. On any other platform, set `ONNXRUNTIME_ROOT` to an unpacked release, or build with `-DCARBON_WITH_ONNXRUNTIME=OFF`; the engine's own int8 backend still runs. PDFium downloads exist for Windows x64, Linux x64 and arm64, and macOS arm64. Elsewhere, set `PDFIUM_ROOT` to an unpacked build, or turn PDFs off with `-DCARBON_WITH_PDFIUM=OFF`.
 
@@ -107,7 +108,7 @@ scikit-build-core builds the module `carbon_ocr` from this CMake project, with O
 
 ## <img src="assets/chip-06.svg" height="22" alt=""> Tests
 
-`ctest --preset <preset>` runs the C++ tests: the tensors, the crop rule, the CPU kernels against their scalar reference, the native backend against ONNX Runtime, the detector's and order model's decoders, the detector's two passes merged, the engine and the batched pipeline on small fake models, the HTTP parser and the server, PDFs, the output formats and the command line. The tests that need a GPU are built with CUDA or TensorRT and run on a machine with one.
+`ctest --preset <preset>` runs the C++ tests: the tensors, the crop rule, the CPU kernels against their scalar reference, the native backend against ONNX Runtime, the detector's and order model's decoders, the detector's two passes merged, the engine, the batched pipeline and the document stream on small fake models, the turn check, the tables' rules, the image formats (PNG, WebP and GIF among them), the HTTP parser and the server, PDFs and their text layers, the output formats and the command line. The tests that need a GPU are built with CUDA or TensorRT and run on a machine with one.
 
 ```shell
 pip install ./python pytest==8.4.2 pillow==13.0.0
